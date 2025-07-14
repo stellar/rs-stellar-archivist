@@ -1,0 +1,25 @@
+[package]
+name = "stellar-archivist"
+description = "Stellar History Archive tools and utilities."
+homepage = "https://github.com/stellar/rs-stellar-archivist"
+repository = "https://github.com/stellar/rs-stellar-archivist"
+authors = ["Stellar Development Foundation <info@stellar.org>"]
+license = "Apache-2.0"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74.0"
+
+[lib]
+name = "stellar_archivist"
+
+[[bin]]
+name = "stellar-archivist"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1.0.139", features = ["derive"] }
+serde_json = { version = "1.0.89" }
+
+[dev-dependencies]
+tempfile = { version = "3.5.0" }
+rstest = { version = "0.18.2" }
