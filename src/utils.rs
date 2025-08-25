@@ -4,6 +4,7 @@ use thiserror::Error;
 use tracing::{error, info, warn};
 
 use crate::history_format::HistoryFileState;
+use crate::pipeline;
 use crate::storage::StorageRef;
 
 /// Utils module errors - just wraps errors from other modules
@@ -28,6 +29,16 @@ pub enum Error {
         low_checkpoint: u32,
         high_checkpoint: u32,
     },
+}
+
+/// Helper function to map pipeline errors to library errors
+pub fn map_pipeline_error(err: pipeline::Error) -> crate::Error {
+    match err {
+        pipeline::Error::ScanOperation(scan_err) => crate::Error::ScanOperation(scan_err),
+        pipeline::Error::MirrorOperation(mirror_err) => crate::Error::MirrorOperation(mirror_err),
+        pipeline::Error::Io(io_err) => crate::Error::Io(io_err),
+        other => crate::Error::Other(other.to_string()),
+    }
 }
 
 /// Shared statistics tracking for archive operations
@@ -169,29 +180,24 @@ pub async fn fetch_well_known_history_file(store: &StorageRef) -> Result<History
     debug!("Fetching .well-known from path: {}", ROOT_WELL_KNOWN_PATH);
 
     // Read the file content
-    let mut reader = store
-        .open_reader(ROOT_WELL_KNOWN_PATH)
-        .await
-        .map_err(|e| std::io::Error::new(
+    let mut reader = store.open_reader(ROOT_WELL_KNOWN_PATH).await.map_err(|e| {
+        std::io::Error::new(
             std::io::ErrorKind::NotFound,
             format!("Failed to open {}: {}", ROOT_WELL_KNOWN_PATH, e),
-        ))?;
+        )
+    })?;
     let mut buffer = Vec::new();
     reader
         .read_to_end(&mut buffer)
         .await
-        .map_err(|e| std::io::Error::new(
-            e.kind(),
-            format!("Failed to read {}: {}", ROOT_WELL_KNOWN_PATH, e),
-        ))?;
+        .map_err(|e| std::io::Error::new(e.kind(), format!("Reading {}: {}", ROOT_WELL_KNOWN_PATH, e)))?;
 
     // Parse the JSON
-    let state: HistoryFileState = serde_json::from_slice(&buffer).map_err(|e| {
-        crate::history_format::Error::InvalidJson {
+    let state: HistoryFileState =
+        serde_json::from_slice(&buffer).map_err(|e| crate::history_format::Error::InvalidJson {
             path: ROOT_WELL_KNOWN_PATH.to_string(),
             error: e.to_string(),
-        }
-    })?;
+        })?;
 
     // Validate the .well-known format
     state.validate()?;

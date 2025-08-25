@@ -141,7 +141,10 @@ impl<Op: Operation> Pipeline<Op> {
                 .map_err(|e| {
                     std::io::Error::new(
                         std::io::ErrorKind::Other,
-                        format!("Failed to create storage backend for {}: {}", config.source, e),
+                        format!(
+                            "Failed to create storage backend for {}: {}",
+                            config.source, e
+                        ),
                     )
                 })?;
         // Create LRU cache for bucket deduplication
@@ -281,11 +284,15 @@ impl<Op: Operation> Pipeline<Op> {
         }
 
         // Wait for producer to finish sending all checkpoints
-        producer.await.map_err(|e| Error::Other(format!("Producer task failed: {}", e)))?;
+        producer
+            .await
+            .map_err(|e| Error::Other(format!("Producer task failed: {}", e)))?;
 
         // Wait for all checkpoint processors to finish spawning file tasks
         for processor in checkpoint_processors {
-            processor.await.map_err(|e| Error::Other(format!("Checkpoint processor task failed: {}", e)))?;
+            processor
+                .await
+                .map_err(|e| Error::Other(format!("Checkpoint processor task failed: {}", e)))?;
         }
 
         // At this point, we've finished processing all the checkpoint files,

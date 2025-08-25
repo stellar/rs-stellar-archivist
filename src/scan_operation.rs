@@ -41,7 +41,10 @@ impl ScanOperation {
 
 #[async_trait]
 impl Operation for ScanOperation {
-    async fn get_checkpoint_bounds(&self, source: &StorageRef) -> Result<(u32, u32), crate::pipeline::Error> {
+    async fn get_checkpoint_bounds(
+        &self,
+        source: &StorageRef,
+    ) -> Result<(u32, u32), crate::pipeline::Error> {
         compute_checkpoint_bounds(source, self.low, self.high)
             .await
             .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))

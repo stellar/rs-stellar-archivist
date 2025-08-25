@@ -5,6 +5,9 @@ pub mod scan_operation;
 pub mod storage;
 pub mod utils;
 
+#[cfg(feature = "cli")]
+pub mod cli;
+
 use thiserror::Error;
 
 /// Top-level error type for the Stellar Archivist library
@@ -31,7 +34,7 @@ mod tests;
 pub mod test_helpers {
     use crate::{
         mirror_operation::MirrorOperation,
-        pipeline::{self, Pipeline, PipelineConfig},
+        pipeline::{Pipeline, PipelineConfig},
         scan_operation::ScanOperation,
     };
     use std::sync::Arc;
@@ -70,20 +73,12 @@ pub mod test_helpers {
         let pipeline = Arc::new(
             Pipeline::new(operation, pipeline_config)
                 .await
-                .map_err(|e| match e {
-                    pipeline::Error::ScanOperation(scan_err) => crate::Error::ScanOperation(scan_err),
-                    pipeline::Error::Io(io_err) => crate::Error::Io(io_err),
-                    other => crate::Error::Other(other.to_string()),
-                })?,
+                .map_err(crate::utils::map_pipeline_error)?,
         );
         pipeline
             .run()
             .await
-            .map_err(|e| match e {
-                pipeline::Error::ScanOperation(scan_err) => crate::Error::ScanOperation(scan_err),
-                pipeline::Error::Io(io_err) => crate::Error::Io(io_err),
-                other => crate::Error::Other(other.to_string()),
-            })
+            .map_err(crate::utils::map_pipeline_error)
     }
 
     pub async fn run_mirror(config: MirrorConfig) -> Result<(), crate::Error> {
@@ -107,19 +102,11 @@ pub mod test_helpers {
         let pipeline = Arc::new(
             Pipeline::new(operation, pipeline_config)
                 .await
-                .map_err(|e| match e {
-                    pipeline::Error::MirrorOperation(mirror_err) => crate::Error::MirrorOperation(mirror_err),
-                    pipeline::Error::Io(io_err) => crate::Error::Io(io_err),
-                    other => crate::Error::Other(other.to_string()),
-                })?,
+                .map_err(crate::utils::map_pipeline_error)?,
         );
         pipeline
             .run()
             .await
-            .map_err(|e| match e {
-                pipeline::Error::MirrorOperation(mirror_err) => crate::Error::MirrorOperation(mirror_err),
-                pipeline::Error::Io(io_err) => crate::Error::Io(io_err),
-                other => crate::Error::Other(other.to_string()),
-            })
+            .map_err(crate::utils::map_pipeline_error)
     }
 }

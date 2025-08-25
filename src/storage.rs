@@ -259,7 +259,7 @@ impl Storage for HttpStore {
                                 if let Some(status) = status {
                                     return Err(io::Error::new(
                                         io::ErrorKind::Other,
-                                        format!("HTTP {} for {}: {}", status, object, e),
+                                        format!("HTTP {}", status),
                                     ));
                                 } else {
                                     return Err(to_io_error(e));
@@ -275,10 +275,7 @@ impl Storage for HttpStore {
                     if attempt >= self.retry_config.max_retries {
                         return Err(io::Error::new(
                             io::ErrorKind::Other,
-                            format!(
-                                "Failed to fetch {} after {} retries: {}",
-                                object, self.retry_config.max_retries, e
-                            ),
+                            "Connection failed".to_string(),
                         ));
                     }
                 }

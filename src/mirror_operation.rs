@@ -108,7 +108,8 @@ impl MirrorOperation {
 
         let should_update = match self.get_initial_dest_well_known_checkpoint().await {
             Some(existing_ledger) => {
-                let existing_checkpoint = history_format::round_to_lower_checkpoint(existing_ledger);
+                let existing_checkpoint =
+                    history_format::round_to_lower_checkpoint(existing_ledger);
                 if highest_checkpoint > existing_checkpoint {
                     info!(
                         "Updating .well-known from checkpoint {:08x} to {:08x}",
@@ -195,7 +196,10 @@ impl MirrorOperation {
 
 #[async_trait]
 impl Operation for MirrorOperation {
-    async fn get_checkpoint_bounds(&self, source: &StorageRef) -> Result<(u32, u32), crate::pipeline::Error> {
+    async fn get_checkpoint_bounds(
+        &self,
+        source: &StorageRef,
+    ) -> Result<(u32, u32), crate::pipeline::Error> {
         // Determine the effective low checkpoint based on destination .well-known/stellar-history.json and flags
         //
         // Starting ledger logic:
