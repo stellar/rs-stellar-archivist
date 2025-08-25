@@ -1,14 +1,30 @@
 use stellar_archivist::{
-    mirror_operation::MirrorOperation,
-    pipeline::{Pipeline, PipelineConfig},
-    scan_operation::ScanOperation,
+    mirror_operation::{self, MirrorOperation},
+    pipeline::{self, Pipeline, PipelineConfig},
+    scan_operation::{self, ScanOperation},
 };
 
-use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::sync::Arc;
+use thiserror::Error;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
+
+/// CLI errors
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    ScanOperation(#[from] scan_operation::Error),
+
+    #[error(transparent)]
+    MirrorOperation(#[from] mirror_operation::Error),
+
+    #[error("{0}")]
+    Other(String),
+}
 
 #[derive(Parser)]
 #[command(name = "stellar-archivist")]
@@ -86,12 +102,12 @@ enum Commands {
 async fn main() {
     let result = run().await;
     if let Err(e) = result {
-        eprintln!("Error: {}", e);
+        eprintln!("{}", e);
         std::process::exit(1);
     }
 }
 
-async fn run() -> Result<()> {
+async fn run() -> Result<(), Error> {
     let cli = Cli::parse();
 
     let log_level = if cli.trace {
@@ -106,7 +122,8 @@ async fn run() -> Result<()> {
         .with_max_level(log_level)
         .with_target(false)
         .finish();
-    tracing::subscriber::set_global_default(subscriber)?;
+    tracing::subscriber::set_global_default(subscriber)
+        .map_err(|e| Error::Other(format!("Failed to initialize logging: {}", e)))?;
 
     match cli.command {
         Commands::Mirror {
@@ -156,7 +173,7 @@ async fn run_scan(
     high: Option<u32>,
     max_retries: u32,
     initial_backoff_ms: u64,
-) -> Result<()> {
+) -> Result<(), Error> {
     info!("Starting scan of {}", archive);
 
     if let Some(low) = low {
@@ -164,17 +181,6 @@ async fn run_scan(
     }
     if let Some(high) = high {
         info!("Scanning up to checkpoint {}", high);
-    }
-
-    // Validate filesystem sources exist before creating storage
-    if archive.starts_with("file://") {
-        let path = archive.trim_start_matches("file://");
-        if !std::path::Path::new(path).exists() {
-            anyhow::bail!(
-                "Source path does not exist: {}\nPlease check the path and try again.",
-                path
-            );
-        }
     }
 
     // Create the scan operation
@@ -190,8 +196,23 @@ async fn run_scan(
     };
 
     // Create and run the pipeline
-    let pipeline = Arc::new(Pipeline::new(operation, pipeline_config).await?);
-    pipeline.run().await?;
+    let pipeline = Arc::new(
+        Pipeline::new(operation, pipeline_config)
+            .await
+            .map_err(|e| match e {
+                pipeline::Error::ScanOperation(scan_err) => Error::ScanOperation(scan_err),
+                pipeline::Error::Io(io_err) => Error::Io(io_err),
+                other => Error::Other(format!("Internal error: {}", other)),
+            })?,
+    );
+    pipeline
+        .run()
+        .await
+        .map_err(|e| match e {
+            pipeline::Error::ScanOperation(scan_err) => Error::ScanOperation(scan_err),
+            pipeline::Error::Io(io_err) => Error::Io(io_err),
+            other => Error::Other(format!("Internal error: {}", other)),
+        })?;
 
     Ok(())
 }
@@ -207,28 +228,11 @@ async fn run_mirror(
     allow_mirror_gaps: bool,
     max_retries: u32,
     initial_backoff_ms: u64,
-) -> Result<()> {
+) -> Result<(), Error> {
     info!(
         "Starting mirror from {} to {} with {} workers",
         src, dst, concurrency
     );
-
-    if !dst.starts_with("file://") {
-        anyhow::bail!(
-            "Unsupported URL scheme for destination. Must use file:// for filesystem paths."
-        );
-    }
-
-    // If source is a filesystem path, do a quick existence check
-    if src.starts_with("file://") {
-        let path = src.trim_start_matches("file://");
-        if !std::path::Path::new(path).exists() {
-            anyhow::bail!(
-                "Source path does not exist: {}\nPlease check the path and try again.",
-                path
-            );
-        }
-    }
 
     let operation = MirrorOperation::new(&dst, overwrite, low, high, allow_mirror_gaps).await?;
     let pipeline_config = PipelineConfig {
@@ -239,8 +243,23 @@ async fn run_mirror(
         initial_backoff_ms,
     };
 
-    let pipeline = Arc::new(Pipeline::new(operation, pipeline_config).await?);
-    pipeline.run().await?;
+    let pipeline = Arc::new(
+        Pipeline::new(operation, pipeline_config)
+            .await
+            .map_err(|e| match e {
+                pipeline::Error::MirrorOperation(mirror_err) => Error::MirrorOperation(mirror_err),
+                pipeline::Error::Io(io_err) => Error::Io(io_err),
+                other => Error::Other(format!("Internal error: {}", other)),
+            })?,
+    );
+    pipeline
+        .run()
+        .await
+        .map_err(|e| match e {
+            pipeline::Error::MirrorOperation(mirror_err) => Error::MirrorOperation(mirror_err),
+            pipeline::Error::Io(io_err) => Error::Io(io_err),
+            other => Error::Other(format!("Internal error: {}", other)),
+        })?;
 
     Ok(())
 }

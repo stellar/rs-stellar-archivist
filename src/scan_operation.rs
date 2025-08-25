@@ -2,8 +2,24 @@
 use crate::pipeline::{async_trait, Operation};
 use crate::storage::{ReaderResult, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, ArchiveStats};
-use anyhow::Result;
+use thiserror::Error;
 use tracing::{debug, error};
+
+/// Scan operation errors
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Archive scan failed")]
+    ScanFailed,
+
+    #[error(transparent)]
+    Utils(#[from] crate::utils::Error),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("History format error: {0}")]
+    HistoryFormat(#[from] crate::history_format::Error),
+}
 
 pub struct ScanOperation {
     stats: ArchiveStats,
@@ -14,7 +30,7 @@ pub struct ScanOperation {
 }
 
 impl ScanOperation {
-    pub async fn new(low: Option<u32>, high: Option<u32>) -> Result<Self> {
+    pub async fn new(low: Option<u32>, high: Option<u32>) -> Result<Self, Error> {
         Ok(Self {
             stats: ArchiveStats::new(),
             low,
@@ -25,8 +41,10 @@ impl ScanOperation {
 
 #[async_trait]
 impl Operation for ScanOperation {
-    async fn get_checkpoint_bounds(&self, source: &StorageRef) -> Result<(u32, u32)> {
-        compute_checkpoint_bounds(source, self.low, self.high).await
+    async fn get_checkpoint_bounds(&self, source: &StorageRef) -> Result<(u32, u32), crate::pipeline::Error> {
+        compute_checkpoint_bounds(source, self.low, self.high)
+            .await
+            .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))
     }
 
     async fn process_object(&self, path: &str, reader_result: ReaderResult) {
@@ -64,12 +82,12 @@ impl Operation for ScanOperation {
         }
     }
 
-    async fn finalize(&self, _highest_checkpoint: u32) -> Result<()> {
+    async fn finalize(&self, _highest_checkpoint: u32) -> Result<(), crate::pipeline::Error> {
         self.stats.report("scan").await;
 
         // Fail if there were any failures
         if self.stats.has_failures() {
-            return Err(anyhow::anyhow!("Archive scan failed"));
+            return Err(Error::ScanFailed.into());
         }
 
         Ok(())

@@ -5,9 +5,17 @@ use futures_util::TryStreamExt;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
+use thiserror::Error;
 use tokio_util::io::StreamReader;
 
 pub const WRITE_BUF_BYTES: usize = 128 * 1024;
+
+/// Storage-related errors - primarily wraps IO errors
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("{0}")]
+    Io(#[from] io::Error),
+}
 
 pub type BoxedAsyncRead = Box<dyn tokio::io::AsyncRead + Send + Unpin + 'static>;
 pub type BoxedAsyncWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin + 'static>;
@@ -19,7 +27,7 @@ pub enum ReaderResult {
     /// Successfully obtained a reader
     Ok(BoxedAsyncRead),
     /// Failed to get reader (file missing or inaccessible)
-    Err(anyhow::Error),
+    Err(Error),
 }
 
 #[derive(Clone, Debug)]
@@ -111,7 +119,7 @@ impl Storage for FileStore {
 // ===== HTTP Backend =====
 
 /// Create a new HTTP client. Use HTTP/2 for HTTPS, HTTP/1.1 for HTTP.
-fn new_http_client(use_http2: bool) -> anyhow::Result<reqwest::Client> {
+fn new_http_client(use_http2: bool) -> Result<reqwest::Client, Error> {
     use reqwest::header::*;
 
     // Set identity encoding to avoid decompression by reqwest since the payload itself is already compressed
@@ -146,7 +154,12 @@ fn new_http_client(use_http2: bool) -> anyhow::Result<reqwest::Client> {
         builder = builder.http1_only();
     }
 
-    Ok(builder.build()?)
+    Ok(builder.build().map_err(|e| {
+        io::Error::new(
+            io::ErrorKind::Other,
+            format!("Failed to create HTTP client: {}", e),
+        )
+    })?)
 }
 
 #[derive(Clone, Debug)]
@@ -359,13 +372,16 @@ impl StorageBackend {
     pub async fn from_url(
         url_str: &str,
         retry_config: Option<HttpRetryConfig>,
-    ) -> anyhow::Result<std::sync::Arc<dyn Storage + Send + Sync>> {
-        use anyhow::Context;
+    ) -> Result<std::sync::Arc<dyn Storage + Send + Sync>, Error> {
         use std::sync::Arc;
         use url::Url;
 
-        let url =
-            Url::parse(url_str).with_context(|| format!("Failed to parse URL: {}", url_str))?;
+        let url = Url::parse(url_str).map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("Failed to parse URL '{}': {}", url_str, e),
+            )
+        })?;
 
         match url.scheme() {
             "file" => {
@@ -382,22 +398,24 @@ impl StorageBackend {
                 Ok(Arc::new(backend))
             }
             "http" | "https" => {
-                let http_store = match retry_config {
-                    Some(config) => HttpStore::new(url.clone(), config),
-                    None => {
-                        anyhow::bail!("Retry configuration is required for HTTP(S) backends")
-                    }
-                };
+                assert!(retry_config.is_some());
+                let http_store = HttpStore::new(url.clone(), retry_config.unwrap());
                 let backend = StorageBackend::Http(http_store);
                 Ok(Arc::new(backend))
             }
             "s3" => {
                 // TODO: Implement S3 support
-                anyhow::bail!("S3 support not yet implemented")
+                Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("Unsupported URL scheme: s3"),
+                )
+                .into())
             }
-            scheme => {
-                anyhow::bail!("Unsupported URL scheme: {}", scheme)
-            }
+            scheme => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!("Unsupported URL scheme: {}", scheme),
+            )
+            .into()),
         }
     }
 }

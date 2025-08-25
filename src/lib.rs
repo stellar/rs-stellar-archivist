@@ -1,19 +1,39 @@
-pub mod history_file;
+pub mod history_format;
 pub mod mirror_operation;
 pub mod pipeline;
 pub mod scan_operation;
 pub mod storage;
 pub mod utils;
 
+use thiserror::Error;
+
+/// Top-level error type for the Stellar Archivist library
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+
+    #[error(transparent)]
+    MirrorOperation(#[from] mirror_operation::Error),
+
+    #[error(transparent)]
+    ScanOperation(#[from] scan_operation::Error),
+
+    #[error("{0}")]
+    Other(String),
+}
+
+#[cfg(test)]
+mod tests;
+
 // Test helper modules with config structures and run functions
 // Available for integration tests
 pub mod test_helpers {
     use crate::{
         mirror_operation::MirrorOperation,
-        pipeline::{Pipeline, PipelineConfig},
+        pipeline::{self, Pipeline, PipelineConfig},
         scan_operation::ScanOperation,
     };
-    use anyhow::Result;
     use std::sync::Arc;
 
     #[derive(Debug)]
@@ -36,15 +56,7 @@ pub mod test_helpers {
         pub allow_mirror_gaps: bool,
     }
 
-    pub async fn run_scan(config: ScanConfig) -> Result<()> {
-        // Validate filesystem sources exist before creating storage
-        if config.archive.starts_with("file://") {
-            let path = config.archive.trim_start_matches("file://");
-            if !std::path::Path::new(path).exists() {
-                anyhow::bail!("Source path does not exist: {}", path);
-            }
-        }
-
+    pub async fn run_scan(config: ScanConfig) -> Result<(), crate::Error> {
         let operation = ScanOperation::new(config.low, config.high).await?;
 
         let pipeline_config = PipelineConfig {
@@ -55,24 +67,26 @@ pub mod test_helpers {
             initial_backoff_ms: 100,
         };
 
-        let pipeline = Arc::new(Pipeline::new(operation, pipeline_config).await?);
-        pipeline.run().await
+        let pipeline = Arc::new(
+            Pipeline::new(operation, pipeline_config)
+                .await
+                .map_err(|e| match e {
+                    pipeline::Error::ScanOperation(scan_err) => crate::Error::ScanOperation(scan_err),
+                    pipeline::Error::Io(io_err) => crate::Error::Io(io_err),
+                    other => crate::Error::Other(other.to_string()),
+                })?,
+        );
+        pipeline
+            .run()
+            .await
+            .map_err(|e| match e {
+                pipeline::Error::ScanOperation(scan_err) => crate::Error::ScanOperation(scan_err),
+                pipeline::Error::Io(io_err) => crate::Error::Io(io_err),
+                other => crate::Error::Other(other.to_string()),
+            })
     }
 
-    pub async fn run_mirror(config: MirrorConfig) -> Result<()> {
-        // Validate destination is file:// (only supported destination type)
-        if !config.dst.starts_with("file://") {
-            anyhow::bail!("Destination must be a filesystem path (file://)");
-        }
-
-        // Validate filesystem sources exist before creating storage
-        if config.src.starts_with("file://") {
-            let path = config.src.trim_start_matches("file://");
-            if !std::path::Path::new(path).exists() {
-                anyhow::bail!("Source path does not exist: {}", path);
-            }
-        }
-
+    pub async fn run_mirror(config: MirrorConfig) -> Result<(), crate::Error> {
         let operation = MirrorOperation::new(
             &config.dst,
             config.overwrite,
@@ -90,7 +104,22 @@ pub mod test_helpers {
             initial_backoff_ms: 100,
         };
 
-        let pipeline = Arc::new(Pipeline::new(operation, pipeline_config).await?);
-        pipeline.run().await
+        let pipeline = Arc::new(
+            Pipeline::new(operation, pipeline_config)
+                .await
+                .map_err(|e| match e {
+                    pipeline::Error::MirrorOperation(mirror_err) => crate::Error::MirrorOperation(mirror_err),
+                    pipeline::Error::Io(io_err) => crate::Error::Io(io_err),
+                    other => crate::Error::Other(other.to_string()),
+                })?,
+        );
+        pipeline
+            .run()
+            .await
+            .map_err(|e| match e {
+                pipeline::Error::MirrorOperation(mirror_err) => crate::Error::MirrorOperation(mirror_err),
+                pipeline::Error::Io(io_err) => crate::Error::Io(io_err),
+                other => crate::Error::Other(other.to_string()),
+            })
     }
 }

@@ -1,11 +1,11 @@
-use rstest::*;
-use std::fs;
-use std::io::Write;
-use stellar_archivist::history_file::{
+use crate::history_format::{
     checkpoint_prefix, count_checkpoints_in_range, is_checkpoint, is_valid_bucket_hash,
     round_to_lower_checkpoint, round_to_upper_checkpoint, HistoryFileState,
     GENESIS_CHECKPOINT_LEDGER,
 };
+use rstest::*;
+use std::fs;
+use std::io::Write;
 use tempfile::NamedTempFile;
 
 #[fixture]
@@ -330,7 +330,10 @@ fn test_invalid_version(mut canonical_v1_json: serde_json::Value) {
     canonical_v1_json["version"] = serde_json::json!(3);
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("Invalid version"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::InvalidVersion { .. }
+    ));
 }
 
 #[rstest]
@@ -338,7 +341,10 @@ fn test_invalid_current_ledger_zero(mut canonical_v1_json: serde_json::Value) {
     canonical_v1_json["currentLedger"] = serde_json::json!(0);
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("currentLedger cannot be 0"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::InvalidCurrentLedger { .. }
+    ));
 }
 
 #[rstest]
@@ -346,7 +352,10 @@ fn test_invalid_current_ledger_not_checkpoint(mut canonical_v1_json: serde_json:
     canonical_v1_json["currentLedger"] = serde_json::json!(64);
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("not on a 64-ledger checkpoint boundary"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::InvalidCurrentLedger { .. }
+    ));
 }
 
 #[rstest]
@@ -356,7 +365,10 @@ fn test_invalid_bucket_hash_too_short(mut canonical_v1_json: serde_json::Value) 
         serde_json::json!("abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678");
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("invalid bucket hash"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::MalformedBucketHash { .. }
+    ));
 }
 
 #[rstest]
@@ -366,7 +378,10 @@ fn test_invalid_bucket_hash_too_long(mut canonical_v1_json: serde_json::Value) {
         serde_json::json!("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789a");
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("invalid bucket hash"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::MalformedBucketHash { .. }
+    ));
 }
 
 #[rstest]
@@ -376,7 +391,10 @@ fn test_invalid_bucket_hash_non_hex(mut canonical_v1_json: serde_json::Value) {
         serde_json::json!("ghij567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("invalid bucket hash"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::MalformedBucketHash { .. }
+    ));
 }
 
 #[rstest]
@@ -384,7 +402,10 @@ fn test_invalid_bucket_hash_empty_string(mut canonical_v1_json: serde_json::Valu
     canonical_v1_json["currentBuckets"][0]["curr"] = serde_json::json!("");
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("invalid bucket hash"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::MalformedBucketHash { .. }
+    ));
 }
 
 #[rstest]
@@ -416,7 +437,10 @@ fn test_next_state_0_with_output(mut canonical_v1_json: serde_json::Value) {
     });
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("next state is 0 but has output field"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::InvalidNextState { state: 0, .. }
+    ));
 }
 
 #[rstest]
@@ -424,7 +448,10 @@ fn test_next_state_1_missing_output(mut canonical_v1_json: serde_json::Value) {
     canonical_v1_json["currentBuckets"][0]["next"] = serde_json::json!({"state": 1});
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("next state is 1 but missing output field"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::InvalidNextState { state: 1, .. }
+    ));
 }
 
 #[rstest]
@@ -435,7 +462,10 @@ fn test_next_state_2_missing_curr(mut canonical_v1_json: serde_json::Value) {
     });
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("next state is 2 but missing curr field"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::InvalidNextState { state: 2, .. }
+    ));
 }
 
 #[rstest]
@@ -446,7 +476,10 @@ fn test_next_state_2_missing_snap(mut canonical_v1_json: serde_json::Value) {
     });
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("next state is 2 but missing snap field"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::InvalidNextState { state: 2, .. }
+    ));
 }
 
 #[rstest]
@@ -458,7 +491,10 @@ fn test_next_state_2_invalid_curr_hash(mut canonical_v1_json: serde_json::Value)
     });
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("invalid bucket hash"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::MalformedBucketHash { .. }
+    ));
 }
 
 #[rstest]
@@ -470,7 +506,10 @@ fn test_next_state_2_invalid_snap_hash(mut canonical_v1_json: serde_json::Value)
     });
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("invalid bucket hash"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::MalformedBucketHash { .. }
+    ));
 }
 
 #[rstest]
@@ -486,7 +525,10 @@ fn test_next_state_2_invalid_shadow_hash(mut canonical_v1_json: serde_json::Valu
     });
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("invalid bucket hash"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::MalformedBucketHash { .. }
+    ));
 }
 
 #[rstest]
@@ -521,7 +563,10 @@ fn test_invalid_next_state_value(mut canonical_v1_json: serde_json::Value) {
     canonical_v1_json["currentBuckets"][0]["next"]["state"] = serde_json::json!(3);
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("Invalid next state value"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::InvalidNextStateValue { .. }
+    ));
 }
 
 // JSON structure tests
@@ -789,7 +834,10 @@ fn test_version_2_missing_hot_archive_buckets(mut canonical_v2_json: serde_json:
 
     let has: HistoryFileState = serde_json::from_value(canonical_v2_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("Version 2 .well-known must have hotArchiveBuckets field"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::MissingHotBuckets { version: 2, .. }
+    ));
 }
 
 #[rstest]
@@ -802,7 +850,10 @@ fn test_version_1_with_hot_archive_buckets(
 
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("Version 1 .well-known must not have hotArchiveBuckets field"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::MissingHotBuckets { version: 1, .. }
+    ));
 }
 
 #[rstest]
@@ -860,5 +911,8 @@ fn test_version_2_hot_bucket_validation(mut canonical_v2_json: serde_json::Value
 
     let has: HistoryFileState = serde_json::from_value(canonical_v2_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(error.contains("invalid bucket hash"));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::MalformedBucketHash { .. }
+    ));
 }

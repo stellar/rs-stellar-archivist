@@ -1,10 +1,34 @@
-use anyhow::{Context, Result};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use thiserror::Error;
 use tracing::{error, info, warn};
 
-use crate::history_file::HistoryFileState;
+use crate::history_format::HistoryFileState;
 use crate::storage::StorageRef;
+
+/// Utils module errors - just wraps errors from other modules
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("History format error: {0}")]
+    HistoryFormat(#[from] crate::history_format::Error),
+
+    #[error("No available checkpoints: archive's latest checkpoint 0x{latest_checkpoint:08x} (ledger {latest_ledger}) is below requested low 0x{low_checkpoint:08x} (ledger {low_ledger})")]
+    NoAvailableCheckpoints {
+        latest_checkpoint: u32,
+        latest_ledger: u32,
+        low_checkpoint: u32,
+        low_ledger: u32,
+    },
+
+    #[error("Invalid checkpoint range: low checkpoint 0x{low_checkpoint:08x} is greater than high checkpoint 0x{high_checkpoint:08x}")]
+    InvalidCheckpointRange {
+        low_checkpoint: u32,
+        high_checkpoint: u32,
+    },
+}
 
 /// Shared statistics tracking for archive operations
 /// for consistent reporting across scan and mirror operations
@@ -137,8 +161,8 @@ impl ArchiveStats {
 }
 
 /// Fetch and validate .well-known/stellar-history.json from store
-pub async fn fetch_well_known_history_file(store: &StorageRef) -> Result<HistoryFileState> {
-    use crate::history_file::ROOT_WELL_KNOWN_PATH;
+pub async fn fetch_well_known_history_file(store: &StorageRef) -> Result<HistoryFileState, Error> {
+    use crate::history_format::ROOT_WELL_KNOWN_PATH;
     use tokio::io::AsyncReadExt;
     use tracing::debug;
 
@@ -148,29 +172,29 @@ pub async fn fetch_well_known_history_file(store: &StorageRef) -> Result<History
     let mut reader = store
         .open_reader(ROOT_WELL_KNOWN_PATH)
         .await
-        .with_context(|| format!("Failed to open reader for: {}", ROOT_WELL_KNOWN_PATH))?;
+        .map_err(|e| std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("Failed to open {}: {}", ROOT_WELL_KNOWN_PATH, e),
+        ))?;
     let mut buffer = Vec::new();
     reader
         .read_to_end(&mut buffer)
         .await
-        .with_context(|| format!("Failed to read file: {}", ROOT_WELL_KNOWN_PATH))?;
+        .map_err(|e| std::io::Error::new(
+            e.kind(),
+            format!("Failed to read {}: {}", ROOT_WELL_KNOWN_PATH, e),
+        ))?;
 
     // Parse the JSON
-    let state: HistoryFileState = serde_json::from_slice(&buffer).with_context(|| {
-        format!(
-            "Failed to parse History Archive State from: {}",
-            ROOT_WELL_KNOWN_PATH
-        )
+    let state: HistoryFileState = serde_json::from_slice(&buffer).map_err(|e| {
+        crate::history_format::Error::InvalidJson {
+            path: ROOT_WELL_KNOWN_PATH.to_string(),
+            error: e.to_string(),
+        }
     })?;
 
     // Validate the .well-known format
-    state.validate().map_err(|e| {
-        anyhow::anyhow!(
-            "Invalid .well-known format in {}: {}",
-            ROOT_WELL_KNOWN_PATH,
-            e
-        )
-    })?;
+    state.validate()?;
 
     Ok(state)
 }
@@ -181,14 +205,14 @@ pub async fn compute_checkpoint_bounds(
     source: &StorageRef,
     low: Option<u32>,
     high: Option<u32>,
-) -> Result<(u32, u32)> {
-    use crate::history_file;
+) -> Result<(u32, u32), Error> {
+    use crate::history_format;
     use tracing::{info, warn};
 
     // Fetch the .well-known file from source
     let state = fetch_well_known_history_file(source).await?;
     let current_ledger = state.current_ledger;
-    let highest_source_checkpoint = history_file::round_to_lower_checkpoint(current_ledger);
+    let highest_source_checkpoint = history_format::round_to_lower_checkpoint(current_ledger);
 
     info!(
         "Source archive reports current ledger: {} (checkpoint: 0x{:08x})",
@@ -198,23 +222,25 @@ pub async fn compute_checkpoint_bounds(
     // Check that the user-specified low is not below the source's current checkpoint
     // If low is not provided, default to genesis checkpoint
     let low_checkpoint = if let Some(low) = low {
-        let low_checkpoint = history_file::round_to_lower_checkpoint(low);
+        let low_checkpoint = history_format::round_to_lower_checkpoint(low);
 
         // Check if the source's current checkpoint is below requested low
         if highest_source_checkpoint < low_checkpoint {
-            anyhow::bail!(
-                "No checkpoints above the lower bound: archive's latest checkpoint 0x{:08x} (ledger {}) is below requested low 0x{:08x} (ledger {})",
-                highest_source_checkpoint, current_ledger, low_checkpoint, low
-            );
+            return Err(Error::NoAvailableCheckpoints {
+                latest_checkpoint: highest_source_checkpoint,
+                latest_ledger: current_ledger,
+                low_checkpoint,
+                low_ledger: low,
+            });
         }
 
         low_checkpoint
     } else {
-        history_file::GENESIS_CHECKPOINT_LEDGER
+        history_format::GENESIS_CHECKPOINT_LEDGER
     };
 
     let high_checkpoint = if let Some(high) = high {
-        let high_checkpoint = history_file::round_to_upper_checkpoint(high);
+        let high_checkpoint = history_format::round_to_upper_checkpoint(high);
 
         // Warn if the user passed a high ledger that is above what we see in source
         // We don't fail, but use the source's current checkpoint as the high bound
@@ -233,14 +259,13 @@ pub async fn compute_checkpoint_bounds(
 
     // Make sure we have at least one checkpoint in range
     if low_checkpoint > high_checkpoint {
-        anyhow::bail!(
-            "No checkpoints found in range: low checkpoint 0x{:08x} is greater than high checkpoint 0x{:08x}",
+        return Err(Error::InvalidCheckpointRange {
             low_checkpoint,
-            high_checkpoint
-        );
+            high_checkpoint,
+        });
     }
 
-    let total_count = history_file::count_checkpoints_in_range(low_checkpoint, high_checkpoint);
+    let total_count = history_format::count_checkpoints_in_range(low_checkpoint, high_checkpoint);
     info!(
         "Processing {} checkpoints from 0x{:08x} to 0x{:08x}",
         total_count, low_checkpoint, high_checkpoint

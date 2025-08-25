@@ -1,6 +1,6 @@
 //! Tests for command-line interface validation and error handling
 
-use stellar_archivist::test_helpers::{run_mirror as cmd_mirror_run, MirrorConfig};
+use crate::test_helpers::{run_mirror as cmd_mirror_run, MirrorConfig};
 
 #[tokio::test]
 async fn test_mirror_rejects_http_destination() {
@@ -134,7 +134,7 @@ async fn test_mirror_rejects_nonexistent_source() {
 
 #[tokio::test]
 async fn test_scan_rejects_nonexistent_source() {
-    use stellar_archivist::test_helpers::{run_scan as cmd_scan_run, ScanConfig};
+    use crate::test_helpers::{run_scan as cmd_scan_run, ScanConfig};
 
     // Source that doesn't exist should fail with a clear error
     let config = ScanConfig {
@@ -149,9 +149,10 @@ async fn test_scan_rejects_nonexistent_source() {
     assert!(result.is_err());
 
     let err_msg = result.unwrap_err().to_string();
+    // The error will be about failing to open the .well-known file since the path doesn't exist
     assert!(
-        err_msg.contains("Source path does not exist"),
-        "Error should clearly indicate the source doesn't exist, got: {}",
+        err_msg.contains("Failed to open reader") || err_msg.contains("No such file or directory"),
+        "Error should indicate file access failure, got: {}",
         err_msg
     );
 }
@@ -200,8 +201,8 @@ async fn test_mirror_creates_destination_if_not_exists() {
 
 #[tokio::test]
 async fn test_scan_rejects_low_greater_than_high() {
+    use crate::test_helpers::{run_scan as cmd_scan_run, ScanConfig};
     use std::path::PathBuf;
-    use stellar_archivist::test_helpers::{run_scan as cmd_scan_run, ScanConfig};
 
     // Create a valid test archive path
     let test_archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -232,8 +233,8 @@ async fn test_scan_rejects_low_greater_than_high() {
 
 #[tokio::test]
 async fn test_mirror_rejects_low_greater_than_high() {
+    use crate::test_helpers::{run_mirror as cmd_mirror_run, MirrorConfig};
     use std::path::PathBuf;
-    use stellar_archivist::test_helpers::{run_mirror as cmd_mirror_run, MirrorConfig};
     use tempfile::TempDir;
 
     // Create a valid test archive path

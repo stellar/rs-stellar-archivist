@@ -1,7 +1,7 @@
 //! Tests for mirror edge cases combining cli flags with interesting destination/source states
 
+use crate::test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig};
 use std::path::PathBuf;
-use stellar_archivist::test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig};
 use tempfile::TempDir;
 
 /// Get the test archive path

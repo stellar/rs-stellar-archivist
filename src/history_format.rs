@@ -4,6 +4,7 @@
 //! Archive history files.
 
 use serde::{Deserialize, Serialize};
+use thiserror::Error;
 
 // Both Bucket List types have exactly 11 levels
 const NUM_BUCKETLIST_LEVELS: usize = 11;
@@ -15,19 +16,48 @@ pub const GENESIS_CHECKPOINT_LEDGER: u32 = CHECKPOINT_FREQUENCY - 1;
 // Standard location for .well-known file in archives
 pub const ROOT_WELL_KNOWN_PATH: &str = ".well-known/stellar-history.json";
 
+/// Errors that can occur when working with history files
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Invalid version: expected 1 or 2, got {version}")]
+    InvalidVersion { version: i32 },
+
+    #[error("Version {version} .well-known must {requirement} hotArchiveBuckets field")]
+    MissingHotBuckets { version: i32, requirement: String },
+
+    #[error("Invalid currentLedger: {reason}")]
+    InvalidCurrentLedger { reason: String },
+
+    #[error("Malformed bucket hash: {reason}")]
+    MalformedBucketHash { reason: String },
+
+    #[error("{prefix} level {level} next state is {state} but {issue}")]
+    InvalidNextState {
+        prefix: String,
+        level: usize,
+        state: u32,
+        issue: String,
+    },
+
+    #[error("Invalid next state value at level {level}: {state}")]
+    InvalidNextStateValue { level: usize, state: u32 },
+
+    #[error("Invalid JSON in {path}: {error}")]
+    InvalidJson { path: String, error: String },
+}
+
 // Root .well-known structure describing archive state at a checkpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HistoryFileState {
     pub version: i32,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
-    #[serde(rename = "currentLedger")]
     pub current_ledger: u32,
-    #[serde(rename = "networkPassphrase", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub network_passphrase: Option<String>,
-    #[serde(rename = "currentBuckets")]
     pub current_buckets: [BucketLevel; NUM_BUCKETLIST_LEVELS],
-    #[serde(rename = "hotArchiveBuckets", skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub hot_archive_buckets: Option<[BucketLevel; NUM_BUCKETLIST_LEVELS]>,
 }
 
@@ -56,95 +86,115 @@ pub struct NextState {
 
 impl HistoryFileState {
     // Helper function to validate a single bucket level
-    fn validate_bucket_level(
-        level: &BucketLevel,
-        index: usize,
-        prefix: &str,
-    ) -> Result<(), String> {
+    fn validate_bucket_level(level: &BucketLevel, index: usize, prefix: &str) -> Result<(), Error> {
         if !is_valid_bucket_hash(&level.curr) {
-            return Err(format!("invalid bucket hash {}", level.curr));
+            return Err(Error::MalformedBucketHash {
+                reason: format!("invalid hash: {}", level.curr),
+            });
         }
 
         if !is_valid_bucket_hash(&level.snap) {
-            return Err(format!("invalid bucket hash {}", level.snap));
+            return Err(Error::MalformedBucketHash {
+                reason: format!("invalid hash: {}", level.snap),
+            });
         }
 
         // Validate next state
         match level.next.state {
             0 => {
                 if level.next.output.is_some() {
-                    return Err(format!(
-                        "{} level {} next state is 0 but has output field",
-                        prefix, index
-                    ));
+                    return Err(Error::InvalidNextState {
+                        prefix: prefix.to_string(),
+                        level: index,
+                        state: 0,
+                        issue: "has output field".to_string(),
+                    });
                 }
                 if level.next.curr.is_some()
                     || level.next.snap.is_some()
                     || level.next.shadow.is_some()
                 {
-                    return Err(format!(
-                        "{} level {} next state is 0 but has merge fields",
-                        prefix, index
-                    ));
+                    return Err(Error::InvalidNextState {
+                        prefix: prefix.to_string(),
+                        level: index,
+                        state: 0,
+                        issue: "has merge fields".to_string(),
+                    });
                 }
             }
             1 => {
                 if level.next.output.is_none() {
-                    return Err(format!(
-                        "{} level {} next state is 1 but missing output field",
-                        prefix, index
-                    ));
+                    return Err(Error::InvalidNextState {
+                        prefix: prefix.to_string(),
+                        level: index,
+                        state: 1,
+                        issue: "missing output field".to_string(),
+                    });
                 } else if let Some(ref output) = level.next.output {
                     if !is_valid_bucket_hash(output) {
-                        return Err(format!("invalid bucket hash {}", output));
+                        return Err(Error::MalformedBucketHash {
+                            reason: format!("invalid hash: {}", output),
+                        });
                     }
                 }
                 if level.next.curr.is_some()
                     || level.next.snap.is_some()
                     || level.next.shadow.is_some()
                 {
-                    return Err(format!(
-                        "{} level {} next state is 1 but has merge fields",
-                        prefix, index
-                    ));
+                    return Err(Error::InvalidNextState {
+                        prefix: prefix.to_string(),
+                        level: index,
+                        state: 1,
+                        issue: "has merge fields".to_string(),
+                    });
                 }
             }
             2 => {
                 if level.next.curr.is_none() {
-                    return Err(format!(
-                        "{} level {} next state is 2 but missing curr field",
-                        prefix, index
-                    ));
+                    return Err(Error::InvalidNextState {
+                        prefix: prefix.to_string(),
+                        level: index,
+                        state: 2,
+                        issue: "missing curr field".to_string(),
+                    });
                 } else if let Some(ref curr) = level.next.curr {
                     if !is_valid_bucket_hash(curr) {
-                        return Err(format!("invalid bucket hash {}", curr));
+                        return Err(Error::MalformedBucketHash {
+                            reason: format!("invalid hash: {}", curr),
+                        });
                     }
                 }
 
                 if level.next.snap.is_none() {
-                    return Err(format!(
-                        "{} level {} next state is 2 but missing snap field",
-                        prefix, index
-                    ));
+                    return Err(Error::InvalidNextState {
+                        prefix: prefix.to_string(),
+                        level: index,
+                        state: 2,
+                        issue: "missing snap field".to_string(),
+                    });
                 } else if let Some(ref snap) = level.next.snap {
                     if !is_valid_bucket_hash(snap) {
-                        return Err(format!("invalid bucket hash {}", snap));
+                        return Err(Error::MalformedBucketHash {
+                            reason: format!("invalid hash: {}", snap),
+                        });
                     }
                 }
 
                 if let Some(ref shadow) = level.next.shadow {
                     for hash in shadow.iter() {
                         if !is_valid_bucket_hash(hash) {
-                            return Err(format!("invalid bucket hash {}", hash));
+                            return Err(Error::MalformedBucketHash {
+                                reason: format!("invalid hash: {}", hash),
+                            });
                         }
                     }
                 }
             }
             _ => {
-                return Err(format!(
-                    "Invalid next state value at level {}: {}",
-                    index, level.next.state
-                ));
+                return Err(Error::InvalidNextStateValue {
+                    level: index,
+                    state: level.next.state,
+                });
             }
         }
 
@@ -152,29 +202,38 @@ impl HistoryFileState {
     }
 
     // Validate .well-known format for basic structural/string correctness
-    pub fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), Error> {
         if self.version != 1 && self.version != 2 {
-            return Err(format!(
-                "Invalid version: expected 1 or 2, got {}",
-                self.version
-            ));
+            return Err(Error::InvalidVersion {
+                version: self.version,
+            });
         }
 
         // Version 2 must have hotArchiveBuckets, version 1 must not
         if self.version == 2 && self.hot_archive_buckets.is_none() {
-            return Err("Version 2 .well-known must have hotArchiveBuckets field".to_string());
+            return Err(Error::MissingHotBuckets {
+                version: 2,
+                requirement: "have".to_string(),
+            });
         }
         if self.version == 1 && self.hot_archive_buckets.is_some() {
-            return Err("Version 1 .well-known must not have hotArchiveBuckets field".to_string());
+            return Err(Error::MissingHotBuckets {
+                version: 1,
+                requirement: "not have".to_string(),
+            });
         }
 
         if self.current_ledger == 0 {
-            return Err("currentLedger cannot be 0".to_string());
+            return Err(Error::InvalidCurrentLedger {
+                reason: "cannot be 0".to_string(),
+            });
         } else if !is_checkpoint(self.current_ledger) {
-            return Err(format!(
-                "currentLedger {} is not on a 64-ledger checkpoint boundary",
-                self.current_ledger
-            ));
+            return Err(Error::InvalidCurrentLedger {
+                reason: format!(
+                    "{} is not on a 64-ledger checkpoint boundary",
+                    self.current_ledger
+                ),
+            });
         }
 
         // Validate each bucket level
@@ -309,12 +368,12 @@ pub fn round_to_upper_checkpoint(ledger: u32) -> u32 {
 /// Count the number of checkpoints in the inclusive range [low_checkpoint, high_checkpoint]
 /// Both parameters should already be valid checkpoint values
 pub fn count_checkpoints_in_range(low_checkpoint: u32, high_checkpoint: u32) -> usize {
-    debug_assert!(
+    assert!(
         is_checkpoint(low_checkpoint),
         "low_checkpoint {} is not a valid checkpoint",
         low_checkpoint
     );
-    debug_assert!(
+    assert!(
         is_checkpoint(high_checkpoint),
         "high_checkpoint {} is not a valid checkpoint",
         high_checkpoint
@@ -338,15 +397,17 @@ pub fn checkpoint_prefix(checkpoint: u32) -> String {
 }
 
 // Convert first 6 hex chars of hash to directory path (e.g., "abcdef..." -> "ab/cd/ef")
-pub fn hash_prefix(hash: &str) -> Result<String, String> {
+pub fn hash_prefix(hash: &str) -> Result<String, Error> {
     if hash.len() < 6 {
-        return Err(format!("Hash too short: '{}'", hash));
+        return Err(Error::MalformedBucketHash {
+            reason: format!("hash too short: '{}'", hash),
+        });
     }
     Ok(format!("{}/{}/{}", &hash[0..2], &hash[2..4], &hash[4..6]))
 }
 
 // Generate archive path for given bucket hash
-pub fn bucket_path(hash: &str) -> Result<String, String> {
+pub fn bucket_path(hash: &str) -> Result<String, Error> {
     let prefix = hash_prefix(hash)?;
     Ok(format!("bucket/{}/bucket-{}.xdr.gz", prefix, hash))
 }

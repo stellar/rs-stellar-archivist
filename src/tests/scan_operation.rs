@@ -1,9 +1,9 @@
 //! Tests for scan command operations
 
+use crate::test_helpers::{run_scan, ScanConfig};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use std::path::{Path, PathBuf};
-use stellar_archivist::test_helpers::{run_scan, ScanConfig};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -224,7 +224,7 @@ async fn test_scan_low_beyond_current() {
     assert!(result.is_err());
 
     let err_msg = result.unwrap_err().to_string();
-    assert!(err_msg.contains("No checkpoints above the lower bound"));
+    assert!(err_msg.contains("No available checkpoints"));
 }
 
 #[tokio::test]

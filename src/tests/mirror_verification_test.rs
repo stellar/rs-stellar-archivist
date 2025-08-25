@@ -1,11 +1,11 @@
 //! Correctness tests for mirror command using filesystem operations
 
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use stellar_archivist::{
-    history_file,
+use crate::{
+    history_format,
     test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig},
 };
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 use walkdir::WalkDir;
 
@@ -33,7 +33,7 @@ fn verify_mirror_correctness(source_path: &Path, dest_path: &Path, max_checkpoin
         // For history files within bounds, parse and collect bucket hashes
         if path_str.contains("history-") && path_str.ends_with(".json") {
             let filename = src_file.file_name().unwrap().to_string_lossy();
-            let checkpoint = history_file::checkpoint_from_filename(&filename).expect(&format!(
+            let checkpoint = history_format::checkpoint_from_filename(&filename).expect(&format!(
                 "Failed to extract checkpoint from history filename: {}",
                 filename
             ));
@@ -48,7 +48,7 @@ fn verify_mirror_correctness(source_path: &Path, dest_path: &Path, max_checkpoin
             // Parse the history file to get referenced bucket hashes
             let content = std::fs::read_to_string(&src_file)
                 .expect(&format!("Failed to read history file: {:?}", src_file));
-            let has: history_file::HistoryFileState = serde_json::from_str(&content)
+            let has: history_format::HistoryFileState = serde_json::from_str(&content)
                 .expect(&format!("Failed to parse history file: {:?}", src_file));
             for hash in has.buckets() {
                 expected_bucket_hashes.insert(hash);
@@ -69,7 +69,7 @@ fn verify_mirror_correctness(source_path: &Path, dest_path: &Path, max_checkpoin
                 {
                     let filename = src_file.file_name().unwrap().to_string_lossy();
                     let checkpoint =
-                        history_file::checkpoint_from_filename(&filename).expect(&format!(
+                        history_format::checkpoint_from_filename(&filename).expect(&format!(
                             "Failed to extract checkpoint from history filename: {}",
                             filename
                         ));
@@ -129,7 +129,7 @@ fn verify_mirror_correctness(source_path: &Path, dest_path: &Path, max_checkpoin
         // Check that the bucket file is actually reference by something in bounds
         if path_str.starts_with("bucket/") {
             let filename = dst_file.file_name().unwrap().to_string_lossy();
-            let hash = history_file::bucket_hash_from_filename(&filename).expect(&format!(
+            let hash = history_format::bucket_hash_from_filename(&filename).expect(&format!(
                 "Failed to extract bucket hash from filename: {}",
                 filename
             ));
@@ -145,7 +145,7 @@ fn verify_mirror_correctness(source_path: &Path, dest_path: &Path, max_checkpoin
         if let Some(max_cp) = max_checkpoint {
             if !path_str.starts_with("bucket/") {
                 let filename = dst_file.file_name().unwrap().to_string_lossy();
-                if let Some(checkpoint) = history_file::checkpoint_from_filename(&filename) {
+                if let Some(checkpoint) = history_format::checkpoint_from_filename(&filename) {
                     assert!(
                         checkpoint <= max_cp,
                         "Found file beyond bound: {} (checkpoint 0x{:08x} > 0x{:08x})",

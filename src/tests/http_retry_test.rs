@@ -1,6 +1,6 @@
 //! Tests for HTTP retry logic and error handling
 
-use stellar_archivist::storage::{HttpRetryConfig, HttpStore, Storage};
+use crate::storage::{HttpRetryConfig, HttpStore, Storage};
 use tokio::io::AsyncReadExt;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};

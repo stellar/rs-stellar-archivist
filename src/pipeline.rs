@@ -17,17 +17,36 @@
 //!         spawn a file processing task. The task will open a reader and hand it off to the
 //!         operation's process_object method.
 //!
-use anyhow::Result;
 use lru::LruCache;
 use std::fmt::Debug;
 use std::sync::Arc;
 use std::sync::Mutex;
+use thiserror::Error;
 
 use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
-use crate::history_file;
+use crate::history_format;
 use crate::storage::ReaderResult;
+
+/// Pipeline errors
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("History format error: {0}")]
+    HistoryFormatError(#[from] crate::history_format::Error),
+
+    #[error("Mirror operation error: {0}")]
+    MirrorOperation(#[from] crate::mirror_operation::Error),
+
+    #[error("Scan operation error: {0}")]
+    ScanOperation(#[from] crate::scan_operation::Error),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("{0}")]
+    Other(String),
+}
 
 /// Maximum number of bucket entries to cache in the LRU for deduplication
 /// 1 million entries * ~64 bytes per hash = ~64MB memory max
@@ -44,7 +63,7 @@ pub trait Operation: Send + Sync + 'static {
     async fn get_checkpoint_bounds(
         &self,
         source: &crate::storage::StorageRef,
-    ) -> Result<(u32, u32)>;
+    ) -> Result<(u32, u32), Error>;
 
     /// Process an object
     /// The Pipeline provides either a reader that streams the object content,
@@ -55,7 +74,7 @@ pub trait Operation: Send + Sync + 'static {
     /// Called when all work is complete
     /// The pipeline passes the highest checkpoint that was processed
     /// This is where operations should check their internal failure counts and return an error if needed
-    async fn finalize(&self, highest_checkpoint: u32) -> Result<()>;
+    async fn finalize(&self, highest_checkpoint: u32) -> Result<(), Error>;
 }
 
 #[derive(Debug, Clone)]
@@ -93,7 +112,7 @@ enum FileTaskSource {
     Buffered(Vec<u8>),
     /// Report an error. This is only used for history files, where the previous
     /// Buffered download failed and we need to propagate the error to the archival op.
-    Error(anyhow::Error),
+    Error(crate::storage::Error),
 }
 
 pub struct Pipeline<Op: Operation> {
@@ -110,14 +129,21 @@ pub struct Pipeline<Op: Operation> {
 
 impl<Op: Operation> Pipeline<Op> {
     /// Create a new pipeline
-    pub async fn new(operation: Op, config: PipelineConfig) -> Result<Self> {
+    pub async fn new(operation: Op, config: PipelineConfig) -> Result<Self, Error> {
         // Create source storage backend from URL with retry config
         let retry_config = crate::storage::HttpRetryConfig {
             max_retries: config.max_retries,
             initial_backoff_ms: config.initial_backoff_ms,
         };
         let source_op =
-            crate::storage::StorageBackend::from_url(&config.source, Some(retry_config)).await?;
+            crate::storage::StorageBackend::from_url(&config.source, Some(retry_config))
+                .await
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!("Failed to create storage backend for {}: {}", config.source, e),
+                    )
+                })?;
         // Create LRU cache for bucket deduplication
         let bucket_lru = Arc::new(Mutex::new(LruCache::new(
             std::num::NonZeroUsize::new(BUCKET_LRU_CACHE_SIZE).unwrap(),
@@ -137,7 +163,7 @@ impl<Op: Operation> Pipeline<Op> {
         })
     }
 
-    pub async fn run(self: Arc<Self>) -> Result<()> {
+    pub async fn run(self: Arc<Self>) -> Result<(), Error> {
         // Get checkpoint bounds from the operation
         let (lower_bound, upper_bound) = self
             .operation
@@ -145,7 +171,7 @@ impl<Op: Operation> Pipeline<Op> {
             .await?;
 
         // Calculate total count for progress tracking
-        let total_count = history_file::count_checkpoints_in_range(lower_bound, upper_bound);
+        let total_count = history_format::count_checkpoints_in_range(lower_bound, upper_bound);
         if total_count == 0 {
             info!("No checkpoints to process");
             return Ok(());
@@ -179,7 +205,7 @@ impl<Op: Operation> Pipeline<Op> {
                     // Channel closed, workers have stopped
                     break;
                 }
-                checkpoint += history_file::CHECKPOINT_FREQUENCY;
+                checkpoint += history_format::CHECKPOINT_FREQUENCY;
             }
             drop(checkpoint_tx); // Signal no more checkpoints
             debug!("Checkpoint producer finished");
@@ -255,11 +281,11 @@ impl<Op: Operation> Pipeline<Op> {
         }
 
         // Wait for producer to finish sending all checkpoints
-        producer.await?;
+        producer.await.map_err(|e| Error::Other(format!("Producer task failed: {}", e)))?;
 
         // Wait for all checkpoint processors to finish spawning file tasks
         for processor in checkpoint_processors {
-            processor.await?;
+            processor.await.map_err(|e| Error::Other(format!("Checkpoint processor task failed: {}", e)))?;
         }
 
         // At this point, we've finished processing all the checkpoint files,
@@ -349,7 +375,7 @@ impl<Op: Operation> Pipeline<Op> {
         let source_op = self.source_op.clone();
         let bucket_lru = self.bucket_lru.clone();
 
-        let history_path = history_file::checkpoint_path("history", checkpoint);
+        let history_path = history_format::checkpoint_path("history", checkpoint);
         let history_path_for_fetch = history_path.clone();
         let source_op_for_history = source_op.clone();
 
@@ -365,22 +391,24 @@ impl<Op: Operation> Pipeline<Op> {
             let mut buffer = Vec::new();
             reader.read_to_end(&mut buffer).await?;
 
-            let state: crate::history_file::HistoryFileState = serde_json::from_slice(&buffer)?;
-            state
-                .validate()
-                .map_err(|e| anyhow::anyhow!("Invalid .well-known format: {}", e))?;
-            Ok::<(crate::history_file::HistoryFileState, Vec<u8>), anyhow::Error>((state, buffer))
+            let state: crate::history_format::HistoryFileState = serde_json::from_slice(&buffer)
+                .map_err(|e| crate::history_format::Error::InvalidJson {
+                    path: history_path_for_fetch.clone(),
+                    error: e.to_string(),
+                })?;
+            state.validate()?;
+            Ok::<(crate::history_format::HistoryFileState, Vec<u8>), Error>((state, buffer))
         };
 
         // Start fetching other checkpoint files (ledger, transactions, results)
         for category in &["ledger", "transactions", "results"] {
-            let path = history_file::checkpoint_path(category, checkpoint);
+            let path = history_format::checkpoint_path(category, checkpoint);
             self.spawn_file_task(path, FileTaskSource::Storage { is_optional: false });
         }
 
         // Add optional SCP files if not skipping
         if !self.config.skip_optional {
-            let path = history_file::checkpoint_path("scp", checkpoint);
+            let path = history_format::checkpoint_path("scp", checkpoint);
             self.spawn_file_task(path, FileTaskSource::Storage { is_optional: true });
         }
 
@@ -395,7 +423,7 @@ impl<Op: Operation> Pipeline<Op> {
                 let mut bucket_count = 0;
                 let mut dedup_count = 0;
                 for bucket_hash in checkpoint_state.buckets() {
-                    if let Ok(path) = history_file::bucket_path(&bucket_hash) {
+                    if let Ok(path) = history_format::bucket_path(&bucket_hash) {
                         bucket_count += 1;
                         // Dedup buckets using cache. Note that we only need to dedup
                         // buckets, all other files are guaranteed to be unique.
@@ -427,7 +455,10 @@ impl<Op: Operation> Pipeline<Op> {
 
                 // Forward error to op since the history file was fetched by the pipeline,
                 // not the archival op.
-                let err = anyhow::anyhow!("Failed to download/parse history file: {}", e);
+                let err = crate::storage::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to download/parse history file: {}", e),
+                ));
                 self.spawn_file_task(history_path, FileTaskSource::Error(err));
             }
         }

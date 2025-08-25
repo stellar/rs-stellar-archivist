@@ -1,12 +1,36 @@
 //! Mirror operation - copies files from source to destination
 
-use crate::history_file;
+use crate::history_format;
 use crate::pipeline::{async_trait, Operation};
 use crate::storage::{ReaderResult, StorageRef, WRITE_BUF_BYTES};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
-use anyhow::Result;
+use thiserror::Error;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
+
+/// Mirror operation errors
+#[derive(Error, Debug)]
+pub enum Error {
+    #[error("Cannot mirror: destination archive ends at ledger {dest_ledger} (checkpoint 0x{dest_checkpoint:08x}) but --low is {low_ledger} (checkpoint 0x{low_checkpoint:08x}). This would create a gap in the archive. Use --allow-mirror-gaps to proceed anyway.")]
+    MirrorGapDetected {
+        dest_ledger: u32,
+        dest_checkpoint: u32,
+        low_ledger: u32,
+        low_checkpoint: u32,
+    },
+
+    #[error(transparent)]
+    Utils(#[from] crate::utils::Error),
+
+    #[error("Archive mirror failed")]
+    MirrorFailed,
+
+    #[error("History format error: {0}")]
+    HistoryFormat(#[from] crate::history_format::Error),
+
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+}
 
 pub struct MirrorOperation {
     dst_op: StorageRef,
@@ -29,12 +53,25 @@ impl MirrorOperation {
         low: Option<u32>,
         high: Option<u32>,
         allow_mirror_gaps: bool,
-    ) -> Result<Self> {
-        let dst_op = crate::storage::StorageBackend::from_url(dst, None).await?;
+    ) -> Result<Self, Error> {
+        // Even though HTTP destinations aren't writable, we need to provide retry config
+        // to avoid assertion failure when checking if destination supports writes
+        let retry_config = crate::storage::HttpRetryConfig {
+            max_retries: 3,
+            initial_backoff_ms: 100,
+        };
+        let dst_op = crate::storage::StorageBackend::from_url(dst, Some(retry_config))
+            .await
+            .map_err(|e| match e {
+                crate::storage::Error::Io(io_err) => io_err,
+            })?;
 
         // Destination must support write operations
         if !dst_op.supports_writes() {
-            anyhow::bail!("Destination storage backend does not support write operations. Only filesystem destinations (file://) are currently supported.");
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("Destination storage backend does not support write operations. Only filesystem destinations (file://) are currently supported: {}", dst),
+            ).into());
         }
 
         Ok(Self {
@@ -63,7 +100,7 @@ impl MirrorOperation {
             .clone()
     }
 
-    async fn maybe_update_well_known(&self, highest_checkpoint: u32) -> Result<()> {
+    async fn maybe_update_well_known(&self, highest_checkpoint: u32) -> Result<(), Error> {
         // Check if we should update the .well-known file
         // We should only update if:
         // 1. There's no existing .well-known file, or
@@ -71,7 +108,7 @@ impl MirrorOperation {
 
         let should_update = match self.get_initial_dest_well_known_checkpoint().await {
             Some(existing_ledger) => {
-                let existing_checkpoint = history_file::round_to_lower_checkpoint(existing_ledger);
+                let existing_checkpoint = history_format::round_to_lower_checkpoint(existing_ledger);
                 if highest_checkpoint > existing_checkpoint {
                     info!(
                         "Updating .well-known from checkpoint {:08x} to {:08x}",
@@ -98,11 +135,14 @@ impl MirrorOperation {
 
         if should_update {
             // Copy the history file at the specified checkpoint to be our .well-known file
-            let history_path = history_file::checkpoint_path("history", highest_checkpoint);
+            let history_path = history_format::checkpoint_path("history", highest_checkpoint);
             let well_known_path = ".well-known/stellar-history.json";
 
             let dst_base = self.dst_op.get_base_path().ok_or_else(|| {
-                anyhow::anyhow!("Destination storage doesn't have a filesystem path")
+                std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "Destination storage backend does not have a filesystem path",
+                )
             })?;
 
             let src_file = dst_base.join(&history_path);
@@ -110,22 +150,38 @@ impl MirrorOperation {
 
             // Check if the history file exists (it might not if the mirror had failures)
             if !src_file.exists() {
-                anyhow::bail!(
-                    "Cannot update .well-known: history file at checkpoint {:08x} was not successfully mirrored",
-                    highest_checkpoint
-                );
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    format!(
+                        "Cannot update .well-known: history file at checkpoint {:08x} was not successfully mirrored ({})",
+                        highest_checkpoint,
+                        src_file.display()
+                    ),
+                )
+                .into());
             }
 
             // Ensure the .well-known directory exists
             if let Some(parent) = dst_file.parent() {
                 tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                    anyhow::anyhow!("Failed to create .well-known directory: {}", e)
+                    std::io::Error::new(
+                        e.kind(),
+                        format!("Failed to create directory {}: {}", parent.display(), e),
+                    )
                 })?;
             }
 
-            tokio::fs::copy(&src_file, &dst_file)
-                .await
-                .map_err(|e| anyhow::anyhow!("Failed to copy history to .well-known: {}", e))?;
+            tokio::fs::copy(&src_file, &dst_file).await.map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "Failed to copy {} to {}: {}",
+                        src_file.display(),
+                        dst_file.display(),
+                        e
+                    ),
+                )
+            })?;
 
             info!(
                 "Updated destination .well-known to checkpoint {:08x}",
@@ -139,7 +195,7 @@ impl MirrorOperation {
 
 #[async_trait]
 impl Operation for MirrorOperation {
-    async fn get_checkpoint_bounds(&self, source: &StorageRef) -> Result<(u32, u32)> {
+    async fn get_checkpoint_bounds(&self, source: &StorageRef) -> Result<(u32, u32), crate::pipeline::Error> {
         // Determine the effective low checkpoint based on destination .well-known/stellar-history.json and flags
         //
         // Starting ledger logic:
@@ -157,16 +213,19 @@ impl Operation for MirrorOperation {
             // User specified --low
             if let Some(dest_ledger) = dest_checkpoint_opt {
                 // Destination archive already exists and has a .well-known/stellar-history.json file
-                let dest_checkpoint = history_file::round_to_lower_checkpoint(dest_ledger);
-                let requested_checkpoint = history_file::round_to_lower_checkpoint(requested_low);
+                let dest_checkpoint = history_format::round_to_lower_checkpoint(dest_ledger);
+                let requested_checkpoint = history_format::round_to_lower_checkpoint(requested_low);
 
                 // Check for gaps between highest destination checkpoint and requested low
                 if dest_checkpoint < requested_checkpoint {
                     if !self.allow_mirror_gaps {
-                        anyhow::bail!(
-                            "Cannot mirror: destination archive ends at ledger {} (checkpoint 0x{:08x}) but --low is {} (checkpoint 0x{:08x}). This would create a gap in the archive. Use --allow-mirror-gaps to proceed anyway.",
-                            dest_ledger, dest_checkpoint, requested_low, requested_checkpoint
-                        );
+                        return Err(Error::MirrorGapDetected {
+                            dest_ledger,
+                            dest_checkpoint,
+                            low_ledger: requested_low,
+                            low_checkpoint: requested_checkpoint,
+                        }
+                        .into());
                     } else {
                         warn!(
                             "WARNING: Creating gap in archive! Destination ends at ledger {} (checkpoint 0x{:08x}) but mirroring from {} (checkpoint 0x{:08x})",
@@ -219,7 +278,9 @@ impl Operation for MirrorOperation {
             }
         };
 
-        compute_checkpoint_bounds(source, effective_low, self.high).await
+        compute_checkpoint_bounds(source, effective_low, self.high)
+            .await
+            .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))
     }
 
     async fn process_object(&self, path: &str, reader_result: ReaderResult) {
@@ -279,18 +340,18 @@ impl Operation for MirrorOperation {
         }
     }
 
-    async fn finalize(&self, highest_checkpoint: u32) -> Result<()> {
+    async fn finalize(&self, highest_checkpoint: u32) -> Result<(), crate::pipeline::Error> {
         self.stats.report("mirror").await;
 
         // Update .well-known file with the highest checkpoint we processed
         if let Err(e) = self.maybe_update_well_known(highest_checkpoint).await {
             error!("Failed to update .well-known file: {}", e);
-            return Err(e);
+            return Err(e.into());
         }
 
         // Report failure if there were any failed files
         if self.stats.has_failures() {
-            anyhow::bail!("Archive mirror failed");
+            return Err(Error::MirrorFailed.into());
         }
 
         Ok(())

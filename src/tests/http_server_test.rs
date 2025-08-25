@@ -1,10 +1,10 @@
 //! Test HTTP via local server
 
+use crate::test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig};
 use axum::{routing::get_service, Router};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use stellar_archivist::test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
@@ -420,7 +420,7 @@ async fn test_mirror_race_condition_with_advancing_archive() {
 
 // Helper function to test HTTP/HTTPS client connections
 async fn test_client_connection(url_str: &str, description: &str) {
-    use stellar_archivist::storage::{HttpRetryConfig, HttpStore, Storage};
+    use crate::storage::{HttpRetryConfig, HttpStore, Storage};
 
     let retry_config = HttpRetryConfig {
         max_retries: 3,
