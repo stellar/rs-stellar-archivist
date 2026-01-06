@@ -15,6 +15,9 @@ pub const WRITE_BUF_BYTES: usize = 128 * 1024;
 pub enum Error {
     #[error("{0}")]
     Io(#[from] io::Error),
+
+    #[error("File not found")]
+    NotFound,
 }
 
 pub type BoxedAsyncRead = Box<dyn tokio::io::AsyncRead + Send + Unpin + 'static>;
@@ -137,18 +140,24 @@ fn new_http_client(use_http2: bool) -> Result<reqwest::Client, Error> {
     h.insert(USER_AGENT, HeaderValue::from_str(&user_agent).unwrap());
 
     let mut builder = reqwest::Client::builder()
-        .pool_max_idle_per_host(1024)
-        .pool_idle_timeout(std::time::Duration::from_secs(120))
+        // No timeout - allow unlimited time for large file transfers
+        // The connect_timeout still ensures we don't hang on connection attempts
+        .connect_timeout(std::time::Duration::from_secs(10))
         .tcp_nodelay(true)
         .default_headers(h);
+
+    // Common pool settings
+    builder = builder
+        .pool_max_idle_per_host(1024)
+        .pool_idle_timeout(std::time::Duration::from_secs(120))
+        .tcp_keepalive(Some(std::time::Duration::from_secs(60)));
 
     if use_http2 {
         // For HTTPS: allow HTTP/2 with adaptive window
         builder = builder
-            .http2_adaptive_window(true)
-            .tcp_keepalive(Some(std::time::Duration::from_secs(60)))
             .http2_keep_alive_while_idle(true)
-            .http2_keep_alive_interval(std::time::Duration::from_secs(30));
+            .http2_keep_alive_interval(std::time::Duration::from_secs(30))
+            .http2_adaptive_window(true);
     } else {
         // For HTTP: force HTTP/1.1 only
         builder = builder.http1_only();
@@ -270,7 +279,7 @@ impl Storage for HttpStore {
                         }
                     }
                 }
-                Err(e) => {
+                Err(_e) => {
                     // Network/connection error - always retryable
                     if attempt >= self.retry_config.max_retries {
                         return Err(io::Error::new(

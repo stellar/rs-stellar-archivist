@@ -75,6 +75,12 @@ pub trait Operation: Send + Sync + 'static {
     /// The pipeline passes the highest checkpoint that was processed
     /// This is where operations should check their internal failure counts and return an error if needed
     async fn finalize(&self, highest_checkpoint: u32) -> Result<(), Error>;
+
+    /// Indicates if this operation only needs to check existence (uses HEAD requests)
+    /// Returns true for scan operations to avoid HTTP/2 stream resets
+    fn use_head_requests(&self) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -340,17 +346,51 @@ impl<Op: Operation> Pipeline<Op> {
             // Get or create the reader based on the source
             let reader_result = match source {
                 // Open a reader stream for the file from backend storage
-                FileTaskSource::Storage { is_optional } => match src.open_reader(&path).await {
-                    Ok(reader) => ReaderResult::Ok(reader),
-                    Err(e) => {
-                        if is_optional {
-                            debug!("Failed to get reader for optional {}: {}", path, e);
-                        } else {
-                            error!("Failed to get reader for {}: {}", path, e);
+                FileTaskSource::Storage { is_optional } => {
+                    if op.use_head_requests() {
+                        // For scan operations, just check existence to avoid HTTP/2 stream resets
+                        match src.exists(&path).await {
+                            Ok(true) => {
+                                // File exists - create a dummy reader that won't be used
+                                let empty = Box::new(std::io::Cursor::new(Vec::new()))
+                                    as crate::storage::BoxedAsyncRead;
+                                ReaderResult::Ok(empty)
+                            }
+                            Ok(false) => {
+                                if is_optional {
+                                    debug!("Optional file doesn't exist: {}", path);
+                                } else {
+                                    error!("File doesn't exist: {}", path);
+                                }
+                                ReaderResult::Err(crate::storage::Error::NotFound)
+                            }
+                            Err(e) => {
+                                if is_optional {
+                                    debug!(
+                                        "Failed to check existence for optional {}: {}",
+                                        path, e
+                                    );
+                                } else {
+                                    error!("Failed to check existence for {}: {}", path, e);
+                                }
+                                ReaderResult::Err(e.into())
+                            }
                         }
-                        ReaderResult::Err(e.into())
+                    } else {
+                        // Normal path - open a reader for actual content streaming
+                        match src.open_reader(&path).await {
+                            Ok(reader) => ReaderResult::Ok(reader),
+                            Err(e) => {
+                                if is_optional {
+                                    debug!("Failed to get reader for optional {}: {}", path, e);
+                                } else {
+                                    error!("Failed to get reader for {}: {}", path, e);
+                                }
+                                ReaderResult::Err(e.into())
+                            }
+                        }
                     }
-                },
+                }
                 // Use already-buffered content
                 FileTaskSource::Buffered(buffer) => {
                     let reader =

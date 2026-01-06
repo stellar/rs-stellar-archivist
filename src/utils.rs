@@ -187,10 +187,9 @@ pub async fn fetch_well_known_history_file(store: &StorageRef) -> Result<History
         )
     })?;
     let mut buffer = Vec::new();
-    reader
-        .read_to_end(&mut buffer)
-        .await
-        .map_err(|e| std::io::Error::new(e.kind(), format!("Reading {}: {}", ROOT_WELL_KNOWN_PATH, e)))?;
+    reader.read_to_end(&mut buffer).await.map_err(|e| {
+        std::io::Error::new(e.kind(), format!("Reading {}: {}", ROOT_WELL_KNOWN_PATH, e))
+    })?;
 
     // Parse the JSON
     let state: HistoryFileState =

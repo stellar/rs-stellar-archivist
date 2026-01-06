@@ -51,35 +51,19 @@ impl Operation for ScanOperation {
     }
 
     async fn process_object(&self, path: &str, reader_result: ReaderResult) {
-        use tokio::io::AsyncReadExt;
-
-        let mut reader = match reader_result {
-            ReaderResult::Ok(r) => r,
+        // For scan, we only need to verify the file exists and is accessible
+        // The pipeline already attempted to open the file, so if we got a reader, it exists
+        // We don't read from it to avoid HTTP/2 stream resets that cause rate limiting
+        match reader_result {
+            ReaderResult::Ok(_reader) => {
+                // File exists and is accessible (pipeline successfully opened it)
+                debug!("Validated: {}", path);
+                self.stats.record_success(path);
+                // Drop the reader without reading to avoid stream resets
+            }
             ReaderResult::Err(_e) => {
                 // Source file couldn't be read
                 error!("Invalid file: {} - File not found or inaccessible", path);
-                self.stats.record_failure(path).await;
-                return;
-            }
-        };
-
-        // Stream the file and check that we can read at least one byte
-        // This validates the file exists and is readable without buffering the entire content
-        let mut buffer = [0u8; 1];
-        match reader.read(&mut buffer).await {
-            Ok(n) if n > 0 => {
-                // File exists and has content
-                debug!("Validated: {}", path);
-                self.stats.record_success(path);
-            }
-            Ok(_) => {
-                // Empty file
-                error!("Invalid file: {} - Empty file", path);
-                self.stats.record_failure(path).await;
-            }
-            Err(e) => {
-                // Error reading file
-                error!("Invalid file: {} - Read error: {}", path, e);
                 self.stats.record_failure(path).await;
             }
         }
@@ -94,5 +78,11 @@ impl Operation for ScanOperation {
         }
 
         Ok(())
+    }
+
+    fn use_head_requests(&self) -> bool {
+        // Scan only needs to check existence, not read content
+        // Using HEAD requests avoids HTTP/2 stream resets
+        true
     }
 }

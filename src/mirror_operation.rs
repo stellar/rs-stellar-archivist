@@ -64,6 +64,9 @@ impl MirrorOperation {
             .await
             .map_err(|e| match e {
                 crate::storage::Error::Io(io_err) => io_err,
+                crate::storage::Error::NotFound => {
+                    std::io::Error::new(std::io::ErrorKind::NotFound, "Storage backend not found")
+                }
             })?;
 
         // Destination must support write operations
@@ -326,6 +329,7 @@ impl Operation for MirrorOperation {
         let write_result = async {
             let writer = self.dst_op.open_writer(path).await?;
             let mut buf_writer = BufWriter::with_capacity(WRITE_BUF_BYTES, writer);
+
             tokio::io::copy(&mut reader, &mut buf_writer).await?;
             buf_writer.flush().await?;
             Ok::<(), std::io::Error>(())
