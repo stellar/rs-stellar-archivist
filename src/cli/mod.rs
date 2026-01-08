@@ -6,8 +6,7 @@ use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 use std::io;
 use thiserror::Error;
-use tracing::Level;
-use tracing_subscriber::FmtSubscriber;
+use tracing_subscriber::{fmt, EnvFilter};
 
 /// CLI errors
 #[derive(Error, Debug)]
@@ -96,16 +95,23 @@ where
 {
     let cli = Cli::try_parse_from(args)?;
 
-    let log_level = if cli.trace {
-        Level::TRACE
+    // Determine log level from CLI flags
+    let level = if cli.trace {
+        "trace"
     } else if cli.debug {
-        Level::DEBUG
+        "debug"
     } else {
-        Level::INFO
+        "info"
     };
 
-    let subscriber = FmtSubscriber::builder()
-        .with_max_level(log_level)
+    // Build filter: set default level and suppress noisy HTTP/2 and networking crates
+    let filter = EnvFilter::new(format!(
+        "{},h2=warn,hyper=warn,hyper_util=warn,reqwest=warn,tokio=warn,tower=warn,rustls=warn",
+        level
+    ));
+
+    let subscriber = fmt::Subscriber::builder()
+        .with_env_filter(filter)
         .with_target(false)
         .finish();
     tracing::subscriber::set_global_default(subscriber)

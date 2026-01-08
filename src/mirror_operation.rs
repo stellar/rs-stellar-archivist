@@ -2,7 +2,7 @@
 
 use crate::history_format;
 use crate::pipeline::{async_trait, Operation};
-use crate::storage::{ReaderResult, StorageRef, WRITE_BUF_BYTES};
+use crate::storage::{BoxedAsyncRead, Error as StorageError, StorageRef, WRITE_BUF_BYTES};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use thiserror::Error;
 use tokio::sync::OnceCell;
@@ -27,6 +27,9 @@ pub enum Error {
 
     #[error("History format error: {0}")]
     HistoryFormat(#[from] crate::history_format::Error),
+
+    #[error("Storage error: {0}")]
+    Storage(#[from] crate::storage::Error),
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -54,20 +57,7 @@ impl MirrorOperation {
         high: Option<u32>,
         allow_mirror_gaps: bool,
     ) -> Result<Self, Error> {
-        // Even though HTTP destinations aren't writable, we need to provide retry config
-        // to avoid assertion failure when checking if destination supports writes
-        let retry_config = crate::storage::HttpRetryConfig {
-            max_retries: 3,
-            initial_backoff_ms: 100,
-        };
-        let dst_op = crate::storage::StorageBackend::from_url(dst, Some(retry_config))
-            .await
-            .map_err(|e| match e {
-                crate::storage::Error::Io(io_err) => io_err,
-                crate::storage::Error::NotFound => {
-                    std::io::Error::new(std::io::ErrorKind::NotFound, "Storage backend not found")
-                }
-            })?;
+        let dst_op = crate::storage::StorageBackend::from_url(dst).await?;
 
         // Destination must support write operations
         if !dst_op.supports_writes() {
@@ -290,39 +280,32 @@ impl Operation for MirrorOperation {
             .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))
     }
 
-    async fn process_object(&self, path: &str, reader_result: ReaderResult) {
-        let mut reader = match reader_result {
-            ReaderResult::Ok(r) => r,
-            ReaderResult::Err(e) => {
-                // Source file couldn't be read - count as failure
-                error!("Failed to read source file {}: {}", path, e);
-                self.stats.record_failure(path).await;
-                return;
-            }
-        };
-        // Check if file exists and handle based on overwrite mode
+    async fn pre_check(&self, path: &str) -> Option<Result<(), StorageError>> {
+        // Check destination before querying source, skip if file already exists
         match self.dst_op.exists(path).await {
             Ok(true) => {
+                // If file exists and we're not overwriting, skip it
                 if !self.overwrite {
-                    debug!("Skipping existing file: {}", path);
-                    self.stats.record_skipped(path);
-                    return;
-                } else {
-                    // Proceed with overwrite
-                    info!("Overwriting existing file: {}", path);
+                    return Some(Ok(()));
                 }
+                // Overwrite mode - proceed to download
+                None
             }
             Ok(false) => {
-                // File doesn't exist, proceed with download
+                // File doesn't exist - proceed to download
+                None
             }
             Err(e) => {
-                // Failed to check existence - treat as error
-                error!("Failed to check existence of file {}: {}", path, e);
-                self.stats.record_failure(path).await;
-                return;
+                // Failed to check existence on destination
+                Some(Err(StorageError::fatal(format!(
+                    "Failed to check existence of destination {}: {}",
+                    path, e
+                ))))
             }
         }
+    }
 
+    async fn process_object(&self, path: &str, mut reader: BoxedAsyncRead) -> Result<(), StorageError> {
         use tokio::io::{AsyncWriteExt, BufWriter};
 
         // Stream from source to destination
@@ -337,15 +320,42 @@ impl Operation for MirrorOperation {
         .await;
 
         match write_result {
-            Ok(_) => {
-                debug!("Successfully copied: {}", path);
-                self.stats.record_success(path);
-            }
+            Ok(_) => Ok(()),
             Err(e) => {
-                error!("Failed to write file {}: {}", path, e);
-                self.stats.record_failure(path).await;
+                // Streaming/write error - clean up partial file before retrying
+                if let Some(base_path) = self.dst_op.get_base_path() {
+                    let file_path = base_path.join(path);
+                    if file_path.exists() {
+                        if let Err(rm_err) = tokio::fs::remove_file(&file_path).await {
+                            // If we fail to clean up the partial file, we can't retry
+                            return Err(StorageError::fatal(format!(
+                                "Failed to remove partial file {}: {}",
+                                file_path.display(),
+                                rm_err
+                            )));
+                        }
+                    }
+                }
+                // Partial file cleaned up, safe to retry
+                Err(StorageError::retry(format!("Stream error: {}", e)))
             }
         }
+    }
+
+    fn record_success(&self, path: &str) {
+        self.stats.record_success(path);
+    }
+
+    async fn record_failure(&self, path: &str) {
+        self.stats.record_failure(path).await;
+    }
+
+    fn record_retry(&self) {
+        self.stats.record_retry();
+    }
+
+    fn record_skipped(&self, path: &str) {
+        self.stats.record_skipped(path);
     }
 
     async fn finalize(&self, highest_checkpoint: u32) -> Result<(), crate::pipeline::Error> {

@@ -1,9 +1,8 @@
 /// Scan operation - validates that files exist
 use crate::pipeline::{async_trait, Operation};
-use crate::storage::{ReaderResult, StorageRef};
+use crate::storage::{BoxedAsyncRead, Error as StorageError, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, ArchiveStats};
 use thiserror::Error;
-use tracing::{debug, error};
 
 /// Scan operation errors
 #[derive(Error, Debug)]
@@ -50,23 +49,25 @@ impl Operation for ScanOperation {
             .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))
     }
 
-    async fn process_object(&self, path: &str, reader_result: ReaderResult) {
-        // For scan, we only need to verify the file exists and is accessible
-        // The pipeline already attempted to open the file, so if we got a reader, it exists
-        // We don't read from it to avoid HTTP/2 stream resets that cause rate limiting
-        match reader_result {
-            ReaderResult::Ok(_reader) => {
-                // File exists and is accessible (pipeline successfully opened it)
-                debug!("Validated: {}", path);
-                self.stats.record_success(path);
-                // Drop the reader without reading to avoid stream resets
-            }
-            ReaderResult::Err(_e) => {
-                // Source file couldn't be read
-                error!("Invalid file: {} - File not found or inaccessible", path);
-                self.stats.record_failure(path).await;
-            }
-        }
+    async fn process_object(&self, _path: &str, _reader: BoxedAsyncRead) -> Result<(), StorageError> {
+        // For now, scan just checks existence.
+        unreachable!("ScanOperation uses existence_check_only(), process_object should not be called")
+    }
+
+    fn record_success(&self, path: &str) {
+        self.stats.record_success(path);
+    }
+
+    async fn record_failure(&self, path: &str) {
+        self.stats.record_failure(path).await;
+    }
+
+    fn record_retry(&self) {
+        self.stats.record_retry();
+    }
+
+    fn record_skipped(&self, _path: &str) {
+        // Scan never skips files
     }
 
     async fn finalize(&self, _highest_checkpoint: u32) -> Result<(), crate::pipeline::Error> {
@@ -80,9 +81,9 @@ impl Operation for ScanOperation {
         Ok(())
     }
 
-    fn use_head_requests(&self) -> bool {
+    fn existence_check_only(&self) -> bool {
         // Scan only needs to check existence, not read content
-        // Using HEAD requests avoids HTTP/2 stream resets
+        // TODO: Add full verification when --verify is set
         true
     }
 }

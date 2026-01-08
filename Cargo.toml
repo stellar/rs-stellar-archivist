@@ -46,6 +46,7 @@ tempfile = { version = "3.5.0" }
 rand = { version = "0.8" }
 rstest = { version = "0.18.2" }
 axum = { version = "0.7" }
+tower = { version = "0.5" }
 tower-http = { version = "0.6", features = ["fs"] }
 walkdir = { version = "2" }
 wiremock = { version = "0.6" }

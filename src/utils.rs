@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::history_format::HistoryFileState;
 use crate::pipeline;
@@ -53,6 +53,9 @@ pub struct ArchiveStats {
     // Skipped files (already exist in mirror mode)
     pub skipped_files: AtomicU64,
 
+    // Number of retry attempts (not unique files, but total retries)
+    pub retry_count: AtomicU64,
+
     pub missing_required: AtomicU64,
     pub missing_history: AtomicU64,
     pub missing_ledger: AtomicU64,
@@ -71,6 +74,7 @@ impl ArchiveStats {
             successful_files: AtomicU64::new(0),
             failed_files: AtomicU64::new(0),
             skipped_files: AtomicU64::new(0),
+            retry_count: AtomicU64::new(0),
             missing_required: AtomicU64::new(0),
             missing_history: AtomicU64::new(0),
             missing_ledger: AtomicU64::new(0),
@@ -89,6 +93,11 @@ impl ArchiveStats {
     /// Record a skipped file (already exists in mirror mode)
     pub fn record_skipped(&self, _path: &str) {
         self.skipped_files.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record a retry attempt
+    pub fn record_retry(&self) {
+        self.retry_count.fetch_add(1, Ordering::Relaxed);
     }
 
     pub async fn record_failure(&self, path: &str) {
@@ -121,6 +130,7 @@ impl ArchiveStats {
         let successful = self.successful_files.load(Ordering::Relaxed);
         let failed = self.failed_files.load(Ordering::Relaxed);
         let skipped = self.skipped_files.load(Ordering::Relaxed);
+        let retries = self.retry_count.load(Ordering::Relaxed);
 
         if operation == "mirror" {
             info!(
@@ -134,6 +144,12 @@ impl ArchiveStats {
                 successful, failed, missing_required
             );
         }
+
+        // Debug-level stats summary
+        debug!(
+            "Stats: {} successful, {} failed, {} skipped, {} retries",
+            successful, failed, skipped, retries
+        );
 
         if failed == 0 {
             return;

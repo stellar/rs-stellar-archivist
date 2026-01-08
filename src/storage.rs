@@ -10,28 +10,52 @@ use tokio_util::io::StreamReader;
 
 pub const WRITE_BUF_BYTES: usize = 128 * 1024;
 
-/// Storage-related errors - primarily wraps IO errors
-#[derive(Error, Debug)]
-pub enum Error {
-    #[error("{0}")]
-    Io(#[from] io::Error),
-
-    #[error("File not found")]
+/// Classification of errors for retry decisions
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorClass {
+    /// Transient error - worth retrying (503, 502, timeouts, connection errors)
+    Retry,
+    /// Fatal error - don't retry (403, invalid data, etc.)
+    Fatal,
+    /// File not found - don't retry, but may need special handling
     NotFound,
+}
+
+/// Storage-related errors with retry classification
+#[derive(Error, Debug)]
+#[error("{message}")]
+pub struct Error {
+    pub class: ErrorClass,
+    pub message: String,
+}
+
+impl Error {
+    pub fn retry(message: impl Into<String>) -> Self {
+        Self {
+            class: ErrorClass::Retry,
+            message: message.into(),
+        }
+    }
+
+    pub fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            class: ErrorClass::Fatal,
+            message: message.into(),
+        }
+    }
+
+    pub fn not_found() -> Self {
+        Self {
+            class: ErrorClass::NotFound,
+            message: "File not found".into(),
+        }
+    }
 }
 
 pub type BoxedAsyncRead = Box<dyn tokio::io::AsyncRead + Send + Unpin + 'static>;
 pub type BoxedAsyncWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin + 'static>;
 
 pub type StorageRef = Arc<dyn Storage + Send + Sync>;
-
-/// Result from attempting to get a reader for an object
-pub enum ReaderResult {
-    /// Successfully obtained a reader
-    Ok(BoxedAsyncRead),
-    /// Failed to get reader (file missing or inaccessible)
-    Err(Error),
-}
 
 #[derive(Clone, Debug)]
 pub struct ObjectInfo {
@@ -42,10 +66,10 @@ pub struct ObjectInfo {
 #[async_trait]
 pub trait Storage: Send + Sync {
     /// Open an async reader for the object
-    async fn open_reader(&self, object: &str) -> io::Result<BoxedAsyncRead>;
+    async fn open_reader(&self, object: &str) -> Result<BoxedAsyncRead, Error>;
 
     /// Check if object exists
-    async fn exists(&self, object: &str) -> io::Result<bool>;
+    async fn exists(&self, object: &str) -> Result<bool, Error>;
 
     /// Open a writer for streaming data to an object (only supported by filesystem backend)
     async fn open_writer(&self, _object: &str) -> io::Result<BoxedAsyncWrite> {
@@ -88,14 +112,33 @@ impl FileStore {
 
 #[async_trait]
 impl Storage for FileStore {
-    async fn open_reader(&self, object: &str) -> io::Result<BoxedAsyncRead> {
+    async fn open_reader(&self, object: &str) -> Result<BoxedAsyncRead, Error> {
         let path = self.relative_to_absolute(object);
-        let file = tokio::fs::File::open(&path).await?;
-        Ok(Box::new(file))
+        match tokio::fs::File::open(&path).await {
+            Ok(file) => Ok(Box::new(file)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Error::not_found()),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                Err(Error::fatal(format!("Permission denied: {}", path.display())))
+            }
+            Err(e) => Err(Error::retry(format!("IO error: {}", e))),
+        }
     }
 
-    async fn exists(&self, object: &str) -> io::Result<bool> {
-        Ok(tokio::fs::try_exists(self.relative_to_absolute(object)).await?)
+    async fn exists(&self, object: &str) -> Result<bool, Error> {
+        let path = self.relative_to_absolute(object);
+        match tokio::fs::metadata(&path).await {
+            Ok(meta) => {
+                // File exists - also verify it's not empty
+                if meta.len() == 0 {
+                    tracing::debug!("File exists but is empty: {}", path.display());
+                    Ok(false) // Treat empty files as non-existent
+                } else {
+                    Ok(true)
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(Error::retry(format!("IO error: {}", e))),
+        }
     }
 
     async fn open_writer(&self, object: &str) -> io::Result<BoxedAsyncWrite> {
@@ -163,49 +206,29 @@ fn new_http_client(use_http2: bool) -> Result<reqwest::Client, Error> {
         builder = builder.http1_only();
     }
 
-    Ok(builder.build().map_err(|e| {
-        io::Error::new(
-            io::ErrorKind::Other,
-            format!("Failed to create HTTP client: {}", e),
-        )
-    })?)
-}
-
-#[derive(Clone, Debug)]
-pub struct HttpRetryConfig {
-    pub max_retries: u32,
-    pub initial_backoff_ms: u64,
+    builder
+        .build()
+        .map_err(|e| Error::fatal(format!("Failed to create HTTP client: {}", e)))
 }
 
 /// HTTP storage backend with streaming support
 pub struct HttpStore {
     base_url: reqwest::Url,
     client: Arc<reqwest::Client>,
-    retry_config: HttpRetryConfig,
 }
 
 impl HttpStore {
-    pub fn new(mut base_url: reqwest::Url, retry_config: HttpRetryConfig) -> Self {
+    pub fn new(mut base_url: reqwest::Url) -> Self {
         // Ensure base URL ends with /
         if !base_url.path().ends_with('/') {
             base_url.set_path(&format!("{}/", base_url.path()));
         }
 
-        tracing::debug!(
-            "Creating HttpStore with retry config: max_retries={}, initial_backoff_ms={}",
-            retry_config.max_retries,
-            retry_config.initial_backoff_ms
-        );
-
         // Use HTTP/2 only for HTTPS URLs
         let use_http2 = base_url.scheme() == "https";
         let client = Arc::new(new_http_client(use_http2).expect("Failed to build HTTP client"));
 
-        Self {
-            base_url,
-            client,
-            retry_config,
-        }
+        Self { base_url, client }
     }
 
     /// Convert an archive object path to a complete URL.
@@ -218,149 +241,102 @@ impl HttpStore {
     }
 }
 
+/// Classify an HTTP status code
+fn classify_http_status(status: u16) -> ErrorClass {
+    match status {
+        // Not found
+        404 => ErrorClass::NotFound,
+        // Retryable server/proxy errors
+        408 | // Request Timeout
+        429 | // Too Many Requests
+        500 | // Internal Server Error
+        502 | // Bad Gateway
+        503 | // Service Unavailable
+        504 => ErrorClass::Retry, // Gateway Timeout
+        // Everything else is fatal
+        _ => ErrorClass::Fatal,
+    }
+}
+
 fn to_io_error<E: std::error::Error + Send + Sync + 'static>(e: E) -> io::Error {
     io::Error::new(io::ErrorKind::Other, e)
 }
 
 #[async_trait]
 impl Storage for HttpStore {
-    async fn open_reader(&self, object: &str) -> io::Result<BoxedAsyncRead> {
-        let mut attempt = 0;
-        let mut backoff_ms = self.retry_config.initial_backoff_ms;
+    async fn open_reader(&self, object: &str) -> Result<BoxedAsyncRead, Error> {
         let url = self.object_path_to_url(object);
+        let request = self.client.get(url.clone());
 
-        // Retry logic: We retry up to max_retries times with exponential backoff for:
-        // - Network/connection errors
-        // - HTTP 408, 429, 500, 502, 503, 504
-        // We do NOT retry client errors (4xx) except 408/429
-        // TODO: Currently handles retries for initial connection request, but not for streaming
-        // We still need to implement better error handling for bucket files.
-        loop {
-            let request = self.client.get(url.clone());
-            let result = request.send().await;
-
-            match result {
-                Ok(resp) => {
-                    match resp.error_for_status() {
-                        Ok(resp) => {
-                            let stream = resp.bytes_stream().map_err(to_io_error);
-                            let reader = StreamReader::new(stream);
-                            return Ok(Box::new(reader) as BoxedAsyncRead);
-                        }
-                        Err(e) => {
-                            let status = e.status();
-
-                            // Determine if error is retryable
-                            let is_retryable = status.map_or(false, |s| {
-                                matches!(
-                                    s.as_u16(),
-                                    408 | // Request Timeout
-                                    429 | // Too Many Requests
-                                    500 | // Internal Server Error
-                                    502 | // Bad Gateway
-                                    503 | // Service Unavailable
-                                    504 // Gateway Timeout
-                                )
-                            });
-
-                            if !is_retryable || attempt >= self.retry_config.max_retries {
-                                // Fatal error or max retries exceeded
-                                if let Some(status) = status {
-                                    return Err(io::Error::new(
-                                        io::ErrorKind::Other,
-                                        format!("HTTP {}", status),
-                                    ));
-                                } else {
-                                    return Err(to_io_error(e));
-                                }
-                            }
-
-                            // Retryable error, continue to backoff
-                        }
+        match request.send().await {
+            Ok(resp) => {
+                match resp.error_for_status() {
+                    Ok(resp) => {
+                        let stream = resp.bytes_stream().map_err(to_io_error);
+                        let reader = StreamReader::new(stream);
+                        Ok(Box::new(reader) as BoxedAsyncRead)
                     }
-                }
-                Err(_e) => {
-                    // Network/connection error - always retryable
-                    if attempt >= self.retry_config.max_retries {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            "Connection failed".to_string(),
-                        ));
+                    Err(e) => {
+                        let status = e.status();
+                        let class = status
+                            .map(|s| classify_http_status(s.as_u16()))
+                            .unwrap_or(ErrorClass::Retry);
+                        let message = status
+                            .map(|s| format!("HTTP {}", s))
+                            .unwrap_or_else(|| e.to_string());
+                        Err(Error { class, message })
                     }
                 }
             }
-
-            // Exponential backoff before retry
-            attempt += 1;
-            tracing::debug!(
-                "Retrying {} (attempt {}/{}), backing off {}ms",
-                object,
-                attempt,
-                self.retry_config.max_retries,
-                backoff_ms
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
-            backoff_ms = (backoff_ms * 2).min(5000); // Cap at 5 seconds
+            Err(e) => {
+                // Network/connection error - always retryable
+                Err(Error::retry(format!("Connection error: {}", e)))
+            }
         }
     }
 
-    async fn exists(&self, object: &str) -> io::Result<bool> {
-        let mut attempt = 0;
-        let mut backoff_ms = self.retry_config.initial_backoff_ms;
+    async fn exists(&self, object: &str) -> Result<bool, Error> {
         let url = self.object_path_to_url(object);
+        let result = self.client.head(url.clone()).send().await;
 
-        // Retry logic: Use HEAD to check existence
-        // - 2xx returns true (exists)
-        // - 404 returns false (doesn't exist)
-        // - All other statuses are retried up to max_retries times
-        loop {
-            let result = self.client.head(url.clone()).send().await;
+        match result {
+            Ok(resp) => {
+                let status = resp.status();
+                match status.as_u16() {
+                    200..=299 => {
+                        // Check Content-Length to ensure file is not empty
+                        let content_length = resp
+                            .headers()
+                            .get(reqwest::header::CONTENT_LENGTH)
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(|s| s.parse::<u64>().ok())
+                            .unwrap_or(0);
 
-            match result {
-                Ok(resp) => {
-                    let status = resp.status();
-                    match status.as_u16() {
-                        200..=299 => return Ok(true), // Object exists
-                        404 => return Ok(false),      // Object definitely doesn't exist
-                        _ => {
-                            // Any other status (5xx, 4xx, etc.) - retry
-                            if attempt >= self.retry_config.max_retries {
-                                return Err(io::Error::new(
-                                    io::ErrorKind::Other,
-                                    format!(
-                                        "Failed to check existence of {} (HTTP {})",
-                                        object, status
-                                    ),
-                                ));
-                            }
+                        if content_length == 0 {
+                            tracing::debug!(
+                                "File exists but is empty (Content-Length: 0): {}",
+                                object
+                            );
+                            Ok(false) // Treat empty files as non-existent
+                        } else {
+                            Ok(true) // Object exists and has content
                         }
                     }
-                }
-                Err(e) => {
-                    // Network error - retry
-                    if attempt >= self.retry_config.max_retries {
-                        return Err(io::Error::new(
-                            io::ErrorKind::Other,
-                            format!(
-                                "Failed to check existence of {} after {} retries: {}",
-                                object, self.retry_config.max_retries, e
-                            ),
-                        ));
+                    404 => Ok(false), // Object definitely doesn't exist
+                    status => {
+                        // Classify based on status code
+                        let class = classify_http_status(status);
+                        Err(Error {
+                            class,
+                            message: format!("HTTP {} checking existence of {}", status, object),
+                        })
                     }
                 }
             }
-
-            // Exponential backoff before retry
-            attempt += 1;
-            tracing::debug!(
-                "Retrying exists check for {} (attempt {}/{}), backing off {}ms",
-                object,
-                attempt,
-                self.retry_config.max_retries,
-                backoff_ms
-            );
-            tokio::time::sleep(tokio::time::Duration::from_millis(backoff_ms)).await;
-            backoff_ms = (backoff_ms * 2).min(5000); // Cap at 5 seconds
+            Err(e) => {
+                // Network error - always retryable
+                Err(Error::retry(format!("Connection error: {}", e)))
+            }
         }
     }
 }
@@ -377,16 +353,12 @@ impl StorageBackend {
     /// Supports file://, http://, and https:// schemes
     pub async fn from_url(
         url_str: &str,
-        retry_config: Option<HttpRetryConfig>,
     ) -> Result<std::sync::Arc<dyn Storage + Send + Sync>, Error> {
         use std::sync::Arc;
         use url::Url;
 
         let url = Url::parse(url_str).map_err(|e| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("Failed to parse URL '{}': {}", url_str, e),
-            )
+            Error::fatal(format!("Failed to parse URL '{}': {}", url_str, e))
         })?;
 
         match url.scheme() {
@@ -404,38 +376,28 @@ impl StorageBackend {
                 Ok(Arc::new(backend))
             }
             "http" | "https" => {
-                assert!(retry_config.is_some());
-                let http_store = HttpStore::new(url.clone(), retry_config.unwrap());
+                let http_store = HttpStore::new(url.clone());
                 let backend = StorageBackend::Http(http_store);
                 Ok(Arc::new(backend))
             }
-            "s3" => {
-                // TODO: Implement S3 support
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    format!("Unsupported URL scheme: s3"),
-                )
-                .into())
-            }
-            scheme => Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("Unsupported URL scheme: {}", scheme),
-            )
-            .into()),
+            scheme => Err(Error::fatal(format!(
+                "Unsupported URL scheme: {}",
+                scheme
+            ))),
         }
     }
 }
 
 #[async_trait]
 impl Storage for StorageBackend {
-    async fn open_reader(&self, object: &str) -> io::Result<BoxedAsyncRead> {
+    async fn open_reader(&self, object: &str) -> Result<BoxedAsyncRead, Error> {
         match self {
             StorageBackend::File(s) => s.open_reader(object).await,
             StorageBackend::Http(s) => s.open_reader(object).await,
         }
     }
 
-    async fn exists(&self, object: &str) -> io::Result<bool> {
+    async fn exists(&self, object: &str) -> Result<bool, Error> {
         match self {
             StorageBackend::File(s) => s.exists(object).await,
             StorageBackend::Http(s) => s.exists(object).await,
