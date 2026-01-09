@@ -48,6 +48,43 @@ pub mod test_helpers {
         pub high: Option<u32>,
     }
 
+    impl ScanConfig {
+        /// Create a new ScanConfig with sensible defaults for testing
+        pub fn new(archive: impl Into<String>) -> Self {
+            Self {
+                archive: archive.into(),
+                concurrency: 4,
+                skip_optional: false,
+                low: None,
+                high: None,
+            }
+        }
+
+        /// Set concurrency level
+        pub fn concurrency(mut self, concurrency: usize) -> Self {
+            self.concurrency = concurrency;
+            self
+        }
+
+        /// Skip optional files (SCP)
+        pub fn skip_optional(mut self) -> Self {
+            self.skip_optional = true;
+            self
+        }
+
+        /// Set the low ledger bound
+        pub fn low(mut self, low: u32) -> Self {
+            self.low = Some(low);
+            self
+        }
+
+        /// Set the high ledger bound
+        pub fn high(mut self, high: u32) -> Self {
+            self.high = Some(high);
+            self
+        }
+    }
+
     pub struct MirrorConfig {
         pub src: String,
         pub dst: String,
@@ -57,6 +94,58 @@ pub mod test_helpers {
         pub high: Option<u32>,
         pub overwrite: bool,
         pub allow_mirror_gaps: bool,
+    }
+
+    impl MirrorConfig {
+        /// Create a new MirrorConfig with sensible defaults for testing
+        pub fn new(src: impl Into<String>, dst: impl Into<String>) -> Self {
+            Self {
+                src: src.into(),
+                dst: dst.into(),
+                concurrency: 4,
+                skip_optional: false,
+                low: None,
+                high: None,
+                overwrite: false,
+                allow_mirror_gaps: false,
+            }
+        }
+
+        /// Set concurrency level
+        pub fn concurrency(mut self, concurrency: usize) -> Self {
+            self.concurrency = concurrency;
+            self
+        }
+
+        /// Skip optional files (SCP)
+        pub fn skip_optional(mut self) -> Self {
+            self.skip_optional = true;
+            self
+        }
+
+        /// Set the low ledger bound
+        pub fn low(mut self, low: u32) -> Self {
+            self.low = Some(low);
+            self
+        }
+
+        /// Set the high ledger bound
+        pub fn high(mut self, high: u32) -> Self {
+            self.high = Some(high);
+            self
+        }
+
+        /// Enable overwrite mode
+        pub fn overwrite(mut self) -> Self {
+            self.overwrite = true;
+            self
+        }
+
+        /// Allow gaps in the mirrored archive
+        pub fn allow_mirror_gaps(mut self) -> Self {
+            self.allow_mirror_gaps = true;
+            self
+        }
     }
 
     pub async fn run_scan(config: ScanConfig) -> Result<(), crate::Error> {

@@ -57,11 +57,6 @@ pub type BoxedAsyncWrite = Box<dyn tokio::io::AsyncWrite + Send + Unpin + 'stati
 
 pub type StorageRef = Arc<dyn Storage + Send + Sync>;
 
-#[derive(Clone, Debug)]
-pub struct ObjectInfo {
-    pub size_bytes: Option<u64>,
-}
-
 /// Core unified storage trait for filesystem and HTTP backends
 #[async_trait]
 pub trait Storage: Send + Sync {

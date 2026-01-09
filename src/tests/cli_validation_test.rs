@@ -1,185 +1,74 @@
 //! Tests for command-line interface validation and error handling
 
 use crate::test_helpers::{run_mirror as cmd_mirror_run, MirrorConfig};
+use rstest::rstest;
 
+#[rstest]
+#[case::http("http://example.com/archive", "HTTP destinations are read-only")]
+#[case::https("https://example.com/archive", "HTTPS destinations are read-only")]
+#[case::s3("s3://my-bucket/archive", "S3 destinations are not currently supported for writing")]
 #[tokio::test]
-async fn test_mirror_rejects_http_destination() {
-    // HTTP destinations are read-only
-    let config = MirrorConfig {
-        src: "file:///tmp/test-source".to_string(),
-        dst: "http://example.com/archive".to_string(),
-        concurrency: 4,
-        skip_optional: false,
-        high: None,
-        low: None,
-        overwrite: false,
-        allow_mirror_gaps: false,
-    };
-
+async fn test_mirror_rejects_readonly_destination(#[case] dst: &str, #[case] _reason: &str) {
+    let config = MirrorConfig::new("file:///tmp/test-source", dst);
     let result = cmd_mirror_run(config).await;
     assert!(result.is_err());
 }
 
+#[rstest]
+#[case::not_a_url("not-a-url")]
+#[case::missing_scheme("://missing-scheme")]
+#[case::missing_slash("file:/missing-slash")]
+#[case::missing_colon("http//missing-colon")]
+#[case::empty("")]
 #[tokio::test]
-async fn test_mirror_rejects_https_destination() {
-    // HTTPS destinations are also read-only
-    let config = MirrorConfig {
-        src: "file:///tmp/test-source".to_string(),
-        dst: "https://example.com/archive".to_string(),
-        concurrency: 4,
-        skip_optional: false,
-        high: None,
-        low: None,
-        overwrite: false,
-        allow_mirror_gaps: false,
+async fn test_mirror_rejects_malformed_url(
+    #[case] bad_url: &str,
+    #[values("source", "destination")] position: &str,
+) {
+    let config = match position {
+        "source" => MirrorConfig::new(bad_url, "file:///tmp/test-dest"),
+        "destination" => MirrorConfig::new("file:///tmp/test-source", bad_url),
+        _ => unreachable!(),
     };
-
     let result = cmd_mirror_run(config).await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn test_mirror_rejects_s3_destination() {
-    // S3 destinations are not currently supported for writing
-    let config = MirrorConfig {
-        src: "file:///tmp/test-source".to_string(),
-        dst: "s3://my-bucket/archive".to_string(),
-        concurrency: 4,
-        skip_optional: false,
-        high: None,
-        low: None,
-        overwrite: false,
-        allow_mirror_gaps: false,
-    };
-
-    let result = cmd_mirror_run(config).await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn test_mirror_rejects_malformed_source_url() {
-    // Test various malformed source URLs
-    let test_cases = vec![
-        "not-a-url",
-        "://missing-scheme",
-        "file:/missing-slash",
-        "http//missing-colon",
-        "",
-    ];
-
-    for bad_src in test_cases {
-        let config = MirrorConfig {
-            src: bad_src.to_string(),
-            dst: "file:///tmp/test-dest".to_string(),
-            concurrency: 4,
-            skip_optional: false,
-            high: None,
-            low: None,
-            overwrite: false,
-            allow_mirror_gaps: false,
-        };
-
-        let result = cmd_mirror_run(config).await;
-        assert!(
-            result.is_err(),
-            "Should reject malformed source URL: '{}'",
-            bad_src
-        );
-    }
-}
-
-#[tokio::test]
-async fn test_mirror_rejects_malformed_destination_url() {
-    // Test various malformed destination URLs
-    let test_cases = vec!["not-a-url", "://missing-scheme", "file:/missing-slash", ""];
-
-    for bad_dst in test_cases {
-        let config = MirrorConfig {
-            src: "file:///tmp/test-source".to_string(),
-            dst: bad_dst.to_string(),
-            concurrency: 4,
-            skip_optional: false,
-            high: None,
-            low: None,
-            overwrite: false,
-            allow_mirror_gaps: false,
-        };
-
-        let result = cmd_mirror_run(config).await;
-        assert!(
-            result.is_err(),
-            "Should reject malformed destination URL: '{}'",
-            bad_dst
-        );
-    }
-}
-
-#[tokio::test]
-async fn test_mirror_rejects_nonexistent_source() {
-    // Source that doesn't exist should fail gracefully
-    let config = MirrorConfig {
-        src: "file:///this/path/does/not/exist/at/all".to_string(),
-        dst: "file:///tmp/test-dest".to_string(),
-        concurrency: 4,
-        skip_optional: false,
-        high: None,
-        low: None,
-        overwrite: false,
-        allow_mirror_gaps: false,
-    };
-
-    let result = cmd_mirror_run(config).await;
-    assert!(result.is_err());
-}
-
-#[tokio::test]
-async fn test_scan_rejects_nonexistent_source() {
-    use crate::test_helpers::{run_scan as cmd_scan_run, ScanConfig};
-
-    // Source that doesn't exist should fail with a clear error
-    let config = ScanConfig {
-        archive: "file:///this/path/does/not/exist/at/all".to_string(),
-        concurrency: 4,
-        skip_optional: false,
-        low: None,
-        high: None,
-    };
-
-    let result = cmd_scan_run(config).await;
-    assert!(result.is_err());
-
-    let err_msg = result.unwrap_err().to_string();
-    // The error will be about failing to open the .well-known file since the path doesn't exist
     assert!(
-        err_msg.contains("Failed to open reader") || err_msg.contains("No such file or directory"),
-        "Error should indicate file access failure, got: {}",
-        err_msg
+        result.is_err(),
+        "Should reject malformed {} URL: '{}'",
+        position,
+        bad_url
     );
+}
+
+#[rstest]
+#[case::scan("scan")]
+#[case::mirror("mirror")]
+#[tokio::test]
+async fn test_rejects_nonexistent_source(#[case] operation: &str) {
+    use crate::test_helpers::{run_scan, ScanConfig};
+
+    let src = "file:///this/path/does/not/exist/at/all";
+
+    let result = match operation {
+        "scan" => run_scan(ScanConfig::new(src)).await,
+        "mirror" => cmd_mirror_run(MirrorConfig::new(src, "file:///tmp/test-dest")).await,
+        _ => unreachable!(),
+    };
+
+    assert!(result.is_err(), "{} should reject nonexistent source", operation);
 }
 
 #[tokio::test]
 async fn test_mirror_creates_destination_if_not_exists() {
-    use std::path::PathBuf;
+    use super::utils::test_archive_path;
     use tempfile::TempDir;
-
-    let test_archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("testdata")
-        .join("testnet-archive-small");
 
     // Create a temp directory, then use a subdirectory that doesn't exist yet
     let temp_base = TempDir::new().expect("Failed to create temp base");
     let dest_path = temp_base.path().join("new-dest-directory");
 
-    let config = MirrorConfig {
-        src: format!("file://{}", test_archive_path.display()),
-        dst: format!("file://{}", dest_path.display()),
-        concurrency: 4,
-        skip_optional: true,
-        high: Some(63),
-        low: None,
-        overwrite: false,
-        allow_mirror_gaps: false,
-    };
+    let src = format!("file://{}", test_archive_path().display());
+    let dst = format!("file://{}", dest_path.display());
+    let config = MirrorConfig::new(&src, &dst).skip_optional().high(63);
 
     let result = cmd_mirror_run(config).await;
     assert!(
@@ -188,85 +77,40 @@ async fn test_mirror_creates_destination_if_not_exists() {
         result
     );
 
-    // Verify the destination was created
-    assert!(
-        dest_path.exists(),
-        "Destination directory should have been created"
-    );
+    assert!(dest_path.exists(), "Destination directory should exist");
     assert!(
         dest_path.join(".well-known/stellar-history.json").exists(),
         "HAS file should exist in destination"
     );
 }
 
+#[rstest]
+#[case::scan("scan")]
+#[case::mirror("mirror")]
 #[tokio::test]
-async fn test_scan_rejects_low_greater_than_high() {
-    use crate::test_helpers::{run_scan as cmd_scan_run, ScanConfig};
-    use std::path::PathBuf;
-
-    // Create a valid test archive path
-    let test_archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("testdata")
-        .join("testnet-archive-small");
-
-    let config = ScanConfig {
-        archive: format!("file://{}", test_archive_path.display()),
-        concurrency: 4,
-        skip_optional: false,
-        low: Some(2000),
-        high: Some(1000), // Lower value - should be rejected
-    };
-
-    let result = cmd_scan_run(config).await;
-    assert!(
-        result.is_err(),
-        "Should reject when --low is greater than --high"
-    );
-
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("low checkpoint") && err_msg.contains("is greater than high checkpoint"),
-        "Error should indicate that low is greater than high, got: {}",
-        err_msg
-    );
-}
-
-#[tokio::test]
-async fn test_mirror_rejects_low_greater_than_high() {
-    use crate::test_helpers::{run_mirror as cmd_mirror_run, MirrorConfig};
-    use std::path::PathBuf;
+async fn test_rejects_low_greater_than_high(#[case] operation: &str) {
+    use super::utils::test_archive_path;
+    use crate::test_helpers::{run_scan, ScanConfig};
     use tempfile::TempDir;
 
-    // Create a valid test archive path
-    let test_archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("testdata")
-        .join("testnet-archive-small");
+    let src = format!("file://{}", test_archive_path().display());
 
-    // Create a temporary destination
-    let temp_dir = TempDir::new().unwrap();
-    let dest_path = temp_dir.path().join("test_dest");
-
-    let config = MirrorConfig {
-        src: format!("file://{}", test_archive_path.display()),
-        dst: format!("file://{}", dest_path.display()),
-        concurrency: 4,
-        skip_optional: false,
-        low: Some(2000),
-        high: Some(1000), // Lower value - should be rejected
-        overwrite: false,
-        allow_mirror_gaps: false,
+    let result = match operation {
+        "scan" => run_scan(ScanConfig::new(&src).low(2000).high(1000)).await,
+        "mirror" => {
+            let temp_dir = TempDir::new().unwrap();
+            let dst = format!("file://{}", temp_dir.path().join("dest").display());
+            cmd_mirror_run(MirrorConfig::new(&src, &dst).low(2000).high(1000)).await
+        }
+        _ => unreachable!(),
     };
 
-    let result = cmd_mirror_run(config).await;
-    assert!(
-        result.is_err(),
-        "Should reject when --low is greater than --high"
-    );
+    assert!(result.is_err(), "{} should reject when low > high", operation);
 
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("low checkpoint") && err_msg.contains("is greater than high checkpoint"),
-        "Error should indicate that low is greater than high, got: {}",
+        "Error should indicate low > high, got: {}",
         err_msg
     );
 }

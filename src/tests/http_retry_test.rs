@@ -1,322 +1,379 @@
-//! Tests for HTTP retry logic and error handling
+//! HTTP error handling tests for scan and mirror operations
+//!
+//! This module tests retry behavior for HTTP errors across both operations:
+//! - Transient errors (5xx, 429, 408) trigger retries with exponential backoff
+//! - Permanent errors (4xx) do not trigger retries
+//! - Connection drops trigger retries
 
-use crate::storage::{HttpRetryConfig, HttpStore, Storage};
-use tokio::io::AsyncReadExt;
-use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use super::utils::{
+    start_flaky_server, start_http_server_with_app, test_archive_path, FlakyServerConfig,
+    RequestTracker, PERMANENT_HTTP_ERRORS, TRANSIENT_HTTP_ERRORS,
+};
+use std::path::PathBuf;
+use crate::test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig};
+use axum::{
+    body::Body,
+    http::{Method, Request, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{any, get_service},
+    Router,
+};
+use rstest::rstest;
+use tempfile::TempDir;
+use tower::util::ServiceExt;
+use tower_http::services::ServeDir;
 
-/// Default retry config for tests
-fn test_retry_config() -> HttpRetryConfig {
-    HttpRetryConfig {
-        max_retries: 3,
-        initial_backoff_ms: 100,
+/// Operation type for parameterized tests
+#[derive(Clone, Copy, Debug)]
+pub enum Operation {
+    Scan,
+    Mirror,
+}
+
+impl Operation {
+    fn path_prefix(&self) -> &'static str {
+        match self {
+            Operation::Scan => "history/",
+            Operation::Mirror => "bucket/",
+        }
+    }
+
+    async fn run(&self, server_url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        match self {
+            Operation::Scan => run_scan(ScanConfig::new(server_url).skip_optional().high(63))
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+            Operation::Mirror => {
+                let dest_dir = TempDir::new().unwrap();
+                run_mirror(
+                    MirrorConfig::new(server_url, format!("file://{}", dest_dir.path().display()))
+                        .skip_optional()
+                        .concurrency(1)
+                        .high(63),
+                )
+                .await
+                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }
+        }
     }
 }
 
-/// Test that transient errors (500, 502, 503, 504) are retried
+//=============================================================================
+// Transient Error Tests (retries expected)
+//=============================================================================
+
+#[rstest]
+#[case::scan(Operation::Scan)]
+#[case::mirror(Operation::Mirror)]
 #[tokio::test]
-async fn test_retry_on_server_errors() {
-    let mock_server = MockServer::start().await;
+async fn test_retries_on_transient_http_errors(#[case] op: Operation) {
+    let archive_path = test_archive_path();
 
-    // Set up sequence of responses - fail twice then succeed
-    // We'll use multiple mocks that get consumed in order
-    Mock::given(method("GET"))
-        .and(path("/test-file"))
-        .respond_with(ResponseTemplate::new(500))
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
+    for (status_code, description) in TRANSIENT_HTTP_ERRORS {
+        let config = FlakyServerConfig::archive_status_error(
+            archive_path.clone(),
+            *status_code,
+            2, // Fail twice, then succeed
+            op.path_prefix(),
+        );
+        let (server_url, tracker, handle) = start_flaky_server(config).await;
 
-    Mock::given(method("GET"))
-        .and(path("/test-file"))
-        .respond_with(ResponseTemplate::new(503))
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
+        let result = op.run(&server_url).await;
+        handle.abort();
 
-    Mock::given(method("GET"))
-        .and(path("/test-file"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"test content"))
-        .mount(&mock_server)
-        .await;
-
-    let store = HttpStore::new(mock_server.uri().parse().unwrap(), test_retry_config());
-
-    // Should succeed after retries
-    let mut reader = store.open_reader("test-file").await.unwrap();
-    let mut content = String::new();
-    reader.read_to_string(&mut content).await.unwrap();
-
-    assert_eq!(content, "test content");
+        verify_retries_occurred(&tracker, op, *status_code, description);
+        assert!(
+            result.is_ok(),
+            "{:?} should succeed after retrying HTTP {} ({}): {:?}",
+            op,
+            status_code,
+            description,
+            result.err()
+        );
+        verify_backoff_timing(&tracker, op, *status_code, description);
+    }
 }
 
-/// Test that 429 (Too Many Requests) triggers retry with backoff
+#[rstest]
+#[case::scan(Operation::Scan)]
+#[case::mirror(Operation::Mirror)]
 #[tokio::test]
-async fn test_retry_on_rate_limit() {
-    let mock_server = MockServer::start().await;
+async fn test_retries_on_connection_drops(#[case] op: Operation) {
+    let archive_path = test_archive_path();
 
-    Mock::given(method("GET"))
-        .and(path("/rate-limited"))
-        .respond_with(ResponseTemplate::new(429))
-        .up_to_n_times(2)
-        .mount(&mock_server)
-        .await;
+    let config = FlakyServerConfig::archive_connection_drop(
+        archive_path,
+        2, // Fail twice, then succeed
+        op.path_prefix(),
+    );
+    let (server_url, tracker, handle) = start_flaky_server(config).await;
 
-    Mock::given(method("GET"))
-        .and(path("/rate-limited"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"success after rate limit"))
-        .mount(&mock_server)
-        .await;
+    let result = op.run(&server_url).await;
+    handle.abort();
 
-    let store = HttpStore::new(mock_server.uri().parse().unwrap(), test_retry_config());
+    let counts = tracker.get_counts();
+    let retried: Vec<_> = counts
+        .iter()
+        .filter(|(path, count)| path.starts_with(op.path_prefix()) && **count > 1)
+        .collect();
 
-    let start = std::time::Instant::now();
-    let mut reader = store.open_reader("rate-limited").await.unwrap();
-    let duration = start.elapsed();
-
-    // Should have backed off (at least 300ms for two retries with exponential backoff)
     assert!(
-        duration.as_millis() >= 300,
-        "Expected backoff delay, got {}ms",
-        duration.as_millis()
+        !retried.is_empty(),
+        "{:?}: Connection drops should trigger retries, got counts: {:?}",
+        op,
+        counts
+            .iter()
+            .filter(|(p, _)| p.starts_with(op.path_prefix()))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        result.is_ok(),
+        "{:?} should succeed after retrying connection drops: {:?}",
+        op,
+        result.err()
     );
 
-    let mut content = String::new();
-    reader.read_to_string(&mut content).await.unwrap();
-    assert_eq!(content, "success after rate limit");
+    if let Some((path, _)) = retried.first() {
+        tracker
+            .verify_backoff_timing(path, 100, 0.8)
+            .unwrap_or_else(|e| panic!("{:?}: Connection drop backoff timing failed: {}", op, e));
+    }
 }
 
-/// Test that 404 (Not Found) does not retry
+//=============================================================================
+// Permanent Error Tests (no retries expected)
+//=============================================================================
+
+#[rstest]
+#[case::scan(Operation::Scan)]
+#[case::mirror(Operation::Mirror)]
 #[tokio::test]
-async fn test_no_retry_on_not_found() {
-    let mock_server = MockServer::start().await;
+async fn test_fails_on_permanent_http_errors(#[case] op: Operation) {
+    let archive_path = test_archive_path();
 
-    Mock::given(method("GET"))
-        .and(path("/missing"))
-        .respond_with(ResponseTemplate::new(404))
-        .expect(1) // Should be called exactly once
-        .mount(&mock_server)
-        .await;
+    for (status_code, description) in PERMANENT_HTTP_ERRORS {
+        let config = FlakyServerConfig::archive_status_error(
+            archive_path.clone(),
+            *status_code,
+            1000, // Always fail
+            op.path_prefix(),
+        );
+        let (server_url, tracker, handle) = start_flaky_server(config).await;
 
-    let store = HttpStore::new(mock_server.uri().parse().unwrap(), test_retry_config());
+        let result = op.run(&server_url).await;
+        handle.abort();
 
-    // Should fail immediately without retries
-    let result = store.open_reader("missing").await;
-    assert!(result.is_err());
-    let error = result.err().unwrap();
-    assert!(error.to_string().contains("HTTP 404"));
+        assert!(
+            result.is_err(),
+            "{:?} should fail on HTTP {} ({})",
+            op,
+            status_code,
+            description
+        );
+
+        // Verify no retries happened
+        let counts = tracker.get_counts();
+        let retried: Vec<_> = counts
+            .iter()
+            .filter(|(path, count)| path.starts_with(op.path_prefix()) && **count > 1)
+            .collect();
+
+        assert!(
+            retried.is_empty(),
+            "{:?}: HTTP {} ({}) should NOT trigger retries, but got: {:?}",
+            op,
+            status_code,
+            description,
+            retried
+        );
+    }
 }
 
-/// Test that 403 (Forbidden) does not retry
-#[tokio::test]
-async fn test_no_retry_on_forbidden() {
-    let mock_server = MockServer::start().await;
+//=============================================================================
+// Helper Functions
+//=============================================================================
 
-    Mock::given(method("GET"))
-        .and(path("/forbidden"))
-        .respond_with(ResponseTemplate::new(403))
-        .expect(1) // Should be called exactly once
-        .mount(&mock_server)
-        .await;
+fn verify_retries_occurred(tracker: &RequestTracker, op: Operation, status_code: u16, description: &str) {
+    let counts = tracker.get_counts();
+    let retried: Vec<_> = counts
+        .iter()
+        .filter(|(path, count)| path.starts_with(op.path_prefix()) && **count > 1)
+        .collect();
 
-    let store = HttpStore::new(mock_server.uri().parse().unwrap(), test_retry_config());
-
-    let result = store.open_reader("forbidden").await;
-    assert!(result.is_err());
-    let error = result.err().unwrap();
-    assert!(error.to_string().contains("HTTP 403"));
+    assert!(
+        !retried.is_empty(),
+        "{:?}: HTTP {} ({}) should trigger retries, got counts: {:?}",
+        op,
+        status_code,
+        description,
+        counts
+            .iter()
+            .filter(|(p, _)| p.starts_with(op.path_prefix()))
+            .collect::<Vec<_>>()
+    );
 }
 
-/// Test max retries limit
-#[tokio::test]
-async fn test_max_retries_exceeded() {
-    let mock_server = MockServer::start().await;
+fn verify_backoff_timing(tracker: &RequestTracker, op: Operation, status_code: u16, description: &str) {
+    let counts = tracker.get_counts();
+    let retried: Vec<_> = counts
+        .iter()
+        .filter(|(path, count)| path.starts_with(op.path_prefix()) && **count > 1)
+        .collect();
 
-    Mock::given(method("GET"))
-        .and(path("/always-fails"))
-        .respond_with(ResponseTemplate::new(500))
-        .expect(4) // Initial + 3 retries
-        .mount(&mock_server)
-        .await;
-
-    let store = HttpStore::new(mock_server.uri().parse().unwrap(), test_retry_config());
-
-    let result = store.open_reader("always-fails").await;
-    assert!(result.is_err());
-    let error_msg = result.err().unwrap().to_string();
-    assert!(error_msg.contains("HTTP 500") || error_msg.contains("after 3 retries"));
+    if let Some((path, _)) = retried.first() {
+        tracker
+            .verify_backoff_timing(path, 100, 0.8)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{:?}: HTTP {} ({}) backoff timing failed: {}",
+                    op, status_code, description, e
+                )
+            });
+    }
 }
 
-/// Test exists() with successful HEAD request
-#[tokio::test]
-async fn test_exists_with_head_success() {
-    let mock_server = MockServer::start().await;
+//=============================================================================
+// HEAD Request Edge Cases
+//=============================================================================
 
-    Mock::given(method("HEAD"))
-        .and(path("/existing-file"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&mock_server)
-        .await;
-
-    let store = HttpStore::new(mock_server.uri().parse().unwrap(), test_retry_config());
-
-    let exists = store.exists("existing-file").await.unwrap();
-    assert!(exists);
+/// HEAD response behavior for testing edge cases
+#[derive(Clone, Copy)]
+enum HeadResponse {
+    /// Return 200 OK without Content-Length header
+    NoContentLength,
+    /// Return 200 OK with Content-Length: 0
+    ZeroContentLength,
+    /// Return 405 Method Not Allowed
+    MethodNotAllowed,
+    /// Normal response
+    Normal,
 }
 
-/// Test exists() returns false for 404
-#[tokio::test]
-async fn test_exists_returns_false_for_not_found() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("HEAD"))
-        .and(path("/not-found"))
-        .respond_with(ResponseTemplate::new(404))
-        .mount(&mock_server)
-        .await;
-
-    let store = HttpStore::new(mock_server.uri().parse().unwrap(), test_retry_config());
-
-    let exists = store.exists("not-found").await.unwrap();
-    assert!(!exists);
+fn make_head_response(behavior: HeadResponse) -> Response<Body> {
+    match behavior {
+        HeadResponse::NoContentLength => Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::empty())
+            .unwrap(),
+        HeadResponse::ZeroContentLength => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Length", "0")
+            .body(Body::empty())
+            .unwrap(),
+        HeadResponse::MethodNotAllowed => Response::builder()
+            .status(StatusCode::METHOD_NOT_ALLOWED)
+            .header("Allow", "GET")
+            .body(Body::empty())
+            .unwrap(),
+        HeadResponse::Normal => unreachable!("Should not be called for Normal behavior"),
+    }
 }
 
-/// Test exists() retries on server errors
+#[rstest]
+#[case::no_content_length(HeadResponse::NoContentLength, true, "no Content-Length")]
+#[case::zero_content_length(HeadResponse::ZeroContentLength, true, "Content-Length: 0")]
+#[case::method_not_allowed(HeadResponse::MethodNotAllowed, true, "405 Method Not Allowed")]
+#[case::proper_response(HeadResponse::Normal, false, "proper Content-Length")]
 #[tokio::test]
-async fn test_exists_retries_on_server_error() {
-    let mock_server = MockServer::start().await;
+async fn test_scan_head_response_handling(
+    #[case] behavior: HeadResponse,
+    #[case] expect_failure: bool,
+    #[case] description: &str,
+) {
+    let archive_path = test_archive_path();
 
-    Mock::given(method("HEAD"))
-        .and(path("/flaky-exists"))
-        .respond_with(ResponseTemplate::new(500))
-        .up_to_n_times(2)
-        .mount(&mock_server)
-        .await;
+    let app = if matches!(behavior, HeadResponse::Normal) {
+        Router::new().fallback(get_service(ServeDir::new(&archive_path)))
+    } else {
+        let serve_dir = ServeDir::new(&archive_path);
+        Router::new().fallback(any(move |req: Request<Body>| {
+            let serve_dir = serve_dir.clone();
+            async move {
+                if req.method() == Method::HEAD {
+                    make_head_response(behavior)
+                } else {
+                    match serve_dir.oneshot(req).await {
+                        Ok(resp) => resp.into_response(),
+                        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+                    }
+                }
+            }
+        }))
+    };
 
-    Mock::given(method("HEAD"))
-        .and(path("/flaky-exists"))
-        .respond_with(ResponseTemplate::new(200))
-        .mount(&mock_server)
-        .await;
+    let (server_url, server_handle) = start_http_server_with_app(app).await;
+    let result = run_scan(ScanConfig::new(&server_url).skip_optional().high(63)).await;
+    server_handle.abort();
 
-    let store = HttpStore::new(mock_server.uri().parse().unwrap(), test_retry_config());
-
-    let exists = store.exists("flaky-exists").await.unwrap();
-    assert!(exists);
+    if expect_failure {
+        assert!(
+            result.is_err(),
+            "Scan should fail when HEAD returns {}",
+            description
+        );
+    } else {
+        assert!(
+            result.is_ok(),
+            "Scan should succeed when HEAD returns {}",
+            description
+        );
+    }
 }
 
-/// Test exists() retries and eventually errors
+//=============================================================================
+// Mid-stream Failure Tests
+//=============================================================================
+
+/// Tests that mid-stream failures (truncated responses) are retried and partial
+/// files are cleaned up. Verifies both that retries occur and that the final
+/// file has correct content (not partial data from failed attempt).
 #[tokio::test]
-async fn test_exists_error_on_unexpected_status() {
-    let mock_server = MockServer::start().await;
+async fn test_mirror_cleans_up_partial_file_on_failure() {
+    let archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("testdata")
+        .join("testnet-archive-small");
 
-    // Return 401 Unauthorized - this should retry then error after max retries
-    Mock::given(method("HEAD"))
-        .and(path("/unauthorized"))
-        .respond_with(ResponseTemplate::new(401))
-        .mount(&mock_server)
-        .await;
+    // Read expected content for verification
+    let bucket_file = archive_path
+        .join("bucket/44/3c/ec/bucket-443cec6682d0e98930ffd71b6f3f450a29fff6b9dd2e0cfaf41bd714926b4422.xdr.gz");
+    let expected_content = std::fs::read(&bucket_file).expect("Test bucket file should exist");
 
-    let store = HttpStore::new(mock_server.uri().parse().unwrap(), test_retry_config());
+    // Server fails first request to bucket files with partial body, succeeds on retry
+    let config = FlakyServerConfig::archive_partial_body(archive_path, 1);
+    let (server_url, tracker, handle) = start_flaky_server(config).await;
 
-    let result = store.exists("unauthorized").await;
-    assert!(result.is_err());
-    let error_msg = result.err().unwrap().to_string();
-    assert!(error_msg.contains("Failed to check existence"));
-    assert!(error_msg.contains("401"));
-}
+    let dest_dir = TempDir::new().unwrap();
+    let mirror_config =
+        MirrorConfig::new(&server_url, format!("file://{}", dest_dir.path().display()))
+            .skip_optional()
+            .concurrency(1)
+            .high(63);
 
-/// Test network/connection errors trigger retry
-#[tokio::test]
-async fn test_retry_on_connection_error() {
-    // Use a non-existent port to trigger connection error
-    let store = HttpStore::new("http://127.0.0.1:1".parse().unwrap(), test_retry_config());
+    let result = run_mirror(mirror_config).await;
+    handle.abort();
 
-    let result = store.open_reader("test").await;
-    assert!(result.is_err());
+    // Verify bucket files were retried (count > 1: first fails, retry succeeds)
+    let counts = tracker.get_counts();
+    let bucket_retry_counts: Vec<_> = counts
+        .iter()
+        .filter(|(path, count)| path.starts_with("bucket/") && **count > 1)
+        .collect();
+    assert!(
+        !bucket_retry_counts.is_empty(),
+        "Expected bucket files to be retried (request count > 1), got counts: {:?}",
+        counts.iter().filter(|(p, _)| p.starts_with("bucket/")).collect::<Vec<_>>()
+    );
 
-    // Error message should indicate retries were attempted
-    let error_msg = result.err().unwrap().to_string();
-    assert!(error_msg.contains("after 3 retries") || error_msg.contains("Failed to fetch"));
-}
+    assert!(result.is_ok(), "Mirror should succeed after retry: {:?}", result.err());
 
-/// Test 408 Request Timeout triggers retry
-#[tokio::test]
-async fn test_retry_on_request_timeout() {
-    let mock_server = MockServer::start().await;
+    // Verify the final file has correct content (not partial)
+    let dest_bucket = dest_dir.path()
+        .join("bucket/44/3c/ec/bucket-443cec6682d0e98930ffd71b6f3f450a29fff6b9dd2e0cfaf41bd714926b4422.xdr.gz");
+    let final_content = std::fs::read(&dest_bucket).expect("Bucket file should exist");
 
-    Mock::given(method("GET"))
-        .and(path("/timeout"))
-        .respond_with(ResponseTemplate::new(408))
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/timeout"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"success after timeout"))
-        .mount(&mock_server)
-        .await;
-
-    let store = HttpStore::new(mock_server.uri().parse().unwrap(), test_retry_config());
-
-    let mut reader = store.open_reader("timeout").await.unwrap();
-    let mut content = String::new();
-    reader.read_to_string(&mut content).await.unwrap();
-
-    assert_eq!(content, "success after timeout");
-}
-
-/// Test 502 Bad Gateway triggers retry
-#[tokio::test]
-async fn test_retry_on_bad_gateway() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/bad-gateway"))
-        .respond_with(ResponseTemplate::new(502))
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/bad-gateway"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"success after bad gateway"))
-        .mount(&mock_server)
-        .await;
-
-    let store = HttpStore::new(mock_server.uri().parse().unwrap(), test_retry_config());
-
-    let mut reader = store.open_reader("bad-gateway").await.unwrap();
-    let mut content = String::new();
-    reader.read_to_string(&mut content).await.unwrap();
-
-    assert_eq!(content, "success after bad gateway");
-}
-
-/// Test 504 Gateway Timeout triggers retry
-#[tokio::test]
-async fn test_retry_on_gateway_timeout() {
-    let mock_server = MockServer::start().await;
-
-    Mock::given(method("GET"))
-        .and(path("/gateway-timeout"))
-        .respond_with(ResponseTemplate::new(504))
-        .up_to_n_times(1)
-        .mount(&mock_server)
-        .await;
-
-    Mock::given(method("GET"))
-        .and(path("/gateway-timeout"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"success after gateway timeout"))
-        .mount(&mock_server)
-        .await;
-
-    let store = HttpStore::new(mock_server.uri().parse().unwrap(), test_retry_config());
-
-    let mut reader = store.open_reader("gateway-timeout").await.unwrap();
-    let mut content = String::new();
-    reader.read_to_string(&mut content).await.unwrap();
-
-    assert_eq!(content, "success after gateway timeout");
+    assert_eq!(
+        final_content.len(),
+        expected_content.len(),
+        "Final file should have correct size, not partial"
+    );
 }

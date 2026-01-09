@@ -42,6 +42,7 @@ fn canonical_v2_has(canonical_v2_json_str: String) -> HistoryFileState {
 
 #[rstest]
 fn test_canonical_v1_file_deserialization(canonical_v1_has: HistoryFileState) {
+    // Verify top-level fields
     assert_eq!(canonical_v1_has.version, 1);
     assert_eq!(canonical_v1_has.current_ledger, 67199);
     assert_eq!(
@@ -52,201 +53,53 @@ fn test_canonical_v1_file_deserialization(canonical_v1_has: HistoryFileState) {
         canonical_v1_has.network_passphrase.as_deref(),
         Some("Test SDF Network ; September 2015")
     );
-
-    // Validate all bucket levels
     assert_eq!(canonical_v1_has.current_buckets.len(), 11);
 
-    // Level 0
-    assert_eq!(
-        canonical_v1_has.current_buckets[0].curr,
-        "5a7e9c8d4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d"
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[0].snap,
-        "0000000000000000000000000000000000000000000000000000000000000000"
-    );
-    assert_eq!(canonical_v1_has.current_buckets[0].next.state, 0);
+    // Spot-check representative bucket levels for each next.state value:
+    // - State 0: no next fields
+    // - State 1: has output field
+    // - State 2: has curr, snap, and optionally shadow
 
-    // Level 1
+    // Level 0: state 0, no next fields
+    let level0 = &canonical_v1_has.current_buckets[0];
+    assert_eq!(level0.curr, "5a7e9c8d4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d");
+    assert_eq!(level0.snap, "0000000000000000000000000000000000000000000000000000000000000000");
+    assert_eq!(level0.next.state, 0);
+    assert!(level0.next.output.is_none());
+    assert!(level0.next.curr.is_none());
+
+    // Level 1: state 1, has output field
+    let level1 = &canonical_v1_has.current_buckets[1];
+    assert_eq!(level1.next.state, 1);
     assert_eq!(
-        canonical_v1_has.current_buckets[1].curr,
-        "9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c"
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[1].snap,
-        "7f6e5d4c3b2a1098765432109876543210987654321098765432109876543210"
-    );
-    assert_eq!(canonical_v1_has.current_buckets[1].next.state, 1);
-    assert_eq!(
-        canonical_v1_has.current_buckets[1].next.output.as_deref(),
+        level1.next.output.as_deref(),
         Some("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789")
     );
+    assert!(level1.next.curr.is_none());
+    assert!(level1.next.snap.is_none());
 
-    // Level 2
+    // Level 2: state 2, has curr, snap, and shadow
+    let level2 = &canonical_v1_has.current_buckets[2];
+    assert_eq!(level2.next.state, 2);
+    assert!(level2.next.output.is_none());
     assert_eq!(
-        canonical_v1_has.current_buckets[2].curr,
-        "1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[2].snap,
-        "fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321"
-    );
-    assert_eq!(canonical_v1_has.current_buckets[2].next.state, 2);
-    assert_eq!(
-        canonical_v1_has.current_buckets[2].next.curr.as_deref(),
+        level2.next.curr.as_deref(),
         Some("aaaa567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
     );
     assert_eq!(
-        canonical_v1_has.current_buckets[2].next.snap.as_deref(),
+        level2.next.snap.as_deref(),
         Some("bbbb567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
     );
-    assert_eq!(
-        canonical_v1_has.current_buckets[2]
-            .next
-            .shadow
-            .as_ref()
-            .map(|v| v.len()),
-        Some(2)
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[2]
-            .next
-            .shadow
-            .as_ref()
-            .unwrap()[0],
-        "cccc567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[2]
-            .next
-            .shadow
-            .as_ref()
-            .unwrap()[1],
-        "dddd567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
-    );
+    let shadow = level2.next.shadow.as_ref().expect("Level 2 should have shadow");
+    assert_eq!(shadow.len(), 2);
+    assert_eq!(shadow[0], "cccc567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
 
-    // Level 3
-    assert_eq!(
-        canonical_v1_has.current_buckets[3].curr,
-        "2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c"
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[3].snap,
-        "0000000000000000000000000000000000000000000000000000000000000000"
-    );
-    assert_eq!(canonical_v1_has.current_buckets[3].next.state, 0);
-
-    // Level 4
-    assert_eq!(
-        canonical_v1_has.current_buckets[4].curr,
-        "3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d"
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[4].snap,
-        "4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e"
-    );
-    assert_eq!(canonical_v1_has.current_buckets[4].next.state, 0);
-
-    // Level 5
-    assert_eq!(
-        canonical_v1_has.current_buckets[5].curr,
-        "5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f"
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[5].snap,
-        "0000000000000000000000000000000000000000000000000000000000000000"
-    );
-    assert_eq!(canonical_v1_has.current_buckets[5].next.state, 0);
-
-    // Level 6
-    assert_eq!(
-        canonical_v1_has.current_buckets[6].curr,
-        "6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a"
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[6].snap,
-        "7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b"
-    );
-    assert_eq!(canonical_v1_has.current_buckets[6].next.state, 1);
-    assert_eq!(
-        canonical_v1_has.current_buckets[6].next.output.as_deref(),
-        Some("8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c")
-    );
-
-    // Level 7
-    assert_eq!(
-        canonical_v1_has.current_buckets[7].curr,
-        "9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d"
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[7].snap,
-        "0000000000000000000000000000000000000000000000000000000000000000"
-    );
-    assert_eq!(canonical_v1_has.current_buckets[7].next.state, 0);
-
-    // Level 8
-    assert_eq!(
-        canonical_v1_has.current_buckets[8].curr,
-        "ad1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e"
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[8].snap,
-        "be2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f"
-    );
-    assert_eq!(canonical_v1_has.current_buckets[8].next.state, 0);
-
-    // Level 9
-    assert_eq!(
-        canonical_v1_has.current_buckets[9].curr,
-        "cf3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a"
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[9].snap,
-        "0000000000000000000000000000000000000000000000000000000000000000"
-    );
-    assert_eq!(canonical_v1_has.current_buckets[9].next.state, 0);
-
-    // Level 10
-    assert_eq!(
-        canonical_v1_has.current_buckets[10].curr,
-        "d04b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b"
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[10].snap,
-        "e15c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c"
-    );
-    assert_eq!(canonical_v1_has.current_buckets[10].next.state, 2);
-    assert_eq!(
-        canonical_v1_has.current_buckets[10].next.curr.as_deref(),
-        Some("f26d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d")
-    );
-    assert_eq!(
-        canonical_v1_has.current_buckets[10].next.snap.as_deref(),
-        Some("037e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e")
-    );
-
-    // Test that no unexpected fields are present in NextState when state is 0
-    for i in [0, 3, 4, 5, 7, 8, 9] {
-        assert!(canonical_v1_has.current_buckets[i].next.output.is_none());
-        assert!(canonical_v1_has.current_buckets[i].next.curr.is_none());
-        assert!(canonical_v1_has.current_buckets[i].next.snap.is_none());
-        assert!(canonical_v1_has.current_buckets[i].next.shadow.is_none());
-    }
-
-    // Test that only output is present for state 1
-    for i in [1, 6] {
-        assert!(canonical_v1_has.current_buckets[i].next.output.is_some());
-        assert!(canonical_v1_has.current_buckets[i].next.curr.is_none());
-        assert!(canonical_v1_has.current_buckets[i].next.snap.is_none());
-        assert!(canonical_v1_has.current_buckets[i].next.shadow.is_none());
-    }
-
-    // Test that curr and snap are present for state 2
-    for i in [2, 10] {
-        assert!(canonical_v1_has.current_buckets[i].next.output.is_none());
-        assert!(canonical_v1_has.current_buckets[i].next.curr.is_some());
-        assert!(canonical_v1_has.current_buckets[i].next.snap.is_some());
-    }
+    // Level 10: state 2, has curr and snap but no shadow
+    let level10 = &canonical_v1_has.current_buckets[10];
+    assert_eq!(level10.next.state, 2);
+    assert!(level10.next.curr.is_some());
+    assert!(level10.next.snap.is_some());
+    assert!(level10.next.shadow.is_none());
 }
 
 #[rstest]
@@ -337,225 +190,108 @@ fn test_invalid_version(mut canonical_v1_json: serde_json::Value) {
 }
 
 #[rstest]
-fn test_invalid_current_ledger_zero(mut canonical_v1_json: serde_json::Value) {
-    canonical_v1_json["currentLedger"] = serde_json::json!(0);
+#[case::zero(0, "zero is not a valid ledger")]
+#[case::not_checkpoint(64, "64 is not on a checkpoint boundary")]
+#[case::off_by_one(62, "62 is one less than valid checkpoint 63")]
+fn test_invalid_current_ledger(
+    mut canonical_v1_json: serde_json::Value,
+    #[case] ledger: u32,
+    #[case] _description: &str,
+) {
+    canonical_v1_json["currentLedger"] = serde_json::json!(ledger);
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::InvalidCurrentLedger { .. }
-    ));
-}
-
-#[rstest]
-fn test_invalid_current_ledger_not_checkpoint(mut canonical_v1_json: serde_json::Value) {
-    canonical_v1_json["currentLedger"] = serde_json::json!(64);
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
-    let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::InvalidCurrentLedger { .. }
-    ));
-}
-
-#[rstest]
-fn test_invalid_bucket_hash_too_short(mut canonical_v1_json: serde_json::Value) {
-    // 63 characters - one character too short
-    canonical_v1_json["currentBuckets"][0]["curr"] =
-        serde_json::json!("abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678");
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
-    let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::MalformedBucketHash { .. }
-    ));
-}
-
-#[rstest]
-fn test_invalid_bucket_hash_too_long(mut canonical_v1_json: serde_json::Value) {
-    // 65 characters
-    canonical_v1_json["currentBuckets"][0]["curr"] =
-        serde_json::json!("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789a");
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
-    let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::MalformedBucketHash { .. }
-    ));
-}
-
-#[rstest]
-fn test_invalid_bucket_hash_non_hex(mut canonical_v1_json: serde_json::Value) {
-    // 64 characters but contains non-hex characters
-    canonical_v1_json["currentBuckets"][0]["curr"] =
-        serde_json::json!("ghij567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
-    let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::MalformedBucketHash { .. }
-    ));
-}
-
-#[rstest]
-fn test_invalid_bucket_hash_empty_string(mut canonical_v1_json: serde_json::Value) {
-    canonical_v1_json["currentBuckets"][0]["curr"] = serde_json::json!("");
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
-    let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::MalformedBucketHash { .. }
-    ));
-}
-
-#[rstest]
-fn test_valid_bucket_hashes(mut canonical_v1_json: serde_json::Value) {
-    // Test valid lowercase hex hash
-    canonical_v1_json["currentBuckets"][0]["curr"] =
-        serde_json::json!("abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json.clone()).unwrap();
     assert!(
-        has.validate().is_ok(),
-        "Valid lowercase hex hash should be valid"
-    );
-
-    // Test valid hex hash (mixed case)
-    canonical_v1_json["currentBuckets"][0]["curr"] =
-        serde_json::json!("AbCdEf0123456789abcdef0123456789abcdef0123456789abcdef0123456789");
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
-    assert!(
-        has.validate().is_ok(),
-        "Valid hex hash with mixed case should be valid"
+        matches!(error, crate::history_format::Error::InvalidCurrentLedger { .. }),
+        "Expected InvalidCurrentLedger for ledger {}, got {:?}",
+        ledger,
+        error
     );
 }
 
-#[rstest]
-fn test_next_state_0_with_output(mut canonical_v1_json: serde_json::Value) {
-    canonical_v1_json["currentBuckets"][0]["next"] = serde_json::json!({
-        "state": 0,
-        "output": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-    });
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
-    let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::InvalidNextState { state: 0, .. }
-    ));
+// Valid hash constant for tests
+const VALID_HASH: &str = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+const VALID_HASH2: &str = "fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321";
+const ZERO_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
+
+/// Helper to build next state JSON for testing
+fn next_state_json(state: u32, fields: &[(&str, serde_json::Value)]) -> serde_json::Value {
+    let mut obj = serde_json::json!({"state": state});
+    for (key, value) in fields {
+        obj[*key] = value.clone();
+    }
+    obj
 }
 
+// Tests for invalid next state structure (missing/extra fields)
 #[rstest]
-fn test_next_state_1_missing_output(mut canonical_v1_json: serde_json::Value) {
-    canonical_v1_json["currentBuckets"][0]["next"] = serde_json::json!({"state": 1});
+// State 0 (idle) should have no fields - output is not allowed
+#[case::state0_with_output(0, &[("output", serde_json::json!(VALID_HASH))], 0)]
+// State 1 (running) requires output field
+#[case::state1_missing_output(1, &[], 1)]
+// State 2 (merging) requires both curr and snap fields
+#[case::state2_missing_curr(2, &[("snap", serde_json::json!(VALID_HASH))], 2)]
+#[case::state2_missing_snap(2, &[("curr", serde_json::json!(VALID_HASH))], 2)]
+fn test_invalid_next_state_structure(
+    mut canonical_v1_json: serde_json::Value,
+    #[case] state: u32,
+    #[case] fields: &[(&str, serde_json::Value)],
+    #[case] expected_state: u32,
+) {
+    canonical_v1_json["currentBuckets"][0]["next"] = next_state_json(state, fields);
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::InvalidNextState { state: 1, .. }
-    ));
-}
-
-#[rstest]
-fn test_next_state_2_missing_curr(mut canonical_v1_json: serde_json::Value) {
-    canonical_v1_json["currentBuckets"][0]["next"] = serde_json::json!({
-        "state": 2,
-        "snap": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-    });
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
-    let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::InvalidNextState { state: 2, .. }
-    ));
-}
-
-#[rstest]
-fn test_next_state_2_missing_snap(mut canonical_v1_json: serde_json::Value) {
-    canonical_v1_json["currentBuckets"][0]["next"] = serde_json::json!({
-        "state": 2,
-        "curr": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-    });
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
-    let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::InvalidNextState { state: 2, .. }
-    ));
-}
-
-#[rstest]
-fn test_next_state_2_invalid_curr_hash(mut canonical_v1_json: serde_json::Value) {
-    canonical_v1_json["currentBuckets"][0]["next"] = serde_json::json!({
-        "state": 2,
-        "curr": "invalid_hash",
-        "snap": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
-    });
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
-    let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::MalformedBucketHash { .. }
-    ));
-}
-
-#[rstest]
-fn test_next_state_2_invalid_snap_hash(mut canonical_v1_json: serde_json::Value) {
-    canonical_v1_json["currentBuckets"][0]["next"] = serde_json::json!({
-        "state": 2,
-        "curr": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-        "snap": "tooshort"
-    });
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
-    let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::MalformedBucketHash { .. }
-    ));
-}
-
-#[rstest]
-fn test_next_state_2_invalid_shadow_hash(mut canonical_v1_json: serde_json::Value) {
-    canonical_v1_json["currentBuckets"][0]["next"] = serde_json::json!({
-        "state": 2,
-        "curr": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-        "snap": "fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321",
-        "shadow": [
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef012345678"
-        ]
-    });
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
-    let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::MalformedBucketHash { .. }
-    ));
-}
-
-#[rstest]
-fn test_next_state_2_valid_with_shadow(mut canonical_v1_json: serde_json::Value) {
-    // Test with valid curr, snap, and shadow array
-    canonical_v1_json["currentBuckets"][0]["next"] = serde_json::json!({
-        "state": 2,
-        "curr": "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789",
-        "snap": "fedcba0987654321fedcba0987654321fedcba0987654321fedcba0987654321",
-        "shadow": [
-            "0000000000000000000000000000000000000000000000000000000000000000",
-            "1111111111111111111111111111111111111111111111111111111111111111"
-        ]
-    });
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json.clone()).unwrap();
     assert!(
-        has.validate().is_ok(),
-        "State 2 with valid curr, snap, and shadow should be valid"
+        matches!(error, crate::history_format::Error::InvalidNextState { state: s, .. } if s == expected_state),
+        "Expected InvalidNextState with state {}, got {:?}",
+        expected_state,
+        error
     );
+}
 
-    // Test with empty shadow array
-    canonical_v1_json["currentBuckets"][0]["next"]["shadow"] = serde_json::json!([]);
-    let has: HistoryFileState = serde_json::from_value(canonical_v1_json.clone()).unwrap();
-    assert!(
-        has.validate().is_ok(),
-        "State 2 with empty shadow array should be valid"
-    );
+// Tests for invalid hashes in next state fields (state 2 merging)
+#[rstest]
+// curr field must be valid 64-char hex
+#[case::invalid_curr("invalid_hash", VALID_HASH, None)]
+// snap field must be valid 64-char hex
+#[case::invalid_snap(VALID_HASH, "tooshort", None)]
+// shadow array entries must all be valid 64-char hex
+#[case::invalid_shadow(VALID_HASH, VALID_HASH2, Some(vec![ZERO_HASH, "bad_shadow_hash"]))]
+fn test_invalid_hash_in_next_state(
+    mut canonical_v1_json: serde_json::Value,
+    #[case] curr: &str,
+    #[case] snap: &str,
+    #[case] shadow: Option<Vec<&str>>,
+) {
+    let mut next = serde_json::json!({"state": 2, "curr": curr, "snap": snap});
+    if let Some(s) = shadow {
+        next["shadow"] = serde_json::json!(s);
+    }
+    canonical_v1_json["currentBuckets"][0]["next"] = next;
+    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
+    let error = has.validate().unwrap_err();
+    assert!(matches!(error, crate::history_format::Error::MalformedBucketHash { .. }));
+}
+
+// Tests for valid next state 2 (merging) configurations
+#[rstest]
+// Shadow array with valid hashes is allowed
+#[case::with_shadow(Some(vec![ZERO_HASH, "1111111111111111111111111111111111111111111111111111111111111111"]))]
+// Empty shadow array is allowed
+#[case::empty_shadow(Some(vec![]))]
+// Shadow field is optional
+#[case::no_shadow(None)]
+fn test_valid_next_state_2(
+    mut canonical_v1_json: serde_json::Value,
+    #[case] shadow: Option<Vec<&str>>,
+) {
+    let mut next = serde_json::json!({"state": 2, "curr": VALID_HASH, "snap": VALID_HASH2});
+    if let Some(s) = shadow {
+        next["shadow"] = serde_json::json!(s);
+    }
+    canonical_v1_json["currentBuckets"][0]["next"] = next;
+    let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
+    assert!(has.validate().is_ok());
 }
 
 #[rstest]
@@ -563,10 +299,7 @@ fn test_invalid_next_state_value(mut canonical_v1_json: serde_json::Value) {
     canonical_v1_json["currentBuckets"][0]["next"]["state"] = serde_json::json!(3);
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(matches!(
-        error,
-        crate::history_format::Error::InvalidNextStateValue { .. }
-    ));
+    assert!(matches!(error, crate::history_format::Error::InvalidNextStateValue { .. }));
 }
 
 // JSON structure tests

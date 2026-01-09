@@ -143,7 +143,7 @@ impl MirrorOperation {
             let dst_file = dst_base.join(well_known_path);
 
             // Check if the history file exists (it might not if the mirror had failures)
-            if !src_file.exists() {
+            if !tokio::fs::try_exists(&src_file).await.unwrap_or(false) {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::NotFound,
                     format!(
