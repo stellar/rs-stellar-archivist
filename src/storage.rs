@@ -112,9 +112,10 @@ impl Storage for FileStore {
         match tokio::fs::File::open(&path).await {
             Ok(file) => Ok(Box::new(file)),
             Err(e) if e.kind() == io::ErrorKind::NotFound => Err(Error::not_found()),
-            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
-                Err(Error::fatal(format!("Permission denied: {}", path.display())))
-            }
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => Err(Error::fatal(format!(
+                "Permission denied: {}",
+                path.display()
+            ))),
             Err(e) => Err(Error::retry(format!("IO error: {}", e))),
         }
     }
@@ -264,25 +265,23 @@ impl Storage for HttpStore {
         let request = self.client.get(url.clone());
 
         match request.send().await {
-            Ok(resp) => {
-                match resp.error_for_status() {
-                    Ok(resp) => {
-                        let stream = resp.bytes_stream().map_err(to_io_error);
-                        let reader = StreamReader::new(stream);
-                        Ok(Box::new(reader) as BoxedAsyncRead)
-                    }
-                    Err(e) => {
-                        let status = e.status();
-                        let class = status
-                            .map(|s| classify_http_status(s.as_u16()))
-                            .unwrap_or(ErrorClass::Retry);
-                        let message = status
-                            .map(|s| format!("HTTP {}", s))
-                            .unwrap_or_else(|| e.to_string());
-                        Err(Error { class, message })
-                    }
+            Ok(resp) => match resp.error_for_status() {
+                Ok(resp) => {
+                    let stream = resp.bytes_stream().map_err(to_io_error);
+                    let reader = StreamReader::new(stream);
+                    Ok(Box::new(reader) as BoxedAsyncRead)
                 }
-            }
+                Err(e) => {
+                    let status = e.status();
+                    let class = status
+                        .map(|s| classify_http_status(s.as_u16()))
+                        .unwrap_or(ErrorClass::Retry);
+                    let message = status
+                        .map(|s| format!("HTTP {}", s))
+                        .unwrap_or_else(|| e.to_string());
+                    Err(Error { class, message })
+                }
+            },
             Err(e) => {
                 // Network/connection error - always retryable
                 Err(Error::retry(format!("Connection error: {}", e)))
@@ -352,9 +351,8 @@ impl StorageBackend {
         use std::sync::Arc;
         use url::Url;
 
-        let url = Url::parse(url_str).map_err(|e| {
-            Error::fatal(format!("Failed to parse URL '{}': {}", url_str, e))
-        })?;
+        let url = Url::parse(url_str)
+            .map_err(|e| Error::fatal(format!("Failed to parse URL '{}': {}", url_str, e)))?;
 
         match url.scheme() {
             "file" => {
@@ -375,10 +373,7 @@ impl StorageBackend {
                 let backend = StorageBackend::Http(http_store);
                 Ok(Arc::new(backend))
             }
-            scheme => Err(Error::fatal(format!(
-                "Unsupported URL scheme: {}",
-                scheme
-            ))),
+            scheme => Err(Error::fatal(format!("Unsupported URL scheme: {}", scheme))),
         }
     }
 }

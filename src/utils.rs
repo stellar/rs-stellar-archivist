@@ -3,7 +3,7 @@ use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-use crate::history_format::HistoryFileState;
+use crate::history_format::{self, HistoryFileState};
 use crate::pipeline;
 use crate::storage::StorageRef;
 
@@ -16,7 +16,7 @@ pub enum Error {
     #[error("History format error: {0}")]
     HistoryFormat(#[from] crate::history_format::Error),
 
-    #[error("No available checkpoints: archive's latest checkpoint 0x{latest_checkpoint:08x} (ledger {latest_ledger}) is below requested low 0x{low_checkpoint:08x} (ledger {low_ledger})")]
+    #[error("No available checkpoints: archive's latest checkpoint {latest_checkpoint} (0x{latest_checkpoint:08x}) (ledger {latest_ledger}) is below requested low {low_checkpoint} (0x{low_checkpoint:08x}) (ledger {low_ledger})")]
     NoAvailableCheckpoints {
         latest_checkpoint: u32,
         latest_ledger: u32,
@@ -24,7 +24,7 @@ pub enum Error {
         low_ledger: u32,
     },
 
-    #[error("Invalid checkpoint range: low checkpoint 0x{low_checkpoint:08x} is greater than high checkpoint 0x{high_checkpoint:08x}")]
+    #[error("Invalid checkpoint range: low checkpoint {low_checkpoint} (0x{low_checkpoint:08x}) is greater than high checkpoint {high_checkpoint} (0x{high_checkpoint:08x})")]
     InvalidCheckpointRange {
         low_checkpoint: u32,
         high_checkpoint: u32,
@@ -187,69 +187,122 @@ impl ArchiveStats {
     }
 }
 
+/// Tracks retry state with exponential backoff
+pub struct RetryState {
+    pub attempt: u32,
+    pub backoff_ms: u64,
+    pub max_retries: u32,
+}
+
+impl RetryState {
+    pub fn new(max_retries: u32, initial_backoff_ms: u64) -> Self {
+        Self {
+            attempt: 0,
+            backoff_ms: initial_backoff_ms,
+            max_retries,
+        }
+    }
+
+    /// Record an attempt and return true if we should retry, false if max retries exceeded
+    pub fn record_attempt(&mut self) -> bool {
+        self.attempt += 1;
+        self.attempt <= self.max_retries
+    }
+
+    /// Wait for the backoff period and increase it for next time
+    pub async fn backoff(&mut self) {
+        tokio::time::sleep(tokio::time::Duration::from_millis(self.backoff_ms)).await;
+        self.backoff_ms = (self.backoff_ms * 2).min(5000); // Cap at 5 seconds
+    }
+}
+
 /// Fetch and validate .well-known/stellar-history.json from store
-pub async fn fetch_well_known_history_file(store: &StorageRef) -> Result<HistoryFileState, Error> {
+pub async fn fetch_well_known_history_file(
+    store: &StorageRef,
+    max_retries: u32,
+    initial_backoff_ms: u64,
+) -> Result<HistoryFileState, Error> {
     use crate::history_format::ROOT_WELL_KNOWN_PATH;
+    use crate::storage::ErrorClass;
     use tokio::io::AsyncReadExt;
-    use tracing::debug;
 
     debug!("Fetching .well-known from path: {}", ROOT_WELL_KNOWN_PATH);
 
-    // Read the file content
-    let mut reader = store.open_reader(ROOT_WELL_KNOWN_PATH).await.map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("Failed to open {}: {}", ROOT_WELL_KNOWN_PATH, e),
-        )
-    })?;
-    let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer).await.map_err(|e| {
-        std::io::Error::new(e.kind(), format!("Reading {}: {}", ROOT_WELL_KNOWN_PATH, e))
-    })?;
+    let mut retry = RetryState::new(max_retries, initial_backoff_ms);
 
-    // Parse the JSON
-    let state: HistoryFileState =
-        serde_json::from_slice(&buffer).map_err(|e| crate::history_format::Error::InvalidJson {
-            path: ROOT_WELL_KNOWN_PATH.to_string(),
-            error: e.to_string(),
-        })?;
+    loop {
+        // Try to open and read the file
+        let result: Result<Vec<u8>, (ErrorClass, String)> = async {
+            let mut reader = store.open_reader(ROOT_WELL_KNOWN_PATH).await.map_err(|e| {
+                (
+                    e.class,
+                    format!("Failed to open {}: {}", ROOT_WELL_KNOWN_PATH, e),
+                )
+            })?;
 
-    // Validate the .well-known format
-    state.validate()?;
+            let mut buffer = Vec::new();
+            reader.read_to_end(&mut buffer).await.map_err(|e| {
+                // IO errors during read are typically retryable
+                (
+                    ErrorClass::Retry,
+                    format!("Reading {}: {}", ROOT_WELL_KNOWN_PATH, e),
+                )
+            })?;
 
-    Ok(state)
+            Ok(buffer)
+        }
+        .await;
+
+        match result {
+            Ok(buffer) => {
+                // Parse the JSON
+                let state: HistoryFileState = serde_json::from_slice(&buffer).map_err(|e| {
+                    crate::history_format::Error::InvalidJson {
+                        path: ROOT_WELL_KNOWN_PATH.to_string(),
+                        error: e.to_string(),
+                    }
+                })?;
+
+                // Validate the .well-known format
+                state.validate()?;
+
+                return Ok(state);
+            }
+            Err((error_class, msg)) => {
+                if matches!(error_class, ErrorClass::Retry) && retry.record_attempt() {
+                    debug!(
+                        "Retrying {} (attempt {}/{}): {}, backing off {}ms",
+                        ROOT_WELL_KNOWN_PATH,
+                        retry.attempt,
+                        retry.max_retries,
+                        msg,
+                        retry.backoff_ms
+                    );
+                    retry.backoff().await;
+                    continue;
+                }
+
+                return Err(std::io::Error::new(std::io::ErrorKind::Other, msg).into());
+            }
+        }
+    }
 }
 
-/// Compute checkpoint bounds from source archive and user-specified low/high values
-/// Returns (first_checkpoint, final_checkpoint)
-pub async fn compute_checkpoint_bounds(
-    source: &StorageRef,
+/// Compute checkpoint bounds using a pre-fetched source checkpoint
+pub fn compute_checkpoint_bounds(
+    source_checkpoint: u32,
     low: Option<u32>,
     high: Option<u32>,
 ) -> Result<(u32, u32), Error> {
-    use crate::history_format;
-    use tracing::{info, warn};
-
-    // Fetch the .well-known file from source
-    let state = fetch_well_known_history_file(source).await?;
-    let current_ledger = state.current_ledger;
-    let highest_source_checkpoint = history_format::round_to_lower_checkpoint(current_ledger);
-
-    info!(
-        "Source archive reports current ledger: {} (checkpoint: 0x{:08x})",
-        current_ledger, highest_source_checkpoint
-    );
-
-    // Check that the user-specified low is not below the source's current checkpoint
     // If low is not provided, default to genesis checkpoint
     let low_checkpoint = if let Some(low) = low {
         let low_checkpoint = history_format::round_to_lower_checkpoint(low);
 
         // Check if the source's current checkpoint is below requested low
-        if highest_source_checkpoint < low_checkpoint {
+        if source_checkpoint < low_checkpoint {
             return Err(Error::NoAvailableCheckpoints {
-                latest_checkpoint: highest_source_checkpoint,
-                latest_ledger: current_ledger,
+                latest_checkpoint: source_checkpoint,
+                latest_ledger: source_checkpoint,
                 low_checkpoint,
                 low_ledger: low,
             });
@@ -265,17 +318,17 @@ pub async fn compute_checkpoint_bounds(
 
         // Warn if the user passed a high ledger that is above what we see in source
         // We don't fail, but use the source's current checkpoint as the high bound
-        if highest_source_checkpoint < high_checkpoint {
+        if source_checkpoint < high_checkpoint {
             warn!(
-                "Archive's latest checkpoint 0x{:08x} (ledger {}) is below requested high 0x{:08x} (ledger {}), will process up to latest available",
-                highest_source_checkpoint, current_ledger, high_checkpoint, high
+                "Source checkpoint {} (0x{:08x}) is below requested high {} (0x{:08x}) (ledger {}), will process up to latest available",
+                source_checkpoint, source_checkpoint, high_checkpoint, high_checkpoint, high
             );
-            highest_source_checkpoint
+            source_checkpoint
         } else {
             high_checkpoint
         }
     } else {
-        highest_source_checkpoint
+        source_checkpoint
     };
 
     // Make sure we have at least one checkpoint in range
@@ -288,8 +341,8 @@ pub async fn compute_checkpoint_bounds(
 
     let total_count = history_format::count_checkpoints_in_range(low_checkpoint, high_checkpoint);
     info!(
-        "Processing {} checkpoints from 0x{:08x} to 0x{:08x}",
-        total_count, low_checkpoint, high_checkpoint
+        "Processing {} checkpoints from {} (0x{:08x}) to {} (0x{:08x})",
+        total_count, low_checkpoint, low_checkpoint, high_checkpoint, high_checkpoint
     );
 
     Ok((low_checkpoint, high_checkpoint))

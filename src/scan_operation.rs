@@ -1,7 +1,8 @@
+use crate::history_format;
 /// Scan operation - validates that files exist
 use crate::pipeline::{async_trait, Operation};
 use crate::storage::{BoxedAsyncRead, Error as StorageError, StorageRef};
-use crate::utils::{compute_checkpoint_bounds, ArchiveStats};
+use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use thiserror::Error;
 
 /// Scan operation errors
@@ -43,15 +44,28 @@ impl Operation for ScanOperation {
     async fn get_checkpoint_bounds(
         &self,
         source: &StorageRef,
+        max_retries: u32,
+        initial_backoff_ms: u64,
     ) -> Result<(u32, u32), crate::pipeline::Error> {
-        compute_checkpoint_bounds(source, self.low, self.high)
+        let source_state = fetch_well_known_history_file(source, max_retries, initial_backoff_ms)
             .await
+            .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))?;
+        let source_checkpoint =
+            history_format::round_to_lower_checkpoint(source_state.current_ledger);
+
+        compute_checkpoint_bounds(source_checkpoint, self.low, self.high)
             .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))
     }
 
-    async fn process_object(&self, _path: &str, _reader: BoxedAsyncRead) -> Result<(), StorageError> {
+    async fn process_object(
+        &self,
+        _path: &str,
+        _reader: BoxedAsyncRead,
+    ) -> Result<(), StorageError> {
         // For now, scan just checks existence.
-        unreachable!("ScanOperation uses existence_check_only(), process_object should not be called")
+        unreachable!(
+            "ScanOperation uses existence_check_only(), process_object should not be called"
+        )
     }
 
     fn record_success(&self, path: &str) {

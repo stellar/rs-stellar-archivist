@@ -9,7 +9,6 @@ use super::utils::{
     start_flaky_server, start_http_server_with_app, test_archive_path, FlakyServerConfig,
     RequestTracker, PERMANENT_HTTP_ERRORS, TRANSIENT_HTTP_ERRORS,
 };
-use std::path::PathBuf;
 use crate::test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig};
 use axum::{
     body::Body,
@@ -19,6 +18,7 @@ use axum::{
     Router,
 };
 use rstest::rstest;
+use std::path::PathBuf;
 use tempfile::TempDir;
 use tower::util::ServiceExt;
 use tower_http::services::ServeDir;
@@ -61,6 +61,63 @@ impl Operation {
 //=============================================================================
 // Transient Error Tests (retries expected)
 //=============================================================================
+
+/// Tests that transient errors on .well-known/stellar-history.json trigger retries.
+#[rstest]
+#[case::scan(Operation::Scan)]
+#[case::mirror(Operation::Mirror)]
+#[tokio::test]
+async fn test_retries_on_transient_well_known_errors(#[case] op: Operation) {
+    let archive_path = test_archive_path();
+
+    for (status_code, description) in TRANSIENT_HTTP_ERRORS {
+        let config = FlakyServerConfig::archive_status_error(
+            archive_path.clone(),
+            *status_code,
+            2,              // Fail twice, then succeed
+            ".well-known/", // Target the .well-known file
+        );
+        let (server_url, tracker, handle) = start_flaky_server(config).await;
+
+        let result = op.run(&server_url).await;
+        handle.abort();
+
+        // Verify retries occurred on .well-known
+        let counts = tracker.get_counts();
+        let well_known_count = counts
+            .get(".well-known/stellar-history.json")
+            .copied()
+            .unwrap_or(0);
+
+        assert!(
+            well_known_count > 1,
+            "{:?}: HTTP {} ({}) on .well-known should trigger retries, got count: {}",
+            op,
+            status_code,
+            description,
+            well_known_count
+        );
+
+        assert!(
+            result.is_ok(),
+            "{:?} should succeed after retrying .well-known HTTP {} ({}): {:?}",
+            op,
+            status_code,
+            description,
+            result.err()
+        );
+
+        // Verify backoff timing
+        tracker
+            .verify_backoff_timing(".well-known/stellar-history.json", 100, 0.8)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "{:?}: HTTP {} ({}) .well-known backoff timing failed: {}",
+                    op, status_code, description, e
+                )
+            });
+    }
+}
 
 #[rstest]
 #[case::scan(Operation::Scan)]
@@ -193,7 +250,12 @@ async fn test_fails_on_permanent_http_errors(#[case] op: Operation) {
 // Helper Functions
 //=============================================================================
 
-fn verify_retries_occurred(tracker: &RequestTracker, op: Operation, status_code: u16, description: &str) {
+fn verify_retries_occurred(
+    tracker: &RequestTracker,
+    op: Operation,
+    status_code: u16,
+    description: &str,
+) {
     let counts = tracker.get_counts();
     let retried: Vec<_> = counts
         .iter()
@@ -213,7 +275,12 @@ fn verify_retries_occurred(tracker: &RequestTracker, op: Operation, status_code:
     );
 }
 
-fn verify_backoff_timing(tracker: &RequestTracker, op: Operation, status_code: u16, description: &str) {
+fn verify_backoff_timing(
+    tracker: &RequestTracker,
+    op: Operation,
+    status_code: u16,
+    description: &str,
+) {
     let counts = tracker.get_counts();
     let retried: Vec<_> = counts
         .iter()
@@ -361,10 +428,17 @@ async fn test_mirror_cleans_up_partial_file_on_failure() {
     assert!(
         !bucket_retry_counts.is_empty(),
         "Expected bucket files to be retried (request count > 1), got counts: {:?}",
-        counts.iter().filter(|(p, _)| p.starts_with("bucket/")).collect::<Vec<_>>()
+        counts
+            .iter()
+            .filter(|(p, _)| p.starts_with("bucket/"))
+            .collect::<Vec<_>>()
     );
 
-    assert!(result.is_ok(), "Mirror should succeed after retry: {:?}", result.err());
+    assert!(
+        result.is_ok(),
+        "Mirror should succeed after retry: {:?}",
+        result.err()
+    );
 
     // Verify the final file has correct content (not partial)
     let dest_bucket = dest_dir.path()

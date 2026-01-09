@@ -52,6 +52,8 @@ pub trait Operation: Send + Sync + 'static {
     async fn get_checkpoint_bounds(
         &self,
         source: &crate::storage::StorageRef,
+        max_retries: u32,
+        initial_backoff_ms: u64,
     ) -> Result<(u32, u32), Error>;
 
     /// Process an object by streaming its content from the provided reader.
@@ -136,34 +138,7 @@ pub struct Pipeline<Op: Operation> {
     progress_tracker: AtomicUsize,
 }
 
-/// Tracks retry state with exponential backoff
-struct RetryState {
-    attempt: u32,
-    backoff_ms: u64,
-    max_retries: u32,
-}
-
-impl RetryState {
-    fn new(config: &PipelineConfig) -> Self {
-        Self {
-            attempt: 0,
-            backoff_ms: config.initial_backoff_ms,
-            max_retries: config.max_retries,
-        }
-    }
-
-    /// Record an attempt and return true if we should retry, false if max retries exceeded
-    fn record_attempt(&mut self) -> bool {
-        self.attempt += 1;
-        self.attempt <= self.max_retries
-    }
-
-    /// Wait for the backoff period and increase it for next time
-    async fn backoff(&mut self) {
-        tokio::time::sleep(tokio::time::Duration::from_millis(self.backoff_ms)).await;
-        self.backoff_ms = (self.backoff_ms * 2).min(5000); // Cap at 5 seconds
-    }
-}
+use crate::utils::RetryState;
 
 impl<Op: Operation> Pipeline<Op> {
     /// Handle a storage error with retry logic.
@@ -212,8 +187,8 @@ impl<Op: Operation> Pipeline<Op> {
                         "Failed to create storage backend for {}: {}",
                         config.source, e
                     ),
-                    )
-                })?;
+                )
+            })?;
 
         let bucket_lru = Mutex::new(LruCache::new(
             std::num::NonZeroUsize::new(BUCKET_LRU_CACHE_SIZE).unwrap(),
@@ -234,7 +209,11 @@ impl<Op: Operation> Pipeline<Op> {
         // Get checkpoint bounds from the operation
         let (lower_bound, upper_bound) = self
             .operation
-            .get_checkpoint_bounds(&self.source_op)
+            .get_checkpoint_bounds(
+                &self.source_op,
+                self.config.max_retries,
+                self.config.initial_backoff_ms,
+            )
             .await?;
 
         let total_count = history_format::count_checkpoints_in_range(lower_bound, upper_bound);
@@ -290,7 +269,7 @@ impl<Op: Operation> Pipeline<Op> {
 
     async fn process_history(self: Arc<Self>, checkpoint: u32) {
         let history_path = checkpoint_path("history", checkpoint);
-        let mut retry = RetryState::new(&self.config);
+        let mut retry = RetryState::new(self.config.max_retries, self.config.initial_backoff_ms);
 
         // Download the history file
         let buffer = loop {
@@ -308,7 +287,10 @@ impl<Op: Operation> Pipeline<Op> {
             match download_result {
                 Ok(bytes) => break bytes,
                 Err(e) => {
-                    if self.handle_error(&history_path, &e, &mut retry, "download").await {
+                    if self
+                        .handle_error(&history_path, &e, &mut retry, "download")
+                        .await
+                    {
                         return;
                     }
                 }
@@ -317,11 +299,12 @@ impl<Op: Operation> Pipeline<Op> {
 
         // Parse and validate
         let parse_result: Result<HistoryFileState, Error> = (|| {
-            let state: HistoryFileState =
-                serde_json::from_slice(&buffer).map_err(|e| history_format::Error::InvalidJson {
+            let state: HistoryFileState = serde_json::from_slice(&buffer).map_err(|e| {
+                history_format::Error::InvalidJson {
                     path: history_path.clone(),
                     error: e.to_string(),
-                })?;
+                }
+            })?;
             state.validate()?;
             Ok(state)
         })();
@@ -337,11 +320,19 @@ impl<Op: Operation> Pipeline<Op> {
                     // Write the history file (we already have content in buffer) and process buckets concurrently
                     let history_path_clone = history_path.clone();
                     let write_history = async {
-                        let reader = Box::new(std::io::Cursor::new(buffer)) as crate::storage::BoxedAsyncRead;
-                        match self.operation.process_object(&history_path_clone, reader).await {
+                        let reader = Box::new(std::io::Cursor::new(buffer))
+                            as crate::storage::BoxedAsyncRead;
+                        match self
+                            .operation
+                            .process_object(&history_path_clone, reader)
+                            .await
+                        {
                             Ok(()) => self.operation.record_success(&history_path_clone),
                             Err(e) => {
-                                error!("Failed to write history file {}: {}", history_path_clone, e);
+                                error!(
+                                    "Failed to write history file {}: {}",
+                                    history_path_clone, e
+                                );
                                 self.operation.record_failure(&history_path_clone).await;
                             }
                         }
@@ -352,8 +343,8 @@ impl<Op: Operation> Pipeline<Op> {
             }
             Err(e) => {
                 error!(
-                    "Failed to parse history JSON for checkpoint {:08x}: {}",
-                    checkpoint, e
+                    "Failed to parse history JSON for checkpoint {} (0x{:08x}): {}",
+                    checkpoint, checkpoint, e
                 );
                 self.operation.record_failure(&history_path).await;
             }
@@ -388,7 +379,7 @@ impl<Op: Operation> Pipeline<Op> {
     }
 
     async fn process_file(self: Arc<Self>, path: String) {
-        let mut retry = RetryState::new(&self.config);
+        let mut retry = RetryState::new(self.config.max_retries, self.config.initial_backoff_ms);
 
         // Acquire I/O permit
         let _permit = self.io_permits.acquire().await.unwrap();
@@ -457,7 +448,6 @@ impl<Op: Operation> Pipeline<Op> {
             }
         }
     }
-
 }
 
 pub use async_trait::async_trait;

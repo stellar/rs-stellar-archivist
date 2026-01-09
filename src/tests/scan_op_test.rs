@@ -209,12 +209,21 @@ enum Corruption {
 #[case::missing_ledger(Corruption::Remove("/ledger-"), "missing ledger file")]
 #[case::missing_transactions(Corruption::Remove("/transactions-"), "missing transactions file")]
 #[case::missing_results(Corruption::Remove("/results-"), "missing results file")]
-#[case::missing_well_known(Corruption::RemoveExact(".well-known/stellar-history.json"), "missing .well-known")]
-#[case::missing_checkpoint_history(Corruption::RemoveExact("history/00/00/27/history-0000273f.json"), "missing current checkpoint history")]
+#[case::missing_well_known(
+    Corruption::RemoveExact(".well-known/stellar-history.json"),
+    "missing .well-known"
+)]
+#[case::missing_checkpoint_history(
+    Corruption::RemoveExact("history/00/00/27/history-0000273f.json"),
+    "missing current checkpoint history"
+)]
 #[case::empty_history(Corruption::Empty("/history-"), "empty history file")]
 #[case::empty_bucket(Corruption::Empty("/bucket-"), "empty bucket file")]
 #[tokio::test]
-async fn test_scan_detects_corrupt_files(#[case] corruption: Corruption, #[case] description: &str) {
+async fn test_scan_detects_corrupt_files(
+    #[case] corruption: Corruption,
+    #[case] description: &str,
+) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let archive_path = temp_dir.path();
     copy_test_archive(archive_path).expect("Failed to copy test archive");

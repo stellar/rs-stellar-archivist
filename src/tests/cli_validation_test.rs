@@ -6,7 +6,10 @@ use rstest::rstest;
 #[rstest]
 #[case::http("http://example.com/archive", "HTTP destinations are read-only")]
 #[case::https("https://example.com/archive", "HTTPS destinations are read-only")]
-#[case::s3("s3://my-bucket/archive", "S3 destinations are not currently supported for writing")]
+#[case::s3(
+    "s3://my-bucket/archive",
+    "S3 destinations are not currently supported for writing"
+)]
 #[tokio::test]
 async fn test_mirror_rejects_readonly_destination(#[case] dst: &str, #[case] _reason: &str) {
     let config = MirrorConfig::new("file:///tmp/test-source", dst);
@@ -54,7 +57,11 @@ async fn test_rejects_nonexistent_source(#[case] operation: &str) {
         _ => unreachable!(),
     };
 
-    assert!(result.is_err(), "{} should reject nonexistent source", operation);
+    assert!(
+        result.is_err(),
+        "{} should reject nonexistent source",
+        operation
+    );
 }
 
 #[tokio::test]
@@ -105,7 +112,11 @@ async fn test_rejects_low_greater_than_high(#[case] operation: &str) {
         _ => unreachable!(),
     };
 
-    assert!(result.is_err(), "{} should reject when low > high", operation);
+    assert!(
+        result.is_err(),
+        "{} should reject when low > high",
+        operation
+    );
 
     let err_msg = result.unwrap_err().to_string();
     assert!(

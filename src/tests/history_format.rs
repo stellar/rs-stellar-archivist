@@ -62,8 +62,14 @@ fn test_canonical_v1_file_deserialization(canonical_v1_has: HistoryFileState) {
 
     // Level 0: state 0, no next fields
     let level0 = &canonical_v1_has.current_buckets[0];
-    assert_eq!(level0.curr, "5a7e9c8d4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d");
-    assert_eq!(level0.snap, "0000000000000000000000000000000000000000000000000000000000000000");
+    assert_eq!(
+        level0.curr,
+        "5a7e9c8d4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d"
+    );
+    assert_eq!(
+        level0.snap,
+        "0000000000000000000000000000000000000000000000000000000000000000"
+    );
     assert_eq!(level0.next.state, 0);
     assert!(level0.next.output.is_none());
     assert!(level0.next.curr.is_none());
@@ -90,9 +96,16 @@ fn test_canonical_v1_file_deserialization(canonical_v1_has: HistoryFileState) {
         level2.next.snap.as_deref(),
         Some("bbbb567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef")
     );
-    let shadow = level2.next.shadow.as_ref().expect("Level 2 should have shadow");
+    let shadow = level2
+        .next
+        .shadow
+        .as_ref()
+        .expect("Level 2 should have shadow");
     assert_eq!(shadow.len(), 2);
-    assert_eq!(shadow[0], "cccc567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef");
+    assert_eq!(
+        shadow[0],
+        "cccc567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef"
+    );
 
     // Level 10: state 2, has curr and snap but no shadow
     let level10 = &canonical_v1_has.current_buckets[10];
@@ -202,7 +215,10 @@ fn test_invalid_current_ledger(
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
     assert!(
-        matches!(error, crate::history_format::Error::InvalidCurrentLedger { .. }),
+        matches!(
+            error,
+            crate::history_format::Error::InvalidCurrentLedger { .. }
+        ),
         "Expected InvalidCurrentLedger for ledger {}, got {:?}",
         ledger,
         error
@@ -270,7 +286,10 @@ fn test_invalid_hash_in_next_state(
     canonical_v1_json["currentBuckets"][0]["next"] = next;
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(matches!(error, crate::history_format::Error::MalformedBucketHash { .. }));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::MalformedBucketHash { .. }
+    ));
 }
 
 // Tests for valid next state 2 (merging) configurations
@@ -299,7 +318,10 @@ fn test_invalid_next_state_value(mut canonical_v1_json: serde_json::Value) {
     canonical_v1_json["currentBuckets"][0]["next"]["state"] = serde_json::json!(3);
     let has: HistoryFileState = serde_json::from_value(canonical_v1_json).unwrap();
     let error = has.validate().unwrap_err();
-    assert!(matches!(error, crate::history_format::Error::InvalidNextStateValue { .. }));
+    assert!(matches!(
+        error,
+        crate::history_format::Error::InvalidNextStateValue { .. }
+    ));
 }
 
 // JSON structure tests

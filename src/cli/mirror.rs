@@ -60,15 +60,10 @@ impl MirrorCmd {
         let pipeline = Arc::new(
             Pipeline::new(operation, pipeline_config)
                 .await
-                .map_err(utils::map_pipeline_error)
-                .map_err(Error::from)?,
+                .map_err(utils::map_pipeline_error)?,
         );
 
-        pipeline
-            .run()
-            .await
-            .map_err(utils::map_pipeline_error)
-            .map_err(Error::from)?;
+        pipeline.run().await.map_err(utils::map_pipeline_error)?;
 
         Ok(())
     }

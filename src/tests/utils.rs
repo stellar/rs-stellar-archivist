@@ -108,8 +108,6 @@ pub struct FlakyServerConfig {
     pub partial_body_path_prefix: Option<String>,
     /// Archive path for serving real files
     pub archive_path: Option<PathBuf>,
-    /// Fraction of body to send on partial failure (default 0.25)
-    pub partial_body_fraction: f32,
     /// HTTP status code to return for error simulation (e.g., 500, 429, 408)
     pub error_status_code: Option<u16>,
     /// Number of times to return the error status code before succeeding (per path)
@@ -129,7 +127,6 @@ impl FlakyServerConfig {
             partial_body_fail_count: fail_count,
             partial_body_path_prefix: Some("bucket/".to_string()),
             archive_path: Some(archive_path),
-            partial_body_fraction: 0.25,
             ..Default::default()
         }
     }
@@ -193,10 +190,7 @@ impl RequestTracker {
         drop(counts);
 
         let mut timestamps = self.timestamps.lock().unwrap();
-        timestamps
-            .entry(path.to_string())
-            .or_default()
-            .push(now);
+        timestamps.entry(path.to_string()).or_default().push(now);
 
         result
     }
@@ -398,13 +392,8 @@ pub async fn start_flaky_server(
                     );
                     let _ = socket.write_all(response.as_bytes()).await;
 
-                    // Send only partial data, then close abruptly
-                    let fraction = if cfg.partial_body_fraction > 0.0 {
-                        cfg.partial_body_fraction
-                    } else {
-                        0.25
-                    };
-                    let partial_len = ((content.len() as f32) * fraction) as usize;
+                    // Send only partial data (25%), then close abruptly
+                    let partial_len = content.len() / 4;
                     let partial_len = partial_len.max(1).min(content.len());
                     let _ = socket.write_all(&content[..partial_len]).await;
                     drop(socket);
@@ -453,9 +442,5 @@ pub const TRANSIENT_HTTP_ERRORS: &[(u16, &str)] = &[
 
 /// Permanent HTTP errors that should not trigger retry behavior.
 /// These indicate a definitive failure condition.
-pub const PERMANENT_HTTP_ERRORS: &[(u16, &str)] = &[
-    (404, "Not Found"),
-    (403, "Forbidden"),
-    (400, "Bad Request"),
-];
-
+pub const PERMANENT_HTTP_ERRORS: &[(u16, &str)] =
+    &[(404, "Not Found"), (403, "Forbidden"), (400, "Bad Request")];
