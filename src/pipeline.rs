@@ -138,8 +138,8 @@ use crate::utils::RetryState;
 
 impl<Op: Operation> Pipeline<Op> {
     /// Handle a storage error with retry logic.
-    /// Returns `true` if we should give up, `false` if we should retry.
-    async fn handle_error(
+    /// Returns `false` if we should give up, `true` if we should retry.
+    async fn maybe_backoff_for_retry(
         &self,
         path: &str,
         error: &crate::storage::Error,
@@ -155,19 +155,19 @@ impl<Op: Operation> Pipeline<Op> {
                         action, path, retry.attempt, error
                     );
                     self.operation.record_failure(path).await;
-                    return true; // give up
+                    return false; // give up
                 }
                 debug!(
                     "Retrying {} (attempt {}/{}): {}, backing off {}ms",
                     path, retry.attempt, retry.max_retries, error, retry.backoff_ms
                 );
                 retry.backoff().await;
-                false // retry
+                true // retry
             }
             ErrorClass::Fatal | ErrorClass::NotFound => {
                 error!("Failed to {} {}: {}", action, path, error);
                 self.operation.record_failure(path).await;
-                true // give up
+                false // give up
             }
         }
     }
@@ -282,8 +282,8 @@ impl<Op: Operation> Pipeline<Op> {
             match download_result {
                 Ok(bytes) => break bytes,
                 Err(e) => {
-                    if self
-                        .handle_error(&history_path, &e, &mut retry, "download")
+                    if !self
+                        .maybe_backoff_for_retry(&history_path, &e, &mut retry, "download")
                         .await
                     {
                         return;
@@ -410,7 +410,10 @@ impl<Op: Operation> Pipeline<Op> {
                         return;
                     }
                     Err(e) => {
-                        if self.handle_error(&path, &e, &mut retry, "check").await {
+                        if !self
+                            .maybe_backoff_for_retry(&path, &e, &mut retry, "check")
+                            .await
+                        {
                             return;
                         }
                     }
@@ -420,7 +423,10 @@ impl<Op: Operation> Pipeline<Op> {
                 let reader = match self.source_op.open_reader(&path).await {
                     Ok(reader) => reader,
                     Err(e) => {
-                        if self.handle_error(&path, &e, &mut retry, "open").await {
+                        if !self
+                            .maybe_backoff_for_retry(&path, &e, &mut retry, "open")
+                            .await
+                        {
                             return;
                         }
                         continue;
@@ -435,7 +441,10 @@ impl<Op: Operation> Pipeline<Op> {
                         return;
                     }
                     Err(e) => {
-                        if self.handle_error(&path, &e, &mut retry, "process").await {
+                        if !self
+                            .maybe_backoff_for_retry(&path, &e, &mut retry, "process")
+                            .await
+                        {
                             return;
                         }
                     }
