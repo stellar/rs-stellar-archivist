@@ -11,10 +11,7 @@ use futures_util::{
     stream, StreamExt,
 };
 use lru::LruCache;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
-};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::{io::AsyncReadExt, sync::Semaphore};
 use tracing::{debug, error, info};
@@ -135,7 +132,6 @@ pub struct Pipeline<Op: Operation> {
     source_op: crate::storage::StorageRef,
     bucket_lru: Mutex<LruCache<String, ()>>,
     io_permits: Semaphore,
-    progress_tracker: AtomicUsize,
 }
 
 use crate::utils::RetryState;
@@ -201,7 +197,6 @@ impl<Op: Operation> Pipeline<Op> {
             source_op,
             bucket_lru,
             io_permits,
-            progress_tracker: AtomicUsize::new(0),
         })
     }
 
@@ -234,11 +229,11 @@ impl<Op: Operation> Pipeline<Op> {
 
         // Process checkpoints concurrently, limiting to config.concurrency at a time
         stream::iter(checkpoints)
-            .for_each_concurrent(self.config.concurrency, |fut| async {
+            .enumerate()
+            .for_each_concurrent(self.config.concurrency, |(i, fut)| async move {
                 fut.await;
-                let n = self.progress_tracker.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % PROGRESS_REPORTING_FREQUENCY == 0 || n == total_count {
-                    info!("Progress: {}/{} checkpoints processed", n, total_count);
+                if i % PROGRESS_REPORTING_FREQUENCY == 0 || i == total_count {
+                    info!("Progress: {}/{} checkpoints processed", i, total_count);
                 }
             })
             .await;
