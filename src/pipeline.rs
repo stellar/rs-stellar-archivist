@@ -232,8 +232,8 @@ impl<Op: Operation> Pipeline<Op> {
             .enumerate()
             .for_each_concurrent(self.config.concurrency, |(i, fut)| async move {
                 fut.await;
-                if i % PROGRESS_REPORTING_FREQUENCY == 0 || i == total_count {
-                    info!("Progress: {}/{} checkpoints processed", i, total_count);
+                if i % PROGRESS_REPORTING_FREQUENCY == 0 || i == total_count - 1 {
+                    info!("Progress: {}/{} checkpoints processed", i + 1, total_count);
                 }
             })
             .await;
