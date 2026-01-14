@@ -57,7 +57,7 @@ impl MirrorOperation {
         high: Option<u32>,
         allow_mirror_gaps: bool,
     ) -> Result<Self, Error> {
-        let dst_store = crate::storage::StorageBackend::from_url(dst).await?;
+        let dst_store = crate::storage::from_url(dst).await?;
 
         // Destination must support write operations
         if !dst_store.supports_writes() {

@@ -174,7 +174,7 @@ impl<Op: Operation> Pipeline<Op> {
 
     /// Create a new pipeline
     pub async fn new(operation: Op, config: PipelineConfig) -> Result<Self, Error> {
-        let src_store = crate::storage::StorageBackend::from_url(&config.source)
+        let src_store = crate::storage::from_url(&config.source)
             .await
             .map_err(|e| {
                 std::io::Error::new(
