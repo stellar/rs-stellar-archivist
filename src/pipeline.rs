@@ -129,7 +129,7 @@ impl Default for PipelineConfig {
 pub struct Pipeline<Op: Operation> {
     operation: Op,
     config: PipelineConfig,
-    source_op: crate::storage::StorageRef,
+    src_store: crate::storage::StorageRef,
     bucket_lru: Mutex<LruCache<String, ()>>,
     io_permits: Semaphore,
 }
@@ -174,7 +174,7 @@ impl<Op: Operation> Pipeline<Op> {
 
     /// Create a new pipeline
     pub async fn new(operation: Op, config: PipelineConfig) -> Result<Self, Error> {
-        let source_op = crate::storage::StorageBackend::from_url(&config.source)
+        let src_store = crate::storage::StorageBackend::from_url(&config.source)
             .await
             .map_err(|e| {
                 std::io::Error::new(
@@ -194,7 +194,7 @@ impl<Op: Operation> Pipeline<Op> {
         Ok(Self {
             operation,
             config,
-            source_op,
+            src_store,
             bucket_lru,
             io_permits,
         })
@@ -205,7 +205,7 @@ impl<Op: Operation> Pipeline<Op> {
         let (lower_bound, upper_bound) = self
             .operation
             .get_checkpoint_bounds(
-                &self.source_op,
+                &self.src_store,
                 self.config.max_retries,
                 self.config.initial_backoff_ms,
             )
@@ -269,7 +269,7 @@ impl<Op: Operation> Pipeline<Op> {
         // Download the history file
         let buffer = loop {
             let download_result: Result<Vec<u8>, crate::storage::Error> = async {
-                let mut reader = self.source_op.open_reader(&history_path).await?;
+                let mut reader = self.src_store.open_reader(&history_path).await?;
                 let mut buffer = Vec::new();
                 reader
                     .read_to_end(&mut buffer)
@@ -398,7 +398,7 @@ impl<Op: Operation> Pipeline<Op> {
 
             // For existence-only checks, we don't need to open a reader or call process_object
             if self.operation.existence_check_only() {
-                match self.source_op.exists(&path).await {
+                match self.src_store.exists(&path).await {
                     Ok(true) => {
                         debug!("Exists: {}", path);
                         self.operation.record_success(&path);
@@ -420,7 +420,7 @@ impl<Op: Operation> Pipeline<Op> {
                 }
             } else {
                 // Normal path - open a reader for actual content streaming
-                let reader = match self.source_op.open_reader(&path).await {
+                let reader = match self.src_store.open_reader(&path).await {
                     Ok(reader) => reader,
                     Err(e) => {
                         if !self
