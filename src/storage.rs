@@ -122,16 +122,25 @@ pub struct StorageConfig {
     pub bandwidth_limit: u32,
 }
 
-impl Default for StorageConfig {
-    fn default() -> Self {
+impl StorageConfig {
+    /// Create a new StorageConfig with explicit values
+    pub fn new(
+        max_retries: usize,
+        retry_min_delay: Duration,
+        retry_max_delay: Duration,
+        max_concurrent: usize,
+        timeout: Duration,
+        io_timeout: Duration,
+        bandwidth_limit: u32,
+    ) -> Self {
         Self {
-            max_retries: 5,
-            retry_min_delay: Duration::from_millis(100),
-            retry_max_delay: Duration::from_secs(30),
-            timeout: Duration::from_secs(60),
-            io_timeout: Duration::from_secs(300), // 5 minutes for large files
-            max_concurrent: 1024,
-            bandwidth_limit: 0, // unlimited
+            max_retries,
+            retry_min_delay,
+            retry_max_delay,
+            max_concurrent,
+            timeout,
+            io_timeout,
+            bandwidth_limit,
         }
     }
 }
@@ -235,13 +244,20 @@ impl OpendalStore {
     // ===== Filesystem Backend =====
 
     /// Create a filesystem storage backend
+    ///
+    /// Uses OpenDAL's atomic_write_dir feature to ensure writes are atomic
+    /// (temp file + rename) and go through the ConcurrentLimitLayer.
     pub fn filesystem(root: impl Into<PathBuf>, config: &StorageConfig) -> Result<Self, Error> {
         use opendal::services::Fs;
 
         let root_path: PathBuf = root.into();
         let root_str = root_path.to_string_lossy().to_string();
 
-        let builder = Fs::default().root(&root_str);
+        // Use atomic_write_dir to ensure atomic writes via temp file + rename
+        // This also ensures writes go through OpenDAL layers (including ConcurrentLimitLayer)
+        let builder = Fs::default()
+            .root(&root_str)
+            .atomic_write_dir(&root_str);
         let operator = Self::apply_layers(builder, config)?;
 
         Ok(Self::from_operator(
@@ -471,67 +487,6 @@ impl OpendalStore {
 
         Ok(Self::from_operator(operator, prefix, None, false))
     }
-
-    /// Write from reader to filesystem atomically via temp file
-    ///
-    /// This ensures that:
-    /// 1. Partial files are never visible at the final path
-    /// 2. If the read fails mid-stream, the temp file is cleaned up
-    /// 3. The final file appears atomically via rename
-    async fn write_from_reader_atomic(
-        &self,
-        root_path: &Path,
-        key: &str,
-        reader: &mut BoxedAsyncRead,
-    ) -> io::Result<u64> {
-        let final_path = root_path.join(key.trim_start_matches('/'));
-
-        // Create parent directories
-        if let Some(parent) = final_path.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-
-        // Generate temp file path in the same directory (for atomic rename)
-        let temp_filename = format!(
-            ".tmp.{}.{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        );
-        let temp_path = final_path
-            .parent()
-            .unwrap_or(root_path)
-            .join(&temp_filename);
-
-        // Write to temp file
-        let write_result = async {
-            let temp_file = tokio::fs::File::create(&temp_path).await?;
-            let mut buf_writer = BufWriter::with_capacity(WRITE_BUF_BYTES, temp_file);
-
-            let bytes_written = tokio::io::copy(reader, &mut buf_writer).await?;
-
-            buf_writer.flush().await?;
-            buf_writer.shutdown().await?;
-
-            Ok::<u64, io::Error>(bytes_written)
-        }
-        .await;
-
-        match write_result {
-            Ok(bytes_written) => {
-                // Atomically rename temp file to final path
-                tokio::fs::rename(&temp_path, &final_path).await?;
-                Ok(bytes_written)
-            }
-            Err(e) => {
-                // Clean up temp file on failure
-                let _ = tokio::fs::remove_file(&temp_path).await;
-                Err(e)
-            }
-        }
-    }
 }
 
 /// Classify an OpenDAL error into our ErrorClass
@@ -615,15 +570,8 @@ impl Storage for OpendalStore {
 
         let key = self.object_to_key(object);
 
-        // For filesystem backends, use atomic write via temp file
-        // This prevents partial files from being visible if the read fails mid-stream
-        if let Some(ref root_path) = self.root_path {
-            return self
-                .write_from_reader_atomic(root_path, &key, reader)
-                .await;
-        }
-
-        // For non-filesystem backends, write directly via OpenDAL
+        // All backends write through OpenDAL, which applies ConcurrentLimitLayer
+        // Filesystem backends use atomic_write_dir for atomic writes (temp file + rename)
         let writer = self
             .operator
             .writer(&key)
@@ -667,11 +615,8 @@ impl Storage for OpendalStore {
 /// - `b2://bucket/prefix` - Backblaze B2 (uses B2_APPLICATION_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET_ID env vars)
 /// - `swift://container/prefix` - OpenStack Swift (uses SWIFT_ENDPOINT, SWIFT_TOKEN env vars)
 /// - `sftp://[user@]host[:port]/path` - SFTP (uses SFTP_USER, SFTP_KEY env vars)
-pub async fn from_url(url_str: &str) -> Result<StorageRef, Error> {
-    from_url_with_config(url_str, &StorageConfig::default()).await
-}
 
-/// Create a backend from a URL string with custom configuration
+/// Create a backend from a URL string with configuration
 pub async fn from_url_with_config(
     url_str: &str,
     config: &StorageConfig,

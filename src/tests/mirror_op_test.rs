@@ -10,7 +10,7 @@ use super::utils::{
 };
 use crate::{
     history_format,
-    test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig},
+    test_helpers::{run_mirror, run_scan, test_storage_config, MirrorConfig, ScanConfig},
 };
 use axum::{routing::get_service, Router};
 use std::collections::HashSet;
@@ -208,6 +208,7 @@ async fn test_mirror_full_archive() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
+        storage_config: test_storage_config(),
     };
 
     run_mirror(mirror_config).await.expect("Full mirror failed");
@@ -219,6 +220,7 @@ async fn test_mirror_full_archive() {
         skip_optional: false,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     })
     .await
     .expect("Scan of full archive failed");
@@ -254,6 +256,7 @@ async fn test_mirror_bounded() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
+        storage_config: test_storage_config(),
     };
 
     run_mirror(mirror_config)
@@ -267,6 +270,7 @@ async fn test_mirror_bounded() {
         skip_optional: false,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     })
     .await
     .expect("Scan of bounded archive failed");
@@ -301,6 +305,7 @@ async fn test_mirror_skip_optional() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
+        storage_config: test_storage_config(),
     };
 
     run_mirror(mirror_config)
@@ -317,6 +322,7 @@ async fn test_mirror_skip_optional() {
         skip_optional: true,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     })
     .await
     .expect("Scan of archive without optional files failed");
@@ -749,6 +755,7 @@ async fn test_mirror_http_to_filesystem() {
         skip_optional: false,
         overwrite: false,
         allow_mirror_gaps: false,
+        storage_config: test_storage_config(),
     };
 
     run_mirror(mirror_config).await.unwrap_or_else(|e| {
@@ -763,6 +770,7 @@ async fn test_mirror_http_to_filesystem() {
         skip_optional: false,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     };
 
     run_scan(scan_config).await.unwrap_or_else(|e| {
@@ -841,6 +849,7 @@ async fn test_mirror_race_condition_with_advancing_archive() {
         skip_optional: true,
         overwrite: false,
         allow_mirror_gaps: false,
+        storage_config: test_storage_config(),
     };
 
     run_mirror(mirror_config).await.unwrap_or_else(|e| {

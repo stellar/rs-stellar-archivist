@@ -2,7 +2,7 @@
 
 use crate::history_format;
 use crate::pipeline::{async_trait, Operation};
-use crate::storage::{BoxedAsyncRead, Error as StorageError, StorageRef};
+use crate::storage::{BoxedAsyncRead, Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use thiserror::Error;
 use tokio::sync::OnceCell;
@@ -56,8 +56,9 @@ impl MirrorOperation {
         low: Option<u32>,
         high: Option<u32>,
         allow_mirror_gaps: bool,
+        storage_config: &StorageConfig,
     ) -> Result<Self, Error> {
-        let dst_store = crate::storage::from_url(dst).await?;
+        let dst_store = crate::storage::from_url_with_config(dst, storage_config).await?;
 
         // Destination must support write operations
         if !dst_store.supports_writes() {
