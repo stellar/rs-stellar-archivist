@@ -44,10 +44,8 @@ impl Operation for ScanOperation {
     async fn get_checkpoint_bounds(
         &self,
         source: &StorageRef,
-        max_retries: u32,
-        initial_backoff_ms: u64,
     ) -> Result<(u32, u32), crate::pipeline::Error> {
-        let source_state = fetch_well_known_history_file(source, max_retries, initial_backoff_ms)
+        let source_state = fetch_well_known_history_file(source)
             .await
             .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))?;
         let source_checkpoint =
@@ -74,10 +72,6 @@ impl Operation for ScanOperation {
 
     async fn record_failure(&self, path: &str) {
         self.stats.record_failure(path).await;
-    }
-
-    fn record_retry(&self) {
-        self.stats.record_retry();
     }
 
     fn record_skipped(&self, _path: &str) {

@@ -2,7 +2,7 @@
 
 use crate::history_format;
 use crate::pipeline::{async_trait, Operation};
-use crate::storage::{BoxedAsyncRead, Error as StorageError, StorageRef, WRITE_BUF_BYTES};
+use crate::storage::{BoxedAsyncRead, Error as StorageError, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use thiserror::Error;
 use tokio::sync::OnceCell;
@@ -84,7 +84,7 @@ impl MirrorOperation {
         self.initial_dest_checkpoint
             .get_or_init(|| async {
                 // Try to read the destination's .well-known file (local file, no retries required)
-                match fetch_well_known_history_file(&self.dst_store, 0, 0).await {
+                match fetch_well_known_history_file(&self.dst_store).await {
                     Ok(has) => Some(has.current_ledger),
                     Err(_) => None, // No existing archive
                 }
@@ -195,8 +195,6 @@ impl Operation for MirrorOperation {
     async fn get_checkpoint_bounds(
         &self,
         source: &StorageRef,
-        max_retries: u32,
-        initial_backoff_ms: u64,
     ) -> Result<(u32, u32), crate::pipeline::Error> {
         // Determine the effective low checkpoint based on destination .well-known/stellar-history.json and flags
         //
@@ -211,7 +209,7 @@ impl Operation for MirrorOperation {
         //    - If destination doesn't exist: start from genesis checkpoint
 
         // First, get the source's latest checkpoint to know what's available
-        let source_state = fetch_well_known_history_file(source, max_retries, initial_backoff_ms)
+        let source_state = fetch_well_known_history_file(source)
             .await
             .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
         let source_checkpoint =
@@ -354,18 +352,9 @@ impl Operation for MirrorOperation {
         path: &str,
         mut reader: BoxedAsyncRead,
     ) -> Result<(), StorageError> {
-        use tokio::io::{AsyncWriteExt, BufWriter};
-
-        // Stream from source to destination
-        let write_result = async {
-            let writer = self.dst_store.open_writer(path).await?;
-            let mut buf_writer = BufWriter::with_capacity(WRITE_BUF_BYTES, writer);
-
-            tokio::io::copy(&mut reader, &mut buf_writer).await?;
-            buf_writer.flush().await?;
-            Ok::<(), std::io::Error>(())
-        }
-        .await;
+        // Stream from source to destination using write_from_reader
+        // which handles buffering, flushing, and shutdown internally
+        let write_result = self.dst_store.write_from_reader(path, &mut reader).await;
 
         match write_result {
             Ok(_) => Ok(()),
@@ -396,10 +385,6 @@ impl Operation for MirrorOperation {
 
     async fn record_failure(&self, path: &str) {
         self.stats.record_failure(path).await;
-    }
-
-    fn record_retry(&self) {
-        self.stats.record_retry();
     }
 
     fn record_skipped(&self, path: &str) {

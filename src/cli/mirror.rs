@@ -53,8 +53,7 @@ impl MirrorCmd {
             source: self.src.clone(),
             concurrency: args.concurrency,
             skip_optional: args.skip_optional,
-            max_retries: args.max_retries,
-            initial_backoff_ms: args.initial_backoff_ms,
+            storage_config: args.storage_config,
         };
 
         let pipeline = Arc::new(

@@ -1,10 +1,12 @@
 //! Pipeline for processing Stellar History Archives
 //!
 //! The pipeline coordinates parallel processing of archive checkpoints and their files.
+//! Retry, concurrency limiting, timeout handling, and bandwidth throttling are delegated
+//! to the storage layer (OpenDAL).
 
 use crate::{
     history_format::{self, bucket_path, checkpoint_path, HistoryFileState},
-    storage::ErrorClass,
+    storage::StorageConfig,
 };
 use futures_util::{
     future::{join, join3, join_all},
@@ -13,7 +15,7 @@ use futures_util::{
 use lru::LruCache;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tokio::{io::AsyncReadExt, sync::Semaphore};
+use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info};
 
 /// Pipeline errors
@@ -49,8 +51,6 @@ pub trait Operation: Send + Sync + 'static {
     async fn get_checkpoint_bounds(
         &self,
         source: &crate::storage::StorageRef,
-        max_retries: u32,
-        initial_backoff_ms: u64,
     ) -> Result<(u32, u32), Error>;
 
     /// Process an object by streaming its content from the provided reader.
@@ -58,8 +58,7 @@ pub trait Operation: Send + Sync + 'static {
     ///
     /// Returns:
     /// - Ok(()) on success
-    /// - Err(e) where e.class == Retry for transient errors
-    /// - Err(e) where e.class == Fatal/NotFound for permanent errors
+    /// - Err(e) on failure (storage layer handles retries internally)
     async fn process_object(
         &self,
         path: &str,
@@ -71,9 +70,6 @@ pub trait Operation: Send + Sync + 'static {
 
     /// Record a failed file processing
     async fn record_failure(&self, path: &str);
-
-    /// Record a retry attempt
-    fn record_retry(&self);
 
     /// Record a skipped file (already exists at destination)
     fn record_skipped(&self, path: &str);
@@ -104,14 +100,12 @@ pub trait Operation: Send + Sync + 'static {
 pub struct PipelineConfig {
     /// Source archive URL, as provided by the user
     pub source: String,
-    /// Number of concurrent workers for processing
+    /// Number of concurrent checkpoint workers
     pub concurrency: usize,
     /// Whether to skip optional SCP files
     pub skip_optional: bool,
-    /// Maximum number of HTTP retry attempts
-    pub max_retries: u32,
-    /// Initial backoff in milliseconds for HTTP retries
-    pub initial_backoff_ms: u64,
+    /// Storage layer configuration (retry, timeout, bandwidth, etc.)
+    pub storage_config: StorageConfig,
 }
 
 impl Default for PipelineConfig {
@@ -120,8 +114,7 @@ impl Default for PipelineConfig {
             source: String::new(),
             concurrency: 64,
             skip_optional: false,
-            max_retries: 3,
-            initial_backoff_ms: 100,
+            storage_config: StorageConfig::default(),
         }
     }
 }
@@ -131,50 +124,12 @@ pub struct Pipeline<Op: Operation> {
     config: PipelineConfig,
     src_store: crate::storage::StorageRef,
     bucket_lru: Mutex<LruCache<String, ()>>,
-    io_permits: Semaphore,
 }
 
-use crate::utils::RetryState;
-
 impl<Op: Operation> Pipeline<Op> {
-    /// Handle a storage error with retry logic.
-    /// Returns `false` if we should give up, `true` if we should retry.
-    async fn maybe_backoff_for_retry(
-        &self,
-        path: &str,
-        error: &crate::storage::Error,
-        retry: &mut RetryState,
-        action: &str,
-    ) -> bool {
-        match error.class {
-            ErrorClass::Retry => {
-                self.operation.record_retry();
-                if !retry.record_attempt() {
-                    error!(
-                        "Failed to {} {} after {} attempts: {}",
-                        action, path, retry.attempt, error
-                    );
-                    self.operation.record_failure(path).await;
-                    return false; // give up
-                }
-                debug!(
-                    "Retrying {} (attempt {}/{}): {}, backing off {}ms",
-                    path, retry.attempt, retry.max_retries, error, retry.backoff_ms
-                );
-                retry.backoff().await;
-                true // retry
-            }
-            ErrorClass::Fatal | ErrorClass::NotFound => {
-                error!("Failed to {} {}: {}", action, path, error);
-                self.operation.record_failure(path).await;
-                false // give up
-            }
-        }
-    }
-
     /// Create a new pipeline
     pub async fn new(operation: Op, config: PipelineConfig) -> Result<Self, Error> {
-        let src_store = crate::storage::from_url(&config.source)
+        let src_store = crate::storage::from_url_with_config(&config.source, &config.storage_config)
             .await
             .map_err(|e| {
                 std::io::Error::new(
@@ -189,14 +144,12 @@ impl<Op: Operation> Pipeline<Op> {
         let bucket_lru = Mutex::new(LruCache::new(
             std::num::NonZeroUsize::new(BUCKET_LRU_CACHE_SIZE).unwrap(),
         ));
-        let io_permits = Semaphore::new(config.concurrency);
 
         Ok(Self {
             operation,
             config,
             src_store,
             bucket_lru,
-            io_permits,
         })
     }
 
@@ -204,11 +157,7 @@ impl<Op: Operation> Pipeline<Op> {
         // Get checkpoint bounds from the operation
         let (lower_bound, upper_bound) = self
             .operation
-            .get_checkpoint_bounds(
-                &self.src_store,
-                self.config.max_retries,
-                self.config.initial_backoff_ms,
-            )
+            .get_checkpoint_bounds(&self.src_store)
             .await?;
 
         let total_count = history_format::count_checkpoints_in_range(lower_bound, upper_bound);
@@ -262,33 +211,30 @@ impl<Op: Operation> Pipeline<Op> {
         }
     }
 
+    /// Process a history file for a checkpoint.
+    /// Downloads and parses the history JSON, then processes buckets.
+    /// Retries are handled by the storage layer (OpenDAL).
     async fn process_history(self: Arc<Self>, checkpoint: u32) {
         let history_path = checkpoint_path("history", checkpoint);
-        let mut retry = RetryState::new(self.config.max_retries, self.config.initial_backoff_ms);
 
-        // Download the history file
-        let buffer = loop {
-            let download_result: Result<Vec<u8>, crate::storage::Error> = async {
-                let mut reader = self.src_store.open_reader(&history_path).await?;
-                let mut buffer = Vec::new();
-                reader
-                    .read_to_end(&mut buffer)
-                    .await
-                    .map_err(|e| crate::storage::Error::retry(format!("Read error: {}", e)))?;
-                Ok(buffer)
-            }
-            .await;
+        // Download the history file (storage layer handles retries)
+        let download_result: Result<Vec<u8>, crate::storage::Error> = async {
+            let mut reader = self.src_store.open_reader(&history_path).await?;
+            let mut buffer = Vec::new();
+            reader
+                .read_to_end(&mut buffer)
+                .await
+                .map_err(|e| crate::storage::Error::fatal(format!("Read error: {}", e)))?;
+            Ok(buffer)
+        }
+        .await;
 
-            match download_result {
-                Ok(bytes) => break bytes,
-                Err(e) => {
-                    if !self
-                        .maybe_backoff_for_retry(&history_path, &e, &mut retry, "download")
-                        .await
-                    {
-                        return;
-                    }
-                }
+        let buffer = match download_result {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                error!("Failed to download history file {}: {}", history_path, e);
+                self.operation.record_failure(&history_path).await;
+                return;
             }
         };
 
@@ -373,81 +319,61 @@ impl<Op: Operation> Pipeline<Op> {
         join_all(bucket_futures).await;
     }
 
+    /// Process a single file (bucket, ledger, transactions, results, scp).
+    /// Retries are handled by the storage layer (OpenDAL).
     async fn process_file(self: Arc<Self>, path: String) {
-        let mut retry = RetryState::new(self.config.max_retries, self.config.initial_backoff_ms);
-
-        // Acquire I/O permit
-        let _permit = self.io_permits.acquire().await.unwrap();
-
-        loop {
-            // Pre-check: allow operation to skip without querying source
-            if let Some(result) = self.operation.pre_check(&path).await {
-                match result {
-                    Ok(()) => {
-                        debug!("Skipping: {}", path);
-                        self.operation.record_skipped(&path);
-                        return;
-                    }
-                    Err(e) => {
-                        error!("Pre-check failed for {}: {}", path, e);
-                        self.operation.record_failure(&path).await;
-                        return;
-                    }
+        // Pre-check: allow operation to skip without querying source
+        if let Some(result) = self.operation.pre_check(&path).await {
+            match result {
+                Ok(()) => {
+                    debug!("Skipping: {}", path);
+                    self.operation.record_skipped(&path);
+                    return;
+                }
+                Err(e) => {
+                    error!("Pre-check failed for {}: {}", path, e);
+                    self.operation.record_failure(&path).await;
+                    return;
                 }
             }
+        }
 
-            // For existence-only checks, we don't need to open a reader or call process_object
-            if self.operation.existence_check_only() {
-                match self.src_store.exists(&path).await {
-                    Ok(true) => {
-                        debug!("Exists: {}", path);
-                        self.operation.record_success(&path);
-                        return;
-                    }
-                    Ok(false) => {
-                        error!("File not found: {}", path);
-                        self.operation.record_failure(&path).await;
-                        return;
-                    }
-                    Err(e) => {
-                        if !self
-                            .maybe_backoff_for_retry(&path, &e, &mut retry, "check")
-                            .await
-                        {
-                            return;
-                        }
-                    }
+        // For existence-only checks, we don't need to open a reader or call process_object
+        if self.operation.existence_check_only() {
+            match self.src_store.exists(&path).await {
+                Ok(true) => {
+                    debug!("Exists: {}", path);
+                    self.operation.record_success(&path);
                 }
-            } else {
-                // Normal path - open a reader for actual content streaming
-                let reader = match self.src_store.open_reader(&path).await {
-                    Ok(reader) => reader,
-                    Err(e) => {
-                        if !self
-                            .maybe_backoff_for_retry(&path, &e, &mut retry, "open")
-                            .await
-                        {
-                            return;
-                        }
-                        continue;
-                    }
-                };
+                Ok(false) => {
+                    error!("File not found: {}", path);
+                    self.operation.record_failure(&path).await;
+                }
+                Err(e) => {
+                    error!("Failed to check existence for {}: {}", path, e);
+                    self.operation.record_failure(&path).await;
+                }
+            }
+        } else {
+            // Normal path - open a reader for actual content streaming
+            let reader = match self.src_store.open_reader(&path).await {
+                Ok(reader) => reader,
+                Err(e) => {
+                    error!("Failed to open reader for {}: {}", path, e);
+                    self.operation.record_failure(&path).await;
+                    return;
+                }
+            };
 
-                // Process the file
-                match self.operation.process_object(&path, reader).await {
-                    Ok(()) => {
-                        debug!("Processed: {}", path);
-                        self.operation.record_success(&path);
-                        return;
-                    }
-                    Err(e) => {
-                        if !self
-                            .maybe_backoff_for_retry(&path, &e, &mut retry, "process")
-                            .await
-                        {
-                            return;
-                        }
-                    }
+            // Process the file
+            match self.operation.process_object(&path, reader).await {
+                Ok(()) => {
+                    debug!("Processed: {}", path);
+                    self.operation.record_success(&path);
+                }
+                Err(e) => {
+                    error!("Failed to process {}: {}", path, e);
+                    self.operation.record_failure(&path).await;
                 }
             }
         }
