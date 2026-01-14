@@ -8,6 +8,9 @@
 
 #![allow(dead_code)] // Test utilities may not all be used in every test run
 
+use crate::retryable_error_layer::{
+    NON_STANDARD_RETRYABLE_HTTP_ERRORS, STANDARD_RETRYABLE_HTTP_ERRORS,
+};
 use axum::{routing::get_service, Router};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -425,22 +428,15 @@ pub async fn start_flaky_server(
     (format!("http://{}", addr), tracker, handle)
 }
 
-//=============================================================================
-// HTTP Error Constants
-//=============================================================================
-
-/// Transient HTTP errors that should trigger retry behavior (OpenDAL's built-in retry layer).
-/// These match what OpenDAL considers retryable: 500, 502, 503, 504.
-/// Note: 429 (Rate Limited) is NOT retried by OpenDAL - it's handled via ConcurrentLimitLayer.
-pub const TRANSIENT_HTTP_ERRORS: &[(u16, &str)] = &[
-    (500, "Internal Server Error"),
-    (502, "Bad Gateway"),
-    (503, "Service Unavailable"),
-    (504, "Gateway Timeout"),
-];
-
-/// Permanent HTTP errors that should not trigger retry behavior.
-/// These indicate a definitive failure condition.
-/// Note: 429 and 408 are also NOT retried by OpenDAL, but they are not permanent failures.
-pub const PERMANENT_HTTP_ERRORS: &[(u16, &str)] =
-    &[(404, "Not Found"), (403, "Forbidden"), (400, "Bad Request")];
+/// Returns all transient HTTP errors that should trigger retry behavior.
+///
+/// This combines:
+/// - Standard HTTP errors (500, 502, 503, 504) - handled by OpenDAL natively
+/// - Non-standard errors (429, Cloudflare, proxy, etc.) - handled by our RetryableErrorLayer
+pub fn transient_http_errors() -> Vec<(u16, &'static str)> {
+    STANDARD_RETRYABLE_HTTP_ERRORS
+        .iter()
+        .chain(NON_STANDARD_RETRYABLE_HTTP_ERRORS.iter())
+        .copied()
+        .collect()
+}
