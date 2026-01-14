@@ -46,6 +46,7 @@ impl MirrorCmd {
             self.low,
             self.high,
             self.allow_mirror_gaps,
+            &args.storage_config,
         )
         .await?;
 

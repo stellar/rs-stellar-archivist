@@ -108,17 +108,6 @@ pub struct PipelineConfig {
     pub storage_config: StorageConfig,
 }
 
-impl Default for PipelineConfig {
-    fn default() -> Self {
-        Self {
-            source: String::new(),
-            concurrency: 64,
-            skip_optional: false,
-            storage_config: StorageConfig::default(),
-        }
-    }
-}
-
 pub struct Pipeline<Op: Operation> {
     operation: Op,
     config: PipelineConfig,

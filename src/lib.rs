@@ -36,8 +36,23 @@ pub mod test_helpers {
         mirror_operation::MirrorOperation,
         pipeline::{Pipeline, PipelineConfig},
         scan_operation::ScanOperation,
+        storage::StorageConfig,
     };
     use std::sync::Arc;
+    use std::time::Duration;
+
+    /// Create a StorageConfig suitable for testing (generous timeouts, limited concurrency)
+    pub fn test_storage_config() -> StorageConfig {
+        StorageConfig::new(
+            3,                             // max_retries
+            Duration::from_millis(100),    // retry_min_delay
+            Duration::from_secs(30),       // retry_max_delay
+            64,                            // max_concurrent
+            Duration::from_secs(30),       // timeout
+            Duration::from_secs(300),      // io_timeout
+            0,                             // bandwidth_limit (unlimited)
+        )
+    }
 
     #[derive(Debug)]
     pub struct ScanConfig {
@@ -46,6 +61,7 @@ pub mod test_helpers {
         pub skip_optional: bool,
         pub low: Option<u32>,
         pub high: Option<u32>,
+        pub storage_config: StorageConfig,
     }
 
     impl ScanConfig {
@@ -57,6 +73,7 @@ pub mod test_helpers {
                 skip_optional: false,
                 low: None,
                 high: None,
+                storage_config: test_storage_config(),
             }
         }
 
@@ -83,6 +100,12 @@ pub mod test_helpers {
             self.high = Some(high);
             self
         }
+
+        /// Set custom storage config
+        pub fn storage_config(mut self, config: StorageConfig) -> Self {
+            self.storage_config = config;
+            self
+        }
     }
 
     pub struct MirrorConfig {
@@ -94,6 +117,7 @@ pub mod test_helpers {
         pub high: Option<u32>,
         pub overwrite: bool,
         pub allow_mirror_gaps: bool,
+        pub storage_config: StorageConfig,
     }
 
     impl MirrorConfig {
@@ -108,6 +132,7 @@ pub mod test_helpers {
                 high: None,
                 overwrite: false,
                 allow_mirror_gaps: false,
+                storage_config: test_storage_config(),
             }
         }
 
@@ -146,6 +171,12 @@ pub mod test_helpers {
             self.allow_mirror_gaps = true;
             self
         }
+
+        /// Set custom storage config
+        pub fn storage_config(mut self, config: StorageConfig) -> Self {
+            self.storage_config = config;
+            self
+        }
     }
 
     pub async fn run_scan(config: ScanConfig) -> Result<(), crate::Error> {
@@ -155,7 +186,7 @@ pub mod test_helpers {
             source: config.archive,
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
-            storage_config: crate::storage::StorageConfig::default(),
+            storage_config: config.storage_config,
         };
 
         let pipeline = Arc::new(
@@ -176,6 +207,7 @@ pub mod test_helpers {
             config.low,
             config.high,
             config.allow_mirror_gaps,
+            &config.storage_config,
         )
         .await?;
 
@@ -183,7 +215,7 @@ pub mod test_helpers {
             source: config.src,
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
-            storage_config: crate::storage::StorageConfig::default(),
+            storage_config: config.storage_config,
         };
 
         let pipeline = Arc::new(
