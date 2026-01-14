@@ -1,10 +1,12 @@
 pub mod mirror;
 pub mod scan;
 
+use crate::storage::StorageConfig;
 use crate::{self as stellar_archivist, mirror_operation, scan_operation};
 use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 use std::io;
+use std::time::Duration;
 use thiserror::Error;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -45,7 +47,7 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Number of files to process concurrently
+    /// Number of checkpoints to process concurrently
     #[arg(short, long, global = true, default_value_t = 32)]
     concurrency: usize,
 
@@ -61,13 +63,21 @@ struct Cli {
     #[arg(long, global = true)]
     trace: bool,
 
-    /// Maximum number of HTTP retry attempts
+    /// Maximum number of retry attempts for failed requests
     #[arg(long, global = true, default_value_t = 3)]
-    max_retries: u32,
+    max_retries: usize,
 
-    /// Initial backoff in milliseconds for HTTP retries
-    #[arg(long, global = true, default_value_t = 100)]
-    initial_backoff_ms: u64,
+    /// Maximum concurrent I/O operations (per storage backend)
+    #[arg(long, global = true, default_value_t = 64)]
+    max_concurrent: usize,
+
+    /// Request timeout in seconds
+    #[arg(long, global = true, default_value_t = 30)]
+    timeout_secs: u64,
+
+    /// Bandwidth limit in bytes per second (0 = unlimited)
+    #[arg(long, global = true, default_value_t = 0)]
+    bandwidth_limit: u32,
 }
 
 #[derive(Subcommand, Debug)]
@@ -83,8 +93,7 @@ pub enum Commands {
 pub struct GlobalArgs {
     pub concurrency: usize,
     pub skip_optional: bool,
-    pub max_retries: u32,
-    pub initial_backoff_ms: u64,
+    pub storage_config: StorageConfig,
 }
 
 /// Run the CLI with the given arguments
@@ -106,8 +115,8 @@ where
 
     // Build filter: set default level and suppress noisy HTTP/2 and networking crates
     let filter = EnvFilter::new(format!(
-        "{},h2=warn,hyper=warn,hyper_util=warn,reqwest=warn,tokio=warn,tower=warn,rustls=warn",
-        level
+        "{},opendal={},h2=warn,hyper=warn,hyper_util=warn,reqwest=warn,tokio=warn,tower=warn,rustls=warn",
+        level, level
     ));
 
     let subscriber = fmt::Subscriber::builder()
@@ -120,8 +129,14 @@ where
     let global_args = GlobalArgs {
         concurrency: cli.concurrency,
         skip_optional: cli.skip_optional,
-        max_retries: cli.max_retries,
-        initial_backoff_ms: cli.initial_backoff_ms,
+        storage_config: StorageConfig {
+            max_retries: cli.max_retries,
+            max_concurrent: cli.max_concurrent,
+            timeout: Duration::from_secs(cli.timeout_secs),
+            io_timeout: Duration::from_secs(cli.timeout_secs * 5), // 5x for large file I/O
+            bandwidth_limit: cli.bandwidth_limit,
+            ..Default::default()
+        },
     };
 
     match cli.command {

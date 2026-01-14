@@ -155,8 +155,7 @@ pub mod test_helpers {
             source: config.archive,
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
-            max_retries: 3,
-            initial_backoff_ms: 100,
+            storage_config: crate::storage::StorageConfig::default(),
         };
 
         let pipeline = Arc::new(
@@ -184,8 +183,7 @@ pub mod test_helpers {
             source: config.src,
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
-            max_retries: 3,
-            initial_backoff_ms: 100,
+            storage_config: crate::storage::StorageConfig::default(),
         };
 
         let pipeline = Arc::new(

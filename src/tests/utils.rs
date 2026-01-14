@@ -429,18 +429,18 @@ pub async fn start_flaky_server(
 // HTTP Error Constants
 //=============================================================================
 
-/// Transient HTTP errors that should trigger retry behavior.
-/// These are recoverable errors where retrying may succeed.
+/// Transient HTTP errors that should trigger retry behavior (OpenDAL's built-in retry layer).
+/// These match what OpenDAL considers retryable: 500, 502, 503, 504.
+/// Note: 429 (Rate Limited) is NOT retried by OpenDAL - it's handled via ConcurrentLimitLayer.
 pub const TRANSIENT_HTTP_ERRORS: &[(u16, &str)] = &[
     (500, "Internal Server Error"),
     (502, "Bad Gateway"),
     (503, "Service Unavailable"),
     (504, "Gateway Timeout"),
-    (429, "Too Many Requests"),
-    (408, "Request Timeout"),
 ];
 
 /// Permanent HTTP errors that should not trigger retry behavior.
 /// These indicate a definitive failure condition.
+/// Note: 429 and 408 are also NOT retried by OpenDAL, but they are not permanent failures.
 pub const PERMANENT_HTTP_ERRORS: &[(u16, &str)] =
     &[(404, "Not Found"), (403, "Forbidden"), (400, "Bad Request")];

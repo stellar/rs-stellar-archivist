@@ -1,7 +1,7 @@
 //! Tests for scan command operations
 
 use super::utils::{copy_test_archive, get_files_by_pattern, start_http_server, test_archive_path};
-use crate::storage::{HttpStore, Storage};
+use crate::storage::{OpendalStore, Storage, StorageConfig};
 use crate::test_helpers::{run_scan, ScanConfig};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
@@ -369,7 +369,9 @@ async fn smoke_live_stellar_archive_connection() {
     ];
 
     for url_str in urls {
-        let store = HttpStore::new(url_str.parse().unwrap());
+        let config = StorageConfig::default();
+        let store = OpendalStore::http(url_str, &config)
+            .unwrap_or_else(|e| panic!("{url_str}: failed to create store: {e}"));
         let mut reader = store
             .open_reader(".well-known/stellar-history.json")
             .await

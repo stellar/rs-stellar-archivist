@@ -16,13 +16,13 @@ name = "stellar_archivist"
 default = ["cli", "opendal-all"]
 cli = ["dep:clap", "dep:tracing-subscriber"]
 
-# OpenDAL-based cloud storage backends
-opendal-s3 = ["dep:opendal", "opendal?/services-s3"]
-opendal-gcs = ["dep:opendal", "opendal?/services-gcs"]
-opendal-azblob = ["dep:opendal", "opendal?/services-azblob"]
-opendal-b2 = ["dep:opendal", "opendal?/services-b2"]
-opendal-sftp = ["dep:opendal", "opendal?/services-sftp"]
-opendal-swift = ["dep:opendal", "opendal?/services-swift"]
+# OpenDAL-based storage backends (fs and http are always enabled)
+opendal-s3 = ["opendal/services-s3"]
+opendal-gcs = ["opendal/services-gcs"]
+opendal-azblob = ["opendal/services-azblob"]
+opendal-b2 = ["opendal/services-b2"]
+opendal-sftp = ["opendal/services-sftp"]
+opendal-swift = ["opendal/services-swift"]
 
 # Convenience feature to enable all cloud storage backends
 opendal-all = ["opendal-s3", "opendal-gcs", "opendal-azblob", "opendal-b2", "opendal-sftp", "opendal-swift"]
@@ -44,15 +44,11 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"]
 futures-util = { version = "0.3" }
 url = { version = "2.5" }
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",        # TLS backend (force rustls, no native-tls)
-    "http2",             # Enable HTTP/2 support
-    "stream",            # Streaming responses
-] }
 tokio-util = { version = "0.7.16", features = ["compat", "io"] }
 lru = { version = "0.12" }
-opendal = { version = "0.55", default-features = false, optional = true }
+opendal = { version = "0.55", default-features = false, features = ["services-fs", "services-http", "layers-throttle"] }
 futures-io = { version = "0.3" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 [dev-dependencies]
 tempfile = { version = "3.5.0" }

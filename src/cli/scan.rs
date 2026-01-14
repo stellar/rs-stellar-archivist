@@ -36,13 +36,12 @@ impl ScanCmd {
         // Create the scan operation
         let operation = ScanOperation::new(self.low, self.high).await?;
 
-        // Configure the pipeline with low/high bounds and retry config
+        // Configure the pipeline with low/high bounds and storage config
         let pipeline_config = PipelineConfig {
             source: self.archive.clone(),
             concurrency: args.concurrency,
             skip_optional: args.skip_optional,
-            max_retries: args.max_retries,
-            initial_backoff_ms: args.initial_backoff_ms,
+            storage_config: args.storage_config,
         };
 
         // Create and run the pipeline

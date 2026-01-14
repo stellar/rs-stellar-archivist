@@ -217,75 +217,45 @@ impl RetryState {
 }
 
 /// Fetch and validate .well-known/stellar-history.json from store
-pub async fn fetch_well_known_history_file(
-    store: &StorageRef,
-    max_retries: u32,
-    initial_backoff_ms: u64,
-) -> Result<HistoryFileState, Error> {
+/// Retries are handled by the storage layer (OpenDAL).
+pub async fn fetch_well_known_history_file(store: &StorageRef) -> Result<HistoryFileState, Error> {
     use crate::history_format::ROOT_WELL_KNOWN_PATH;
-    use crate::storage::ErrorClass;
     use tokio::io::AsyncReadExt;
 
     debug!("Fetching .well-known from path: {}", ROOT_WELL_KNOWN_PATH);
 
-    let mut retry = RetryState::new(max_retries, initial_backoff_ms);
+    // Open and read the file (storage layer handles retries)
+    let mut reader = store.open_reader(ROOT_WELL_KNOWN_PATH).await.map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Failed to open {}: {}", ROOT_WELL_KNOWN_PATH, e),
+        )
+    })?;
 
-    loop {
-        // Try to open and read the file
-        let result: Result<Vec<u8>, (ErrorClass, String)> = async {
-            let mut reader = store.open_reader(ROOT_WELL_KNOWN_PATH).await.map_err(|e| {
-                (
-                    e.class,
-                    format!("Failed to open {}: {}", ROOT_WELL_KNOWN_PATH, e),
-                )
-            })?;
+    let mut buffer = Vec::new();
+    reader.read_to_end(&mut buffer).await.map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Reading {}: {}", ROOT_WELL_KNOWN_PATH, e),
+        )
+    })?;
 
-            let mut buffer = Vec::new();
-            reader.read_to_end(&mut buffer).await.map_err(|e| {
-                // IO errors during read are typically retryable
-                (
-                    ErrorClass::Retry,
-                    format!("Reading {}: {}", ROOT_WELL_KNOWN_PATH, e),
-                )
-            })?;
-
-            Ok(buffer)
-        }
-        .await;
-
-        match result {
-            Ok(buffer) => {
-                // Parse the JSON
-                let state: HistoryFileState = serde_json::from_slice(&buffer).map_err(|e| {
-                    crate::history_format::Error::InvalidJson {
-                        path: ROOT_WELL_KNOWN_PATH.to_string(),
-                        error: e.to_string(),
-                    }
-                })?;
-
-                // Validate the .well-known format
-                state.validate()?;
-
-                return Ok(state);
-            }
-            Err((error_class, msg)) => {
-                if matches!(error_class, ErrorClass::Retry) && retry.record_attempt() {
-                    debug!(
-                        "Retrying {} (attempt {}/{}): {}, backing off {}ms",
-                        ROOT_WELL_KNOWN_PATH,
-                        retry.attempt,
-                        retry.max_retries,
-                        msg,
-                        retry.backoff_ms
-                    );
-                    retry.backoff().await;
-                    continue;
-                }
-
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, msg).into());
-            }
-        }
+    // Parse the JSON
+    tracing::debug!("Read {} bytes from {}", buffer.len(), ROOT_WELL_KNOWN_PATH);
+    if buffer.len() < 200 {
+        tracing::debug!("Content: {:?}", String::from_utf8_lossy(&buffer));
     }
+    let state: HistoryFileState = serde_json::from_slice(&buffer).map_err(|e| {
+        crate::history_format::Error::InvalidJson {
+            path: ROOT_WELL_KNOWN_PATH.to_string(),
+            error: e.to_string(),
+        }
+    })?;
+
+    // Validate the .well-known format
+    state.validate()?;
+
+    Ok(state)
 }
 
 /// Compute checkpoint bounds using a pre-fetched source checkpoint
