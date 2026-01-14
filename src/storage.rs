@@ -258,11 +258,10 @@ impl OpendalStore {
         let root_path: PathBuf = root.into();
         let root_str = root_path.to_string_lossy().to_string();
 
-        // Use atomic_write_dir to ensure atomic writes via temp file + rename
-        // This also ensures writes go through OpenDAL layers (including ConcurrentLimitLayer)
+        // Direct writes (no atomic temp file + rename) for better performance
+        // Trade-off: interrupted writes may leave partial files, but mirror cleanup handles this
         let builder = Fs::default()
-            .root(&root_str)
-            .atomic_write_dir(&root_str);
+            .root(&root_str);
         let operator = Self::apply_layers(builder, config)?;
 
         Ok(Self::from_operator(
