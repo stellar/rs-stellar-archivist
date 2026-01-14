@@ -39,7 +39,7 @@ reqwest = { version = "0.12", default-features = false, features = [
     "stream",            # Streaming responses
 ] }
 tokio-util = { version = "0.7.16", features = ["compat", "io"] }
-lru = { version = "0.12" }
+lru = { version = "0.16" }
 
 [dev-dependencies]
 tempfile = { version = "3.5.0" }
