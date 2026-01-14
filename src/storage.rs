@@ -7,6 +7,7 @@
 //! - Concurrent request limiting
 //! - Request logging
 
+use crate::retryable_error_layer::RetryableErrorLayer;
 use async_trait::async_trait;
 use opendal::{layers, ErrorKind, Operator};
 use std::io;
@@ -189,7 +190,10 @@ impl OpendalStore {
     ) -> Result<Operator, Error> {
         // Build operator with layers
         // IMPORTANT: TimeoutLayer must come BEFORE RetryLayer per OpenDAL docs
-        // Order of layers (innermost to outermost): Service -> HttpClient -> Timeout -> Retry -> ConcurrentLimit -> Logging
+        // Order of layers (innermost to outermost):
+        //   Service -> HttpClient -> Timeout -> RetryableError -> Retry -> ConcurrentLimit -> Logging
+        // Note: RetryableErrorLayer must come before RetryLayer to mark non-standard 5xx codes as
+        //       temporary before the retry decision is made.
         // Note: ThrottleLayer is applied at the end since it needs the final Operator type
         let op = Operator::new(builder)
             .map_err(|e| Error::fatal(format!("Failed to create operator: {}", e)))?
@@ -198,6 +202,7 @@ impl OpendalStore {
                     .with_timeout(config.timeout)
                     .with_io_timeout(config.io_timeout),
             )
+            .layer(RetryableErrorLayer::new())
             .layer(
                 layers::RetryLayer::new()
                     .with_max_times(config.max_retries)

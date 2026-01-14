@@ -1,6 +1,7 @@
 pub mod history_format;
 pub mod mirror_operation;
 pub mod pipeline;
+pub mod retryable_error_layer;
 pub mod scan_operation;
 pub mod storage;
 pub mod utils;

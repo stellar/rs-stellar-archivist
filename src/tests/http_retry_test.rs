@@ -1,13 +1,13 @@
 //! HTTP error handling tests for scan and mirror operations
 //!
 //! This module tests retry behavior for HTTP errors across both operations:
-//! - Transient errors (5xx, 429, 408) trigger retries with exponential backoff
-//! - Permanent errors (4xx) do not trigger retries
+//! - Transient errors (5xx, 408, 429) trigger retries with exponential backoff
+//! - Permanent errors (4xx except 408, 429) do not trigger retries
 //! - Connection drops trigger retries
 
 use super::utils::{
-    start_flaky_server, start_http_server_with_app, test_archive_path, FlakyServerConfig,
-    RequestTracker, PERMANENT_HTTP_ERRORS, TRANSIENT_HTTP_ERRORS,
+    start_flaky_server, start_http_server_with_app, test_archive_path, transient_http_errors,
+    FlakyServerConfig, RequestTracker,
 };
 use crate::test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig};
 use axum::{
@@ -22,6 +22,10 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 use tower::util::ServiceExt;
 use tower_http::services::ServeDir;
+
+/// Permanent HTTP errors that should not trigger retry behavior.
+const PERMANENT_HTTP_ERRORS: &[(u16, &str)] =
+    &[(404, "Not Found"), (403, "Forbidden"), (400, "Bad Request")];
 
 /// Operation type for parameterized tests
 #[derive(Clone, Copy, Debug)]
@@ -70,10 +74,10 @@ impl Operation {
 async fn test_retries_on_transient_well_known_errors(#[case] op: Operation) {
     let archive_path = test_archive_path();
 
-    for (status_code, description) in TRANSIENT_HTTP_ERRORS {
+    for (status_code, description) in transient_http_errors() {
         let config = FlakyServerConfig::archive_status_error(
             archive_path.clone(),
-            *status_code,
+            status_code,
             2,              // Fail twice, then succeed
             ".well-known/", // Target the .well-known file
         );
@@ -119,10 +123,10 @@ async fn test_retries_on_transient_well_known_errors(#[case] op: Operation) {
 async fn test_retries_on_transient_http_errors(#[case] op: Operation) {
     let archive_path = test_archive_path();
 
-    for (status_code, description) in TRANSIENT_HTTP_ERRORS {
+    for (status_code, description) in transient_http_errors() {
         let config = FlakyServerConfig::archive_status_error(
             archive_path.clone(),
-            *status_code,
+            status_code,
             2, // Fail twice, then succeed
             op.path_prefix(),
         );
@@ -131,7 +135,7 @@ async fn test_retries_on_transient_http_errors(#[case] op: Operation) {
         let result = op.run(&server_url).await;
         handle.abort();
 
-        verify_retries_occurred(&tracker, op, *status_code, description);
+        verify_retries_occurred(&tracker, op, status_code, description);
         assert!(
             result.is_ok(),
             "{:?} should succeed after retrying HTTP {} ({}): {:?}",
@@ -140,7 +144,7 @@ async fn test_retries_on_transient_http_errors(#[case] op: Operation) {
             description,
             result.err()
         );
-        verify_backoff_timing(&tracker, op, *status_code, description);
+        verify_backoff_timing(&tracker, op, status_code, description);
     }
 }
 
@@ -216,9 +220,6 @@ async fn test_fails_on_permanent_http_errors(#[case] op: Operation) {
             status_code,
             description
         );
-
-        // Note: OpenDAL's RetryLayer may retry some "permanent" errors
-        // The key assertion is that the operation eventually fails
     }
 }
 
