@@ -385,6 +385,8 @@ async fn smoke_live_stellar_archive_connection() {
             Duration::from_secs(30),    // timeout
             Duration::from_secs(300),   // io_timeout
             0,                          // bandwidth_limit
+            false,                      // atomic_file_writes
+            false,                      // fsync_file_writes
         );
         let store = OpendalStore::http(url_str, &config)
             .unwrap_or_else(|e| panic!("{url_str}: failed to create store: {e}"));

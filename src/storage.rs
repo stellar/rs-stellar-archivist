@@ -9,12 +9,14 @@
 
 use crate::retryable_error_layer::RetryableErrorLayer;
 use async_trait::async_trait;
-use futures_util::TryStreamExt;
+use futures_util::SinkExt;
+use futures_util::StreamExt;
 use opendal::{layers, Buffer, ErrorKind, Operator, Reader, Writer};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
+use tokio::io::AsyncWriteExt;
 
 /// Classification of errors for retry decisions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -95,8 +97,8 @@ pub trait Storage: Send + Sync {
     /// Copy data from a source reader to a destination object.
     /// Streams data in chunks without buffering the entire file in memory.
     /// Only supported by writable backends (e.g., filesystem).
-    async fn copy_from_reader(&self, object: &str, reader: Reader) -> Result<u64, Error> {
-        let mut writer = self.open_writer(object).await?;
+    async fn copy_from_reader(&self, object: &str, reader: Reader) -> Result<(), Error> {
+        let writer = self.open_writer(object).await?;
 
         // Convert reader to a stream of Buffer chunks (zero-copy)
         // The range `..` means read all data
@@ -105,27 +107,14 @@ pub trait Storage: Send + Sync {
             .await
             .map_err(|e| Error::retry(format!("Failed to create stream for {}: {}", object, e)))?;
 
-        let mut bytes_written: u64 = 0;
-
-        // Stream chunks directly to writer without buffering entire file
-        while let Some(buffer) = stream
-            .try_next()
+        let mut sink = writer.into_sink();
+        sink.send_all(&mut stream)
             .await
-            .map_err(|e| Error::retry(format!("Failed to read chunk for {}: {}", object, e)))?
-        {
-            bytes_written += buffer.len() as u64;
-            writer
-                .write(buffer)
-                .await
-                .map_err(|e| Error::retry(format!("Failed to write chunk to {}: {}", object, e)))?;
-        }
-
-        writer
-            .close()
+            .map_err(|e| Error::retry(format!("Failed to write data to {}: {}", object, e)))?;
+        sink.close()
             .await
             .map_err(|e| Error::retry(format!("Failed to close writer for {}: {}", object, e)))?;
-
-        Ok(bytes_written)
+        Ok(())
     }
 
     /// Check if this backend supports write operations
@@ -158,6 +147,10 @@ pub struct StorageConfig {
     pub max_concurrent: usize,
     /// Bandwidth limit in bytes per second (0 = unlimited)
     pub bandwidth_limit: u32,
+    /// Use atomic file writes (write to temp file, then rename)
+    pub atomic_file_writes: bool,
+    /// Call fsync after each file write
+    pub fsync_file_writes: bool,
 }
 
 impl StorageConfig {
@@ -170,6 +163,8 @@ impl StorageConfig {
         timeout: Duration,
         io_timeout: Duration,
         bandwidth_limit: u32,
+        atomic_file_writes: bool,
+        fsync_file_writes: bool,
     ) -> Self {
         Self {
             max_retries,
@@ -179,6 +174,8 @@ impl StorageConfig {
             timeout,
             io_timeout,
             bandwidth_limit,
+            atomic_file_writes,
+            fsync_file_writes,
         }
     }
 }
@@ -193,6 +190,8 @@ pub struct OpendalStore {
     root_path: Option<PathBuf>,
     /// Whether this backend supports writes
     writable: bool,
+    /// Whether to call fsync after each file write.
+    fsync_file_writes: bool,
 }
 
 impl OpendalStore {
@@ -202,12 +201,14 @@ impl OpendalStore {
         prefix: impl Into<String>,
         root_path: Option<PathBuf>,
         writable: bool,
+        fsync_file_writes: bool,
     ) -> Self {
         Self {
             operator,
             prefix: prefix.into(),
             root_path,
             writable,
+            fsync_file_writes,
         }
     }
 
@@ -283,21 +284,72 @@ impl OpendalStore {
         }
     }
 
+    /// Direct file write that bypasses OpenDAL's writer layer.
+    /// This avoids the WriteGenerator buffering and the fsync in close().
+    /// Used when fsync_file_writes is false for filesystem backends.
+    async fn copy_from_reader_direct(
+        &self,
+        root_path: &Path,
+        object: &str,
+        reader: Reader,
+    ) -> Result<(), Error> {
+        let object = object.trim_start_matches('/');
+        let file_path = root_path.join(object);
+
+        // Ensure parent directory exists
+        if let Some(parent) = file_path.parent() {
+            tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                Error::retry(format!("Failed to create directory {:?}: {}", parent, e))
+            })?;
+        }
+
+        // Open file directly with tokio::fs
+        let mut file = tokio::fs::File::create(&file_path)
+            .await
+            .map_err(|e| Error::retry(format!("Failed to create file {:?}: {}", file_path, e)))?;
+
+        // Stream data from reader to file
+        let mut stream = reader
+            .into_stream(..)
+            .await
+            .map_err(|e| Error::retry(format!("Failed to create stream for {}: {}", object, e)))?;
+
+        while let Some(result) = stream.next().await {
+            let buffer =
+                result.map_err(|e| Error::retry(format!("Failed to read from source: {}", e)))?;
+            for bytes in buffer {
+                file.write_all(&bytes).await.map_err(|e| {
+                    Error::retry(format!("Failed to write to {:?}: {}", file_path, e))
+                })?;
+            }
+        }
+
+        // Flush to OS buffers (but no fsync)
+        file.flush()
+            .await
+            .map_err(|e| Error::retry(format!("Failed to flush {:?}: {}", file_path, e)))?;
+
+        Ok(())
+    }
+
     // ===== Filesystem Backend =====
 
     /// Create a filesystem storage backend
     ///
-    /// Uses OpenDAL's atomic_write_dir feature to ensure writes are atomic
-    /// (temp file + rename) and go through the ConcurrentLimitLayer.
+    /// When atomic_file_writes is enabled, uses OpenDAL's atomic_write_dir feature
+    /// to ensure writes are atomic (temp file + rename).
     pub fn filesystem(root: impl Into<PathBuf>, config: &StorageConfig) -> Result<Self, Error> {
         use opendal::services::Fs;
 
         let root_path: PathBuf = root.into();
         let root_str = root_path.to_string_lossy().to_string();
 
-        // Use atomic_write_dir to ensure atomic writes via temp file + rename
-        // This also ensures writes go through OpenDAL layers (including ConcurrentLimitLayer)
-        let builder = Fs::default().root(&root_str).atomic_write_dir(&root_str);
+        // Conditionally use atomic_write_dir based on config
+        let builder = if config.atomic_file_writes {
+            Fs::default().root(&root_str).atomic_write_dir(&root_str)
+        } else {
+            Fs::default().root(&root_str)
+        };
         let operator = Self::apply_layers(builder, config)?;
 
         Ok(Self::from_operator(
@@ -305,6 +357,7 @@ impl OpendalStore {
             "",
             Some(root_path),
             true, // filesystem is writable
+            config.fsync_file_writes,
         ))
     }
 
@@ -362,7 +415,7 @@ impl OpendalStore {
         let operator = Self::apply_layers_with_http_client(builder, config, Some(http_client))?;
 
         Ok(Self::from_operator(
-            operator, "", None, false, // HTTP is read-only
+            operator, "", None, false, false, // HTTP is read-only
         ))
     }
 
@@ -398,7 +451,7 @@ impl OpendalStore {
 
         let operator = Self::apply_layers(builder, config)?;
 
-        Ok(Self::from_operator(operator, prefix, None, false))
+        Ok(Self::from_operator(operator, prefix, None, false, false))
     }
 
     /// Create a Google Cloud Storage backend
@@ -423,7 +476,7 @@ impl OpendalStore {
 
         let operator = Self::apply_layers(builder, config)?;
 
-        Ok(Self::from_operator(operator, prefix, None, false))
+        Ok(Self::from_operator(operator, prefix, None, false, false))
     }
 
     /// Create an Azure Blob Storage backend
@@ -452,7 +505,7 @@ impl OpendalStore {
 
         let operator = Self::apply_layers(builder, config)?;
 
-        Ok(Self::from_operator(operator, prefix, None, false))
+        Ok(Self::from_operator(operator, prefix, None, false, false))
     }
 
     /// Create a Backblaze B2 storage backend
@@ -475,7 +528,7 @@ impl OpendalStore {
 
         let operator = Self::apply_layers(builder, config)?;
 
-        Ok(Self::from_operator(operator, prefix, None, false))
+        Ok(Self::from_operator(operator, prefix, None, false, false))
     }
 
     /// Create an SFTP storage backend
@@ -504,7 +557,7 @@ impl OpendalStore {
 
         let operator = Self::apply_layers(builder, config)?;
 
-        Ok(Self::from_operator(operator, prefix, None, false))
+        Ok(Self::from_operator(operator, prefix, None, false, false))
     }
 
     /// Create an OpenStack Swift storage backend
@@ -526,7 +579,7 @@ impl OpendalStore {
 
         let operator = Self::apply_layers(builder, config)?;
 
-        Ok(Self::from_operator(operator, prefix, None, false))
+        Ok(Self::from_operator(operator, prefix, None, false, false))
     }
 }
 
@@ -616,6 +669,38 @@ impl Storage for OpendalStore {
         })?;
 
         Ok(writer)
+    }
+
+    async fn copy_from_reader(&self, object: &str, reader: Reader) -> Result<(), Error> {
+        // If we have a filesystem root and fsync is disabled, use direct tokio::fs writes
+        // to bypass OpenDAL's WriteGenerator buffering and avoid the fsync in close().
+        if let Some(root_path) = &self.root_path {
+            if !self.fsync_file_writes {
+                return self
+                    .copy_from_reader_direct(root_path, object, reader)
+                    .await;
+            }
+        }
+
+        // Otherwise use OpenDAL's writer (required for non-filesystem backends or when fsync is enabled)
+        let writer = self.open_writer(object).await?;
+        // Convert reader to a stream of Buffer chunks (zero-copy)
+        // The range `..` means read all data
+        let mut stream = reader
+            .into_stream(..)
+            .await
+            .map_err(|e| Error::retry(format!("Failed to create stream for {}: {}", object, e)))?;
+
+        let mut sink = writer.into_sink();
+        sink.send_all(&mut stream)
+            .await
+            .map_err(|e| Error::retry(format!("Failed to write data to {}: {}", object, e)))?;
+
+        // Always call close() when using OpenDAL writer - it's required to flush internal buffers
+        sink.close()
+            .await
+            .map_err(|e| Error::retry(format!("Failed to close writer for {}: {}", object, e)))?;
+        Ok(())
     }
 
     fn supports_writes(&self) -> bool {

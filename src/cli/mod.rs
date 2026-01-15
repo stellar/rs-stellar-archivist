@@ -90,6 +90,14 @@ struct Cli {
     /// Bandwidth limit in bytes per second (0 = unlimited)
     #[arg(long, global = true, default_value_t = 0)]
     bandwidth_limit: u32,
+
+    /// Use atomic file writes (write to temp file, then rename). More durable but slower.
+    #[arg(long, global = true, default_value_t = false)]
+    atomic_file_writes: bool,
+
+    /// Call fsync after each file write. Ensures durability but significantly slower.
+    #[arg(long, global = true, default_value_t = false)]
+    fsync_file_writes: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -149,6 +157,8 @@ where
             Duration::from_secs(cli.timeout_secs),
             Duration::from_secs(cli.io_timeout_secs),
             cli.bandwidth_limit,
+            cli.atomic_file_writes,
+            cli.fsync_file_writes,
         ),
     };
 

@@ -39,10 +39,10 @@ pub const NON_STANDARD_RETRYABLE_HTTP_ERRORS: &[(u16, &str)] = &[
     (524, "Cloudflare A Timeout Occurred"),
     (530, "Cloudflare Origin DNS Error"),
     // Informal/proxy-specific errors
-    (509, "Bandwidth Limit Exceeded"),  // Apache/cPanel
-    (529, "Site is Overloaded"),        // Qualys SSLLabs
-    (598, "Network Read Timeout"),      // Informal, nginx
-    (599, "Network Connect Timeout"),   // Informal, nginx
+    (509, "Bandwidth Limit Exceeded"), // Apache/cPanel
+    (529, "Site is Overloaded"),       // Qualys SSLLabs
+    (598, "Network Read Timeout"),     // Informal, nginx
+    (599, "Network Connect Timeout"),  // Informal, nginx
 ];
 
 /// Layer that marks non-standard HTTP errors as retryable.
