@@ -9,18 +9,12 @@
 
 use crate::retryable_error_layer::RetryableErrorLayer;
 use async_trait::async_trait;
-use opendal::{layers, ErrorKind, Operator};
-use std::io;
+use futures_util::TryStreamExt;
+use opendal::{layers, Buffer, ErrorKind, Operator, Reader, Writer};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::time::Duration;
 use thiserror::Error;
-use tokio::io::{AsyncWriteExt, BufWriter, ReadBuf};
-use tokio_util::compat::FuturesAsyncWriteCompatExt;
-
-pub const WRITE_BUF_BYTES: usize = 128 * 1024;
 
 /// Classification of errors for retry decisions
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,31 +58,74 @@ impl Error {
     }
 }
 
-pub type BoxedAsyncRead = Box<dyn tokio::io::AsyncRead + Send + Unpin + 'static>;
-
 pub type StorageRef = Arc<dyn Storage + Send + Sync>;
 
 /// Core unified storage trait for all backends
 #[async_trait]
 pub trait Storage: Send + Sync {
-    /// Open an async reader for the object
-    async fn open_reader(&self, object: &str) -> Result<BoxedAsyncRead, Error>;
+    /// Open an OpenDAL reader for the object with buffering enabled
+    async fn open_reader(&self, object: &str) -> Result<Reader, Error>;
 
     /// Check if object exists
     async fn exists(&self, object: &str) -> Result<bool, Error>;
 
-    /// Write data from a reader to an object.
-    /// This handles all buffering, flushing, and shutdown internally.
+    /// Open an OpenDAL writer for the object with buffering enabled.
     /// Only supported by writable backends (e.g., filesystem).
-    async fn write_from_reader(
-        &self,
-        _object: &str,
-        _reader: &mut BoxedAsyncRead,
-    ) -> io::Result<u64> {
-        Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "Write not supported by this backend",
-        ))
+    /// Caller is responsible for calling `writer.close()` after writing.
+    async fn open_writer(&self, _object: &str) -> Result<Writer, Error> {
+        Err(Error::fatal("Write not supported by this backend"))
+    }
+
+    /// Write an entire buffer to an object.
+    /// This is a convenience method that opens a writer, writes, and closes.
+    /// Only supported by writable backends (e.g., filesystem).
+    async fn write(&self, object: &str, data: Buffer) -> Result<(), Error> {
+        let mut writer = self.open_writer(object).await?;
+        writer
+            .write(data)
+            .await
+            .map_err(|e| Error::retry(format!("Failed to write to {}: {}", object, e)))?;
+        writer
+            .close()
+            .await
+            .map_err(|e| Error::retry(format!("Failed to close writer for {}: {}", object, e)))?;
+        Ok(())
+    }
+
+    /// Copy data from a source reader to a destination object.
+    /// Streams data in chunks without buffering the entire file in memory.
+    /// Only supported by writable backends (e.g., filesystem).
+    async fn copy_from_reader(&self, object: &str, reader: Reader) -> Result<u64, Error> {
+        let mut writer = self.open_writer(object).await?;
+
+        // Convert reader to a stream of Buffer chunks (zero-copy)
+        // The range `..` means read all data
+        let mut stream = reader
+            .into_stream(..)
+            .await
+            .map_err(|e| Error::retry(format!("Failed to create stream for {}: {}", object, e)))?;
+
+        let mut bytes_written: u64 = 0;
+
+        // Stream chunks directly to writer without buffering entire file
+        while let Some(buffer) = stream
+            .try_next()
+            .await
+            .map_err(|e| Error::retry(format!("Failed to read chunk for {}: {}", object, e)))?
+        {
+            bytes_written += buffer.len() as u64;
+            writer
+                .write(buffer)
+                .await
+                .map_err(|e| Error::retry(format!("Failed to write chunk to {}: {}", object, e)))?;
+        }
+
+        writer
+            .close()
+            .await
+            .map_err(|e| Error::retry(format!("Failed to close writer for {}: {}", object, e)))?;
+
+        Ok(bytes_written)
     }
 
     /// Check if this backend supports write operations
@@ -97,7 +134,7 @@ pub trait Storage: Send + Sync {
     }
 
     /// Get the base filesystem path if this is a filesystem backend
-    fn get_base_path(&self) -> Option<&Path> {
+    fn get_base_path(&self) -> Option<&std::path::Path> {
         None
     }
 }
@@ -258,10 +295,9 @@ impl OpendalStore {
         let root_path: PathBuf = root.into();
         let root_str = root_path.to_string_lossy().to_string();
 
-        // Direct writes (no atomic temp file + rename) for better performance
-        // Trade-off: interrupted writes may leave partial files, but mirror cleanup handles this
-        let builder = Fs::default()
-            .root(&root_str);
+        // Use atomic_write_dir to ensure atomic writes via temp file + rename
+        // This also ensures writes go through OpenDAL layers (including ConcurrentLimitLayer)
+        let builder = Fs::default().root(&root_str).atomic_write_dir(&root_str);
         let operator = Self::apply_layers(builder, config)?;
 
         Ok(Self::from_operator(
@@ -275,8 +311,7 @@ impl OpendalStore {
     // ===== HTTP Backend =====
 
     /// User-Agent string for HTTP requests
-    const USER_AGENT: &'static str =
-        concat!("stellar-archivist/", env!("CARGO_PKG_VERSION"));
+    const USER_AGENT: &'static str = concat!("stellar-archivist/", env!("CARGO_PKG_VERSION"));
 
     /// Create a custom HTTP client with proper User-Agent header
     fn create_http_client() -> Result<opendal::raw::HttpClient, Error> {
@@ -306,7 +341,12 @@ impl OpendalStore {
 
         // Build endpoint with optional port
         let endpoint = if let Some(port) = url.port() {
-            format!("{}://{}:{}", url.scheme(), url.host_str().unwrap_or(""), port)
+            format!(
+                "{}://{}:{}",
+                url.scheme(),
+                url.host_str().unwrap_or(""),
+                port
+            )
         } else {
             format!("{}://{}", url.scheme(), url.host_str().unwrap_or(""))
         };
@@ -322,10 +362,7 @@ impl OpendalStore {
         let operator = Self::apply_layers_with_http_client(builder, config, Some(http_client))?;
 
         Ok(Self::from_operator(
-            operator,
-            "",
-            None,
-            false, // HTTP is read-only
+            operator, "", None, false, // HTTP is read-only
         ))
     }
 
@@ -516,10 +553,15 @@ fn classify_opendal_error(err: &opendal::Error) -> ErrorClass {
 
 #[async_trait]
 impl Storage for OpendalStore {
-    async fn open_reader(&self, object: &str) -> Result<BoxedAsyncRead, Error> {
+    async fn open_reader(&self, object: &str) -> Result<Reader, Error> {
         let key = self.object_to_key(object);
         tracing::debug!("open_reader: object={}, key={}", object, key);
 
+        // Use plain reader() - the .chunk() option is for concurrent reading of
+        // large files with known size, but HTTP responses with chunked transfer
+        // encoding don't have a known content-length, so we use streaming instead.
+        // The reader can then be converted to a stream via into_stream(..) which
+        // provides zero-copy streaming of chunks as they arrive.
         let reader = self.operator.reader(&key).await.map_err(|e| {
             let class = classify_opendal_error(&e);
             Error {
@@ -528,12 +570,7 @@ impl Storage for OpendalStore {
             }
         })?;
 
-        // Use bytes stream - works with servers that use chunked encoding (no Content-Length)
-        let stream = reader.into_bytes_stream(..).await.map_err(|e| {
-            Error::retry(format!("Failed to create byte stream for {}: {}", key, e))
-        })?;
-
-        Ok(Box::new(BytesStreamReader::new(stream)))
+        Ok(reader)
     }
 
     async fn exists(&self, object: &str) -> Result<bool, Error> {
@@ -560,42 +597,25 @@ impl Storage for OpendalStore {
         }
     }
 
-    async fn write_from_reader(
-        &self,
-        object: &str,
-        reader: &mut BoxedAsyncRead,
-    ) -> io::Result<u64> {
+    async fn open_writer(&self, object: &str) -> Result<Writer, Error> {
         if !self.writable {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "Write not supported by this backend",
-            ));
+            return Err(Error::fatal("Write not supported by this backend"));
         }
 
         let key = self.object_to_key(object);
 
+        // Use writer_with to enable buffered/chunked writing for better performance
         // All backends write through OpenDAL, which applies ConcurrentLimitLayer
         // Filesystem backends use atomic_write_dir for atomic writes (temp file + rename)
-        let writer = self
-            .operator
-            .writer(&key)
-            .await
-            .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+        let writer = self.operator.writer_with(&key).await.map_err(|e| {
+            let class = classify_opendal_error(&e);
+            Error {
+                class,
+                message: format!("Failed to open writer for {}: {}", key, e),
+            }
+        })?;
 
-        // Convert OpenDAL writer to tokio::AsyncWrite
-        let futures_writer = writer.into_futures_async_write();
-        let tokio_writer = futures_writer.compat_write();
-        let mut buf_writer = BufWriter::with_capacity(WRITE_BUF_BYTES, tokio_writer);
-
-        // Copy data from reader to writer
-        let bytes_written = tokio::io::copy(reader, &mut buf_writer).await?;
-
-        // Flush and shutdown to ensure all data is written
-        // This is critical for OpenDAL - without shutdown, data may not be persisted
-        buf_writer.flush().await?;
-        buf_writer.shutdown().await?;
-
-        Ok(bytes_written)
+        Ok(writer)
     }
 
     fn supports_writes(&self) -> bool {
@@ -837,70 +857,5 @@ pub async fn from_url_with_config(
             "SFTP support not compiled in. Enable the 'opendal-sftp' feature to use SFTP URLs.",
         )),
         scheme => Err(Error::fatal(format!("Unsupported URL scheme: {}", scheme))),
-    }
-}
-
-// ============================================================================
-// BytesStreamReader - adapts OpenDAL's FuturesBytesStream to tokio::io::AsyncRead
-// ============================================================================
-
-use futures_util::Stream;
-use tokio::io::AsyncRead;
-use tokio_util::bytes::Buf;
-
-/// Adapts an OpenDAL bytes stream to tokio's AsyncRead trait.
-///
-/// This is needed because OpenDAL's `into_futures_async_read` requires knowing
-/// the content length upfront, but some HTTP servers (like Stellar's archive)
-/// use chunked transfer encoding without Content-Length headers.
-struct BytesStreamReader {
-    stream: opendal::FuturesBytesStream,
-    chunk: opendal::Buffer,
-}
-
-impl BytesStreamReader {
-    fn new(stream: opendal::FuturesBytesStream) -> Self {
-        Self {
-            stream,
-            chunk: opendal::Buffer::new(),
-        }
-    }
-}
-
-impl AsyncRead for BytesStreamReader {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        cx: &mut Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> Poll<io::Result<()>> {
-        // If we have leftover data from previous chunk, use it first
-        if self.chunk.has_remaining() {
-            let to_copy = self.chunk.remaining().min(buf.remaining());
-            self.chunk.copy_to_slice(buf.initialize_unfilled_to(to_copy));
-            buf.advance(to_copy);
-            return Poll::Ready(Ok(()));
-        }
-
-        // Poll for next chunk from stream
-        match Pin::new(&mut self.stream).poll_next(cx) {
-            Poll::Ready(Some(Ok(bytes))) => {
-                self.chunk = opendal::Buffer::from(bytes);
-                if self.chunk.is_empty() {
-                    // Empty chunk - wake and try again
-                    cx.waker().wake_by_ref();
-                    Poll::Pending
-                } else {
-                    let to_copy = self.chunk.remaining().min(buf.remaining());
-                    self.chunk.copy_to_slice(buf.initialize_unfilled_to(to_copy));
-                    buf.advance(to_copy);
-                    Poll::Ready(Ok(()))
-                }
-            }
-            Poll::Ready(Some(Err(e))) => {
-                Poll::Ready(Err(io::Error::new(io::ErrorKind::Other, e)))
-            }
-            Poll::Ready(None) => Poll::Ready(Ok(())), // EOF
-            Poll::Pending => Poll::Pending,
-        }
     }
 }

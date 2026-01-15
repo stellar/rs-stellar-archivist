@@ -45,13 +45,13 @@ pub mod test_helpers {
     /// Create a StorageConfig suitable for testing (generous timeouts, limited concurrency)
     pub fn test_storage_config() -> StorageConfig {
         StorageConfig::new(
-            3,                             // max_retries
-            Duration::from_millis(100),    // retry_min_delay
-            Duration::from_secs(30),       // retry_max_delay
-            64,                            // max_concurrent
-            Duration::from_secs(30),       // timeout
-            Duration::from_secs(300),      // io_timeout
-            0,                             // bandwidth_limit (unlimited)
+            3,                          // max_retries
+            Duration::from_millis(100), // retry_min_delay
+            Duration::from_secs(30),    // retry_max_delay
+            64,                         // max_concurrent
+            Duration::from_secs(30),    // timeout
+            Duration::from_secs(300),   // io_timeout
+            0,                          // bandwidth_limit (unlimited)
         )
     }
 
