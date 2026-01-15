@@ -1,3 +1,4 @@
+use bytes::Buf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -220,32 +221,43 @@ impl RetryState {
 /// Retries are handled by the storage layer (OpenDAL).
 pub async fn fetch_well_known_history_file(store: &StorageRef) -> Result<HistoryFileState, Error> {
     use crate::history_format::ROOT_WELL_KNOWN_PATH;
-    use tokio::io::AsyncReadExt;
+    use futures_util::TryStreamExt;
+    use opendal::Buffer;
 
     debug!("Fetching .well-known from path: {}", ROOT_WELL_KNOWN_PATH);
 
-    // Open and read the file (storage layer handles retries)
-    let mut reader = store.open_reader(ROOT_WELL_KNOWN_PATH).await.map_err(|e| {
+    // Open and read the file using streaming to handle chunked transfer encoding
+    let reader = store.open_reader(ROOT_WELL_KNOWN_PATH).await.map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("Failed to open {}: {}", ROOT_WELL_KNOWN_PATH, e),
         )
     })?;
 
-    let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer).await.map_err(|e| {
+    // Convert to stream and collect all chunks
+    let stream = reader.into_stream(..).await.map_err(|e| {
+        std::io::Error::new(
+            std::io::ErrorKind::Other,
+            format!("Stream error for {}: {}", ROOT_WELL_KNOWN_PATH, e),
+        )
+    })?;
+
+    let chunks: Vec<Buffer> = stream.try_collect().await.map_err(|e| {
         std::io::Error::new(
             std::io::ErrorKind::Other,
             format!("Reading {}: {}", ROOT_WELL_KNOWN_PATH, e),
         )
     })?;
 
+    // Merge chunks into a single buffer
+    let buffer: Buffer = chunks.into_iter().flatten().collect();
+
     // Parse the JSON
     tracing::debug!("Read {} bytes from {}", buffer.len(), ROOT_WELL_KNOWN_PATH);
     if buffer.len() < 200 {
-        tracing::debug!("Content: {:?}", String::from_utf8_lossy(&buffer));
+        tracing::debug!("Content: {:?}", String::from_utf8_lossy(&buffer.to_vec()));
     }
-    let state: HistoryFileState = serde_json::from_slice(&buffer).map_err(|e| {
+    let state: HistoryFileState = serde_json::from_reader(buffer.reader()).map_err(|e| {
         crate::history_format::Error::InvalidJson {
             path: ROOT_WELL_KNOWN_PATH.to_string(),
             error: e.to_string(),

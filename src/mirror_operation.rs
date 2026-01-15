@@ -2,8 +2,9 @@
 
 use crate::history_format;
 use crate::pipeline::{async_trait, Operation};
-use crate::storage::{BoxedAsyncRead, Error as StorageError, StorageConfig, StorageRef};
+use crate::storage::{Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
+use opendal::{Buffer, Reader};
 use thiserror::Error;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
@@ -348,14 +349,9 @@ impl Operation for MirrorOperation {
         }
     }
 
-    async fn process_object(
-        &self,
-        path: &str,
-        mut reader: BoxedAsyncRead,
-    ) -> Result<(), StorageError> {
-        // Stream from source to destination using write_from_reader
-        // which handles buffering, flushing, and shutdown internally
-        let write_result = self.dst_store.write_from_reader(path, &mut reader).await;
+    async fn process_object(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
+        // Stream from source reader to destination using streaming copy
+        let write_result = self.dst_store.copy_from_reader(path, reader).await;
 
         match write_result {
             Ok(_) => Ok(()),
@@ -376,6 +372,31 @@ impl Operation for MirrorOperation {
                 }
                 // Partial file cleaned up, safe to retry
                 Err(StorageError::retry(format!("Stream error: {}", e)))
+            }
+        }
+    }
+
+    async fn process_buffer(&self, path: &str, buffer: Buffer) -> Result<(), StorageError> {
+        // Write buffer to destination
+        let write_result = self.dst_store.write(path, buffer).await;
+
+        match write_result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Write error - clean up partial file before retrying
+                if let Some(base_path) = self.dst_store.get_base_path() {
+                    let file_path = base_path.join(path);
+                    if file_path.exists() {
+                        if let Err(rm_err) = tokio::fs::remove_file(&file_path).await {
+                            return Err(StorageError::fatal(format!(
+                                "Failed to remove partial file {}: {}",
+                                file_path.display(),
+                                rm_err
+                            )));
+                        }
+                    }
+                }
+                Err(StorageError::retry(format!("Write error: {}", e)))
             }
         }
     }

@@ -8,14 +8,15 @@ use crate::{
     history_format::{self, bucket_path, checkpoint_path, HistoryFileState},
     storage::StorageConfig,
 };
+use bytes::Buf;
 use futures_util::{
     future::{join, join3, join_all},
     stream, StreamExt,
 };
 use lru::LruCache;
+use opendal::{Buffer, Reader};
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tokio::io::AsyncReadExt;
 use tracing::{debug, error, info};
 
 /// Pipeline errors
@@ -59,11 +60,13 @@ pub trait Operation: Send + Sync + 'static {
     /// Returns:
     /// - Ok(()) on success
     /// - Err(e) on failure (storage layer handles retries internally)
-    async fn process_object(
-        &self,
-        path: &str,
-        reader: crate::storage::BoxedAsyncRead,
-    ) -> Result<(), crate::storage::Error>;
+    async fn process_object(&self, path: &str, reader: Reader)
+        -> Result<(), crate::storage::Error>;
+
+    /// Process an object from an in-memory buffer.
+    /// Used when the content is already loaded (e.g., history files that are parsed).
+    async fn process_buffer(&self, path: &str, buffer: Buffer)
+        -> Result<(), crate::storage::Error>;
 
     /// Record a successful file processing
     fn record_success(&self, path: &str);
@@ -118,17 +121,18 @@ pub struct Pipeline<Op: Operation> {
 impl<Op: Operation> Pipeline<Op> {
     /// Create a new pipeline
     pub async fn new(operation: Op, config: PipelineConfig) -> Result<Self, Error> {
-        let src_store = crate::storage::from_url_with_config(&config.source, &config.storage_config)
-            .await
-            .map_err(|e| {
-                std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!(
-                        "Failed to create storage backend for {}: {}",
-                        config.source, e
-                    ),
-                )
-            })?;
+        let src_store =
+            crate::storage::from_url_with_config(&config.source, &config.storage_config)
+                .await
+                .map_err(|e| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "Failed to create storage backend for {}: {}",
+                            config.source, e
+                        ),
+                    )
+                })?;
 
         let bucket_lru = Mutex::new(LruCache::new(
             std::num::NonZeroUsize::new(BUCKET_LRU_CACHE_SIZE).unwrap(),
@@ -204,22 +208,31 @@ impl<Op: Operation> Pipeline<Op> {
     /// Downloads and parses the history JSON, then processes buckets.
     /// Retries are handled by the storage layer (OpenDAL).
     async fn process_history(self: Arc<Self>, checkpoint: u32) {
+        use futures_util::TryStreamExt;
+
         let history_path = checkpoint_path("history", checkpoint);
 
         // Download the history file (storage layer handles retries)
-        let download_result: Result<Vec<u8>, crate::storage::Error> = async {
-            let mut reader = self.src_store.open_reader(&history_path).await?;
-            let mut buffer = Vec::new();
-            reader
-                .read_to_end(&mut buffer)
+        // Use into_stream to handle chunked transfer encoding properly
+        let download_result: Result<Buffer, crate::storage::Error> = async {
+            let reader = self.src_store.open_reader(&history_path).await?;
+            // Convert to stream and collect all chunks into a single buffer
+            let stream = reader
+                .into_stream(..)
+                .await
+                .map_err(|e| crate::storage::Error::fatal(format!("Stream error: {}", e)))?;
+            let chunks: Vec<Buffer> = stream
+                .try_collect()
                 .await
                 .map_err(|e| crate::storage::Error::fatal(format!("Read error: {}", e)))?;
+            // Merge chunks into a single buffer
+            let buffer: Buffer = chunks.into_iter().flatten().collect();
             Ok(buffer)
         }
         .await;
 
         let buffer = match download_result {
-            Ok(bytes) => bytes,
+            Ok(buf) => buf,
             Err(e) => {
                 error!("Failed to download history file {}: {}", history_path, e);
                 self.operation.record_failure(&history_path).await;
@@ -229,12 +242,11 @@ impl<Op: Operation> Pipeline<Op> {
 
         // Parse and validate
         let parse_result: Result<HistoryFileState, Error> = (|| {
-            let state: HistoryFileState = serde_json::from_slice(&buffer).map_err(|e| {
-                history_format::Error::InvalidJson {
+            let state: HistoryFileState = serde_json::from_reader(buffer.clone().reader())
+                .map_err(|e| history_format::Error::InvalidJson {
                     path: history_path.clone(),
                     error: e.to_string(),
-                }
-            })?;
+                })?;
             state.validate()?;
             Ok(state)
         })();
@@ -250,11 +262,9 @@ impl<Op: Operation> Pipeline<Op> {
                     // Write the history file (we already have content in buffer) and process buckets concurrently
                     let history_path_clone = history_path.clone();
                     let write_history = async {
-                        let reader = Box::new(std::io::Cursor::new(buffer))
-                            as crate::storage::BoxedAsyncRead;
                         match self
                             .operation
-                            .process_object(&history_path_clone, reader)
+                            .process_buffer(&history_path_clone, buffer)
                             .await
                         {
                             Ok(()) => self.operation.record_success(&history_path_clone),

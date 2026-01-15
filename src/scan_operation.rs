@@ -1,8 +1,9 @@
 use crate::history_format;
 /// Scan operation - validates that files exist
 use crate::pipeline::{async_trait, Operation};
-use crate::storage::{BoxedAsyncRead, Error as StorageError, StorageRef};
+use crate::storage::{Error as StorageError, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
+use opendal::{Buffer, Reader};
 use thiserror::Error;
 
 /// Scan operation errors
@@ -55,14 +56,17 @@ impl Operation for ScanOperation {
             .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))
     }
 
-    async fn process_object(
-        &self,
-        _path: &str,
-        _reader: BoxedAsyncRead,
-    ) -> Result<(), StorageError> {
+    async fn process_object(&self, _path: &str, _reader: Reader) -> Result<(), StorageError> {
         // For now, scan just checks existence.
         unreachable!(
             "ScanOperation uses existence_check_only(), process_object should not be called"
+        )
+    }
+
+    async fn process_buffer(&self, _path: &str, _buffer: Buffer) -> Result<(), StorageError> {
+        // For now, scan just checks existence.
+        unreachable!(
+            "ScanOperation uses existence_check_only(), process_buffer should not be called"
         )
     }
 

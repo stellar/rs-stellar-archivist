@@ -396,7 +396,10 @@ async fn test_mirror_cleans_up_partial_file_on_failure() {
     assert!(
         !bucket_request_counts.is_empty(),
         "Expected bucket files to be retried (count > 1), got counts: {:?}",
-        counts.iter().filter(|(p, _)| p.starts_with("bucket/")).collect::<Vec<_>>()
+        counts
+            .iter()
+            .filter(|(p, _)| p.starts_with("bucket/"))
+            .collect::<Vec<_>>()
     );
 
     // Mirror should succeed after retry

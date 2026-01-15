@@ -378,26 +378,36 @@ async fn smoke_live_stellar_archive_connection() {
 
     for url_str in urls {
         let config = StorageConfig::new(
-            3,                             // max_retries
-            Duration::from_millis(100),    // retry_min_delay
-            Duration::from_secs(30),       // retry_max_delay
-            64,                            // max_concurrent
-            Duration::from_secs(30),       // timeout
-            Duration::from_secs(300),      // io_timeout
-            0,                             // bandwidth_limit
+            3,                          // max_retries
+            Duration::from_millis(100), // retry_min_delay
+            Duration::from_secs(30),    // retry_max_delay
+            64,                         // max_concurrent
+            Duration::from_secs(30),    // timeout
+            Duration::from_secs(300),   // io_timeout
+            0,                          // bandwidth_limit
         );
         let store = OpendalStore::http(url_str, &config)
             .unwrap_or_else(|e| panic!("{url_str}: failed to create store: {e}"));
-        let mut reader = store
+        let reader = store
             .open_reader(".well-known/stellar-history.json")
             .await
             .unwrap_or_else(|e| panic!("{url_str}: connection failed: {e}"));
 
-        let mut buf = [0u8; 100];
-        let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
+        // Use into_stream to handle chunked transfer encoding properly
+        use futures_util::TryStreamExt;
+        use opendal::Buffer;
+
+        let stream = reader
+            .into_stream(..)
+            .await
+            .unwrap_or_else(|e| panic!("{url_str}: stream failed: {e}"));
+
+        let chunks: Vec<Buffer> = stream
+            .try_collect()
             .await
             .unwrap_or_else(|e| panic!("{url_str}: read failed: {e}"));
 
-        assert!(n > 0, "{url_str}: no data received");
+        let buffer: Buffer = chunks.into_iter().flatten().collect();
+        assert!(!buffer.is_empty(), "{url_str}: no data received");
     }
 }
