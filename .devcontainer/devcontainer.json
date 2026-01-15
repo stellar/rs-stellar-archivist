@@ -1,0 +1,21 @@
+// For format details, see https://aka.ms/devcontainer.json. For config options, see the
+// README at: https://github.com/devcontainers/templates/tree/main/src/rust
+{
+	"name": "Rust",
+	// Or use a Dockerfile or Docker Compose file. More info: https://containers.dev/guide/dockerfile
+	"image": "mcr.microsoft.com/devcontainers/rust:2-1-trixie",
+	"features": {
+		"ghcr.io/devcontainers/features/rust:1": {
+			"version": "latest",
+			"profile": "complete",
+			"targets": "aarch64-unknown-linux-gnu",
+			"components": "rust-analyzer,rust-src,rustfmt,clippy"
+		},
+		"ghcr.io/devcontainers-extra/features/apt-packages:1": {
+			"clean_ppas": true,
+			"preserve_apt_list": true,
+			"packages": ["awscli", "curl", "ripgrep", "wget"],
+			"ppas": "ppa:deadsnakes/ppa"
+		}
+	}
+}

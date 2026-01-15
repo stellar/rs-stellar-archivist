@@ -1,10 +1,12 @@
 pub mod mirror;
 pub mod scan;
 
+use crate::storage::StorageConfig;
 use crate::{self as stellar_archivist, mirror_operation, scan_operation};
 use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 use std::io;
+use std::time::Duration;
 use thiserror::Error;
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -45,7 +47,7 @@ struct Cli {
     #[command(subcommand)]
     command: Commands,
 
-    /// Number of files to process concurrently
+    /// Number of checkpoints to process concurrently
     #[arg(short, long, global = true, default_value_t = 32)]
     concurrency: usize,
 
@@ -61,13 +63,41 @@ struct Cli {
     #[arg(long, global = true)]
     trace: bool,
 
-    /// Maximum number of HTTP retry attempts
+    /// Maximum number of retry attempts for failed requests
     #[arg(long, global = true, default_value_t = 3)]
-    max_retries: u32,
+    max_retries: usize,
 
-    /// Initial backoff in milliseconds for HTTP retries
+    /// Minimum delay between retries in milliseconds
     #[arg(long, global = true, default_value_t = 100)]
-    initial_backoff_ms: u64,
+    retry_min_delay_ms: u64,
+
+    /// Maximum delay between retries in seconds
+    #[arg(long, global = true, default_value_t = 30)]
+    retry_max_delay_secs: u64,
+
+    /// Maximum concurrent I/O operations per storage backend (source and destination each have their own limit)
+    #[arg(long, global = true, default_value_t = 64)]
+    max_concurrent: usize,
+
+    /// Request timeout in seconds (for metadata operations)
+    #[arg(long, global = true, default_value_t = 30)]
+    timeout_secs: u64,
+
+    /// I/O timeout in seconds (for read/write operations on large files)
+    #[arg(long, global = true, default_value_t = 300)]
+    io_timeout_secs: u64,
+
+    /// Bandwidth limit in bytes per second (0 = unlimited)
+    #[arg(long, global = true, default_value_t = 0)]
+    bandwidth_limit: u32,
+
+    /// Use atomic file writes (write to temp file, then rename). More durable but slower.
+    #[arg(long, global = true, default_value_t = false)]
+    atomic_file_writes: bool,
+
+    /// Call fsync after each file write. Ensures durability but significantly slower.
+    #[arg(long, global = true, default_value_t = false)]
+    fsync_file_writes: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -83,8 +113,7 @@ pub enum Commands {
 pub struct GlobalArgs {
     pub concurrency: usize,
     pub skip_optional: bool,
-    pub max_retries: u32,
-    pub initial_backoff_ms: u64,
+    pub storage_config: StorageConfig,
 }
 
 /// Run the CLI with the given arguments
@@ -106,8 +135,8 @@ where
 
     // Build filter: set default level and suppress noisy HTTP/2 and networking crates
     let filter = EnvFilter::new(format!(
-        "{},h2=warn,hyper=warn,hyper_util=warn,reqwest=warn,tokio=warn,tower=warn,rustls=warn",
-        level
+        "{},opendal={},h2=warn,hyper=warn,hyper_util=warn,reqwest=warn,tokio=warn,tower=warn,rustls=warn",
+        level, level
     ));
 
     let subscriber = fmt::Subscriber::builder()
@@ -120,8 +149,17 @@ where
     let global_args = GlobalArgs {
         concurrency: cli.concurrency,
         skip_optional: cli.skip_optional,
-        max_retries: cli.max_retries,
-        initial_backoff_ms: cli.initial_backoff_ms,
+        storage_config: StorageConfig::new(
+            cli.max_retries,
+            Duration::from_millis(cli.retry_min_delay_ms),
+            Duration::from_secs(cli.retry_max_delay_secs),
+            cli.max_concurrent,
+            Duration::from_secs(cli.timeout_secs),
+            Duration::from_secs(cli.io_timeout_secs),
+            cli.bandwidth_limit,
+            cli.atomic_file_writes,
+            cli.fsync_file_writes,
+        ),
     };
 
     match cli.command {

@@ -2,8 +2,9 @@
 
 use crate::history_format;
 use crate::pipeline::{async_trait, Operation};
-use crate::storage::{BoxedAsyncRead, Error as StorageError, StorageRef, WRITE_BUF_BYTES};
+use crate::storage::{Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
+use opendal::{Buffer, Reader};
 use thiserror::Error;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
@@ -36,7 +37,7 @@ pub enum Error {
 }
 
 pub struct MirrorOperation {
-    dst_op: StorageRef,
+    dst_store: StorageRef,
     overwrite: bool,
     stats: ArchiveStats,
 
@@ -56,11 +57,12 @@ impl MirrorOperation {
         low: Option<u32>,
         high: Option<u32>,
         allow_mirror_gaps: bool,
+        storage_config: &StorageConfig,
     ) -> Result<Self, Error> {
-        let dst_op = crate::storage::StorageBackend::from_url(dst).await?;
+        let dst_store = crate::storage::from_url_with_config(dst, storage_config).await?;
 
         // Destination must support write operations
-        if !dst_op.supports_writes() {
+        if !dst_store.supports_writes() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
                 format!("Destination storage backend does not support write operations. Only filesystem destinations (file://) are currently supported: {}", dst),
@@ -68,7 +70,7 @@ impl MirrorOperation {
         }
 
         Ok(Self {
-            dst_op,
+            dst_store,
             overwrite,
             stats: ArchiveStats::new(),
             low,
@@ -84,7 +86,7 @@ impl MirrorOperation {
         self.initial_dest_checkpoint
             .get_or_init(|| async {
                 // Try to read the destination's .well-known file (local file, no retries required)
-                match fetch_well_known_history_file(&self.dst_op, 0, 0).await {
+                match fetch_well_known_history_file(&self.dst_store).await {
                     Ok(has) => Some(has.current_ledger),
                     Err(_) => None, // No existing archive
                 }
@@ -135,7 +137,7 @@ impl MirrorOperation {
             let history_path = history_format::checkpoint_path("history", highest_checkpoint);
             let well_known_path = ".well-known/stellar-history.json";
 
-            let dst_base = self.dst_op.get_base_path().ok_or_else(|| {
+            let dst_base = self.dst_store.get_base_path().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     "Destination storage backend does not have a filesystem path",
@@ -195,8 +197,6 @@ impl Operation for MirrorOperation {
     async fn get_checkpoint_bounds(
         &self,
         source: &StorageRef,
-        max_retries: u32,
-        initial_backoff_ms: u64,
     ) -> Result<(u32, u32), crate::pipeline::Error> {
         // Determine the effective low checkpoint based on destination .well-known/stellar-history.json and flags
         //
@@ -211,7 +211,7 @@ impl Operation for MirrorOperation {
         //    - If destination doesn't exist: start from genesis checkpoint
 
         // First, get the source's latest checkpoint to know what's available
-        let source_state = fetch_well_known_history_file(source, max_retries, initial_backoff_ms)
+        let source_state = fetch_well_known_history_file(source)
             .await
             .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
         let source_checkpoint =
@@ -326,7 +326,7 @@ impl Operation for MirrorOperation {
 
     async fn pre_check(&self, path: &str) -> Option<Result<(), StorageError>> {
         // Check destination before querying source, skip if file already exists
-        match self.dst_op.exists(path).await {
+        match self.dst_store.exists(path).await {
             Ok(true) => {
                 // If file exists and we're not overwriting, skip it
                 if !self.overwrite {
@@ -349,29 +349,15 @@ impl Operation for MirrorOperation {
         }
     }
 
-    async fn process_object(
-        &self,
-        path: &str,
-        mut reader: BoxedAsyncRead,
-    ) -> Result<(), StorageError> {
-        use tokio::io::{AsyncWriteExt, BufWriter};
-
-        // Stream from source to destination
-        let write_result = async {
-            let writer = self.dst_op.open_writer(path).await?;
-            let mut buf_writer = BufWriter::with_capacity(WRITE_BUF_BYTES, writer);
-
-            tokio::io::copy(&mut reader, &mut buf_writer).await?;
-            buf_writer.flush().await?;
-            Ok::<(), std::io::Error>(())
-        }
-        .await;
+    async fn process_object(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
+        // Stream from source reader to destination using streaming copy
+        let write_result = self.dst_store.copy_from_reader(path, reader).await;
 
         match write_result {
             Ok(_) => Ok(()),
             Err(e) => {
                 // Streaming/write error - clean up partial file before retrying
-                if let Some(base_path) = self.dst_op.get_base_path() {
+                if let Some(base_path) = self.dst_store.get_base_path() {
                     let file_path = base_path.join(path);
                     if file_path.exists() {
                         if let Err(rm_err) = tokio::fs::remove_file(&file_path).await {
@@ -390,16 +376,37 @@ impl Operation for MirrorOperation {
         }
     }
 
+    async fn process_buffer(&self, path: &str, buffer: Buffer) -> Result<(), StorageError> {
+        // Write buffer to destination
+        let write_result = self.dst_store.write(path, buffer).await;
+
+        match write_result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Write error - clean up partial file before retrying
+                if let Some(base_path) = self.dst_store.get_base_path() {
+                    let file_path = base_path.join(path);
+                    if file_path.exists() {
+                        if let Err(rm_err) = tokio::fs::remove_file(&file_path).await {
+                            return Err(StorageError::fatal(format!(
+                                "Failed to remove partial file {}: {}",
+                                file_path.display(),
+                                rm_err
+                            )));
+                        }
+                    }
+                }
+                Err(StorageError::retry(format!("Write error: {}", e)))
+            }
+        }
+    }
+
     fn record_success(&self, path: &str) {
         self.stats.record_success(path);
     }
 
     async fn record_failure(&self, path: &str) {
         self.stats.record_failure(path).await;
-    }
-
-    fn record_retry(&self) {
-        self.stats.record_retry();
     }
 
     fn record_skipped(&self, path: &str) {

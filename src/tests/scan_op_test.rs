@@ -1,8 +1,8 @@
 //! Tests for scan command operations
 
 use super::utils::{copy_test_archive, get_files_by_pattern, start_http_server, test_archive_path};
-use crate::storage::{HttpStore, Storage};
-use crate::test_helpers::{run_scan, ScanConfig};
+use crate::storage::{OpendalStore, Storage, StorageConfig};
+use crate::test_helpers::{run_scan, test_storage_config, ScanConfig};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rstest::rstest;
@@ -99,6 +99,7 @@ async fn remove_bucket_and_verify_scan_fails(
                 skip_optional: false,
                 low: None,
                 high: None,
+                storage_config: test_storage_config(),
             };
 
             run_scan(scan_config).await.expect_err(error_msg);
@@ -266,6 +267,7 @@ async fn test_scan_detects_corrupt_files(
         skip_optional: false,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     };
 
     run_scan(scan_config)
@@ -292,6 +294,7 @@ async fn test_scan_missing_scp_with_optional_flag() {
         skip_optional: false, // SCP files are required
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     };
 
     run_scan(scan_required)
@@ -305,6 +308,7 @@ async fn test_scan_missing_scp_with_optional_flag() {
         skip_optional: true, // SCP files are optional
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     };
 
     run_scan(scan_optional)
@@ -324,6 +328,7 @@ async fn test_scan_complete_archive() {
         skip_optional: false,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     };
 
     // Scan should succeed on complete archive
@@ -348,6 +353,7 @@ async fn test_scan_http_archive() {
         skip_optional: false,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     };
 
     run_scan(scan_config).await.unwrap_or_else(|e| {
@@ -363,23 +369,47 @@ async fn test_scan_http_archive() {
 #[tokio::test]
 #[ignore]
 async fn smoke_live_stellar_archive_connection() {
+    use std::time::Duration;
+
     let urls = [
         "http://history.stellar.org/prd/core-live/core_live_001",
         "https://history.stellar.org/prd/core-live/core_live_001/",
     ];
 
     for url_str in urls {
-        let store = HttpStore::new(url_str.parse().unwrap());
-        let mut reader = store
+        let config = StorageConfig::new(
+            3,                          // max_retries
+            Duration::from_millis(100), // retry_min_delay
+            Duration::from_secs(30),    // retry_max_delay
+            64,                         // max_concurrent
+            Duration::from_secs(30),    // timeout
+            Duration::from_secs(300),   // io_timeout
+            0,                          // bandwidth_limit
+            false,                      // atomic_file_writes
+            false,                      // fsync_file_writes
+        );
+        let store = OpendalStore::http(url_str, &config)
+            .unwrap_or_else(|e| panic!("{url_str}: failed to create store: {e}"));
+        let reader = store
             .open_reader(".well-known/stellar-history.json")
             .await
             .unwrap_or_else(|e| panic!("{url_str}: connection failed: {e}"));
 
-        let mut buf = [0u8; 100];
-        let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
+        // Use into_stream to handle chunked transfer encoding properly
+        use futures_util::TryStreamExt;
+        use opendal::Buffer;
+
+        let stream = reader
+            .into_stream(..)
+            .await
+            .unwrap_or_else(|e| panic!("{url_str}: stream failed: {e}"));
+
+        let chunks: Vec<Buffer> = stream
+            .try_collect()
             .await
             .unwrap_or_else(|e| panic!("{url_str}: read failed: {e}"));
 
-        assert!(n > 0, "{url_str}: no data received");
+        let buffer: Buffer = chunks.into_iter().flatten().collect();
+        assert!(!buffer.is_empty(), "{url_str}: no data received");
     }
 }

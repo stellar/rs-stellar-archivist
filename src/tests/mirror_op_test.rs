@@ -10,12 +10,12 @@ use super::utils::{
 };
 use crate::{
     history_format,
-    test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig},
+    test_helpers::{run_mirror, run_scan, test_storage_config, MirrorConfig, ScanConfig},
 };
 use axum::{routing::get_service, Router};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tower_http::services::ServeDir;
@@ -208,6 +208,7 @@ async fn test_mirror_full_archive() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
+        storage_config: test_storage_config(),
     };
 
     run_mirror(mirror_config).await.expect("Full mirror failed");
@@ -219,6 +220,7 @@ async fn test_mirror_full_archive() {
         skip_optional: false,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     })
     .await
     .expect("Scan of full archive failed");
@@ -254,6 +256,7 @@ async fn test_mirror_bounded() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
+        storage_config: test_storage_config(),
     };
 
     run_mirror(mirror_config)
@@ -267,6 +270,7 @@ async fn test_mirror_bounded() {
         skip_optional: false,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     })
     .await
     .expect("Scan of bounded archive failed");
@@ -301,6 +305,7 @@ async fn test_mirror_skip_optional() {
         low: None,
         overwrite: false,
         allow_mirror_gaps: false,
+        storage_config: test_storage_config(),
     };
 
     run_mirror(mirror_config)
@@ -317,6 +322,7 @@ async fn test_mirror_skip_optional() {
         skip_optional: true,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     })
     .await
     .expect("Scan of archive without optional files failed");
@@ -749,6 +755,7 @@ async fn test_mirror_http_to_filesystem() {
         skip_optional: false,
         overwrite: false,
         allow_mirror_gaps: false,
+        storage_config: test_storage_config(),
     };
 
     run_mirror(mirror_config).await.unwrap_or_else(|e| {
@@ -763,6 +770,7 @@ async fn test_mirror_http_to_filesystem() {
         skip_optional: false,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     };
 
     run_scan(scan_config).await.unwrap_or_else(|e| {
@@ -801,19 +809,24 @@ async fn test_mirror_race_condition_with_advancing_archive() {
     std::fs::write(&well_known_path, &initial_well_known)
         .expect("Failed to write initial .well-known");
 
-    // Start HTTP server with special handler that advances .well-known after initial reads
-    let should_advance = Arc::new(AtomicBool::new(false));
+    // Start HTTP server with special handler that advances .well-known after initial reads.
+    // We use a counter instead of a boolean because OpenDAL may make multiple requests
+    // (e.g., stat then read) for a single logical "read". We want to return the initial
+    // .well-known for all requests during the first read operation, then advance.
+    // Using threshold of 2 handles: stat + read = 2 requests for initial fetch.
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let advance_threshold = 2; // After this many requests, start returning advanced state
     let app = Router::new()
         .route(
             "/.well-known/stellar-history.json",
             axum::routing::get(move || {
-                let should_advance = should_advance.clone();
-                let well_known_content = if should_advance.load(Ordering::Relaxed) {
-                    // Return advanced .well-known
+                let request_count = request_count.clone();
+                let count = request_count.fetch_add(1, Ordering::Relaxed);
+                let well_known_content = if count >= advance_threshold {
+                    // Return advanced .well-known after threshold
                     advanced_well_known.to_string()
                 } else {
-                    // First few reads get initial .well-known, then we advance
-                    should_advance.store(true, Ordering::Relaxed);
+                    // Initial reads get initial .well-known
                     initial_well_known.to_string()
                 };
                 async move { well_known_content }
@@ -836,6 +849,7 @@ async fn test_mirror_race_condition_with_advancing_archive() {
         skip_optional: true,
         overwrite: false,
         allow_mirror_gaps: false,
+        storage_config: test_storage_config(),
     };
 
     run_mirror(mirror_config).await.unwrap_or_else(|e| {
