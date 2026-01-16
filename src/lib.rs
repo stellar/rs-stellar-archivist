@@ -53,7 +53,6 @@ pub mod test_helpers {
             Duration::from_secs(300),   // io_timeout
             0,                          // bandwidth_limit (unlimited)
             false,                      // atomic_file_writes
-            false,                      // fsync_file_writes
         )
     }
 
