@@ -11,10 +11,7 @@ use futures_util::{
     stream, StreamExt,
 };
 use lru::LruCache;
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
-};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tokio::{io::AsyncReadExt, sync::Semaphore};
 use tracing::{debug, error, info};
@@ -132,18 +129,17 @@ impl Default for PipelineConfig {
 pub struct Pipeline<Op: Operation> {
     operation: Op,
     config: PipelineConfig,
-    source_op: crate::storage::StorageRef,
+    src_store: crate::storage::StorageRef,
     bucket_lru: Mutex<LruCache<String, ()>>,
     io_permits: Semaphore,
-    progress_tracker: AtomicUsize,
 }
 
 use crate::utils::RetryState;
 
 impl<Op: Operation> Pipeline<Op> {
     /// Handle a storage error with retry logic.
-    /// Returns `true` if we should give up, `false` if we should retry.
-    async fn handle_error(
+    /// Returns `false` if we should give up, `true` if we should retry.
+    async fn maybe_backoff_for_retry(
         &self,
         path: &str,
         error: &crate::storage::Error,
@@ -159,26 +155,26 @@ impl<Op: Operation> Pipeline<Op> {
                         action, path, retry.attempt, error
                     );
                     self.operation.record_failure(path).await;
-                    return true; // give up
+                    return false; // give up
                 }
                 debug!(
                     "Retrying {} (attempt {}/{}): {}, backing off {}ms",
                     path, retry.attempt, retry.max_retries, error, retry.backoff_ms
                 );
                 retry.backoff().await;
-                false // retry
+                true // retry
             }
             ErrorClass::Fatal | ErrorClass::NotFound => {
                 error!("Failed to {} {}: {}", action, path, error);
                 self.operation.record_failure(path).await;
-                true // give up
+                false // give up
             }
         }
     }
 
     /// Create a new pipeline
     pub async fn new(operation: Op, config: PipelineConfig) -> Result<Self, Error> {
-        let source_op = crate::storage::StorageBackend::from_url(&config.source)
+        let src_store = crate::storage::from_url(&config.source)
             .await
             .map_err(|e| {
                 std::io::Error::new(
@@ -198,10 +194,9 @@ impl<Op: Operation> Pipeline<Op> {
         Ok(Self {
             operation,
             config,
-            source_op,
+            src_store,
             bucket_lru,
             io_permits,
-            progress_tracker: AtomicUsize::new(0),
         })
     }
 
@@ -210,7 +205,7 @@ impl<Op: Operation> Pipeline<Op> {
         let (lower_bound, upper_bound) = self
             .operation
             .get_checkpoint_bounds(
-                &self.source_op,
+                &self.src_store,
                 self.config.max_retries,
                 self.config.initial_backoff_ms,
             )
@@ -234,11 +229,11 @@ impl<Op: Operation> Pipeline<Op> {
 
         // Process checkpoints concurrently, limiting to config.concurrency at a time
         stream::iter(checkpoints)
-            .for_each_concurrent(self.config.concurrency, |fut| async {
+            .enumerate()
+            .for_each_concurrent(self.config.concurrency, |(i, fut)| async move {
                 fut.await;
-                let n = self.progress_tracker.fetch_add(1, Ordering::Relaxed) + 1;
-                if n % PROGRESS_REPORTING_FREQUENCY == 0 || n == total_count {
-                    info!("Progress: {}/{} checkpoints processed", n, total_count);
+                if i % PROGRESS_REPORTING_FREQUENCY == 0 || i == total_count - 1 {
+                    info!("Progress: {}/{} checkpoints processed", i + 1, total_count);
                 }
             })
             .await;
@@ -274,7 +269,7 @@ impl<Op: Operation> Pipeline<Op> {
         // Download the history file
         let buffer = loop {
             let download_result: Result<Vec<u8>, crate::storage::Error> = async {
-                let mut reader = self.source_op.open_reader(&history_path).await?;
+                let mut reader = self.src_store.open_reader(&history_path).await?;
                 let mut buffer = Vec::new();
                 reader
                     .read_to_end(&mut buffer)
@@ -287,8 +282,8 @@ impl<Op: Operation> Pipeline<Op> {
             match download_result {
                 Ok(bytes) => break bytes,
                 Err(e) => {
-                    if self
-                        .handle_error(&history_path, &e, &mut retry, "download")
+                    if !self
+                        .maybe_backoff_for_retry(&history_path, &e, &mut retry, "download")
                         .await
                     {
                         return;
@@ -403,7 +398,7 @@ impl<Op: Operation> Pipeline<Op> {
 
             // For existence-only checks, we don't need to open a reader or call process_object
             if self.operation.existence_check_only() {
-                match self.source_op.exists(&path).await {
+                match self.src_store.exists(&path).await {
                     Ok(true) => {
                         debug!("Exists: {}", path);
                         self.operation.record_success(&path);
@@ -415,17 +410,23 @@ impl<Op: Operation> Pipeline<Op> {
                         return;
                     }
                     Err(e) => {
-                        if self.handle_error(&path, &e, &mut retry, "check").await {
+                        if !self
+                            .maybe_backoff_for_retry(&path, &e, &mut retry, "check")
+                            .await
+                        {
                             return;
                         }
                     }
                 }
             } else {
                 // Normal path - open a reader for actual content streaming
-                let reader = match self.source_op.open_reader(&path).await {
+                let reader = match self.src_store.open_reader(&path).await {
                     Ok(reader) => reader,
                     Err(e) => {
-                        if self.handle_error(&path, &e, &mut retry, "open").await {
+                        if !self
+                            .maybe_backoff_for_retry(&path, &e, &mut retry, "open")
+                            .await
+                        {
                             return;
                         }
                         continue;
@@ -440,7 +441,10 @@ impl<Op: Operation> Pipeline<Op> {
                         return;
                     }
                     Err(e) => {
-                        if self.handle_error(&path, &e, &mut retry, "process").await {
+                        if !self
+                            .maybe_backoff_for_retry(&path, &e, &mut retry, "process")
+                            .await
+                        {
                             return;
                         }
                     }
