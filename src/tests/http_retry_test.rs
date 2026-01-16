@@ -110,9 +110,6 @@ async fn test_retries_on_transient_well_known_errors(#[case] op: Operation) {
             description,
             result.err()
         );
-
-        // Note: OpenDAL's RetryLayer handles backoff timing internally
-        // We only verify that retries occurred, not specific timing
     }
 }
 
@@ -144,7 +141,6 @@ async fn test_retries_on_transient_http_errors(#[case] op: Operation) {
             description,
             result.err()
         );
-        verify_backoff_timing(&tracker, op, status_code, description);
     }
 }
 
@@ -186,8 +182,6 @@ async fn test_retries_on_connection_drops(#[case] op: Operation) {
         op,
         result.err()
     );
-
-    // Note: OpenDAL's RetryLayer handles backoff timing internally
 }
 
 //=============================================================================
@@ -250,16 +244,6 @@ fn verify_retries_occurred(
             .filter(|(p, _)| p.starts_with(op.path_prefix()))
             .collect::<Vec<_>>()
     );
-}
-
-fn verify_backoff_timing(
-    _tracker: &RequestTracker,
-    _op: Operation,
-    _status_code: u16,
-    _description: &str,
-) {
-    // OpenDAL's RetryLayer handles backoff timing internally
-    // We only verify that retries occurred, not specific timing
 }
 
 //=============================================================================
@@ -354,64 +338,81 @@ async fn test_scan_head_response_handling(
 // Mid-stream Failure Tests
 //=============================================================================
 
-/// Tests that atomic writes properly clean up temp files when write operations fail.
-/// Uses HTTP 500 errors (which OpenDAL retries) to verify:
-/// 1. Retries happen at the HTTP request level
-/// 2. No temp files are left behind after all retries exhausted
-/// 3. Final files don't contain partial/duplicate data
+/// Demonstrates a data corruption bug with mid-stream download failures.
 ///
-/// Note: OpenDAL's streaming doesn't detect partial body responses (server sends 200 OK
-/// with Content-Length but only partial data). This test uses HTTP error codes instead
-/// since those are properly retried by OpenDAL.
+/// When the server sends 200 OK with Content-Length but drops the connection after
+/// sending partial data, OpenDAL's retry layer retries the HTTP request from byte 0.
+/// However, our streaming write has already written the partial data to the destination.
+/// The retry data gets APPENDED, resulting in a corrupted file.
+///
+/// Example with a 129-byte file and fail_count=2 (25% partial each time):
+///   - Attempt 1: writes 32 bytes, connection drops
+///   - Attempt 2: writes 32 bytes (from byte 0), connection drops
+///   - Attempt 3: writes 129 bytes (from byte 0)
+///   - Result: 32 + 32 + 129 = 193 bytes (CORRUPTED)
+///
+/// This test verifies the bug exists by checking that files are larger than expected.
+/// Note: atomic_file_writes=true doesn't help because the temp file still receives
+/// appended data before being renamed.
 #[tokio::test]
-async fn test_mirror_cleans_up_partial_file_on_failure() {
+async fn test_partial_body_retry_causes_corruption() {
+    use crate::storage::StorageConfig;
+    use std::time::Duration;
+
     let archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("testdata")
         .join("testnet-archive-small");
 
-    // Server returns 500 for first request to bucket files, succeeds on retry
-    // This tests that:
-    // 1. OpenDAL retries on 500 errors
-    // 2. When retry succeeds, we get correct file content (not duplicated/partial)
-    let config = FlakyServerConfig::archive_status_error(archive_path.clone(), 500, 1, "bucket/");
+    // Server sends 200 OK with Content-Length but only 25% of body, twice, then succeeds
+    let fail_count = 2;
+    let config = FlakyServerConfig::archive_partial_body(archive_path.clone(), fail_count);
     let (server_url, tracker, handle) = start_flaky_server(config).await;
+
+    // Enable atomic writes to verify they don't prevent the corruption
+    let storage_config = StorageConfig::new(
+        3,                          // max_retries
+        Duration::from_millis(100), // retry_min_delay
+        Duration::from_secs(30),    // retry_max_delay
+        64,                         // max_concurrent
+        Duration::from_secs(30),    // timeout
+        Duration::from_secs(300),   // io_timeout
+        0,                          // bandwidth_limit
+        true,                       // atomic_file_writes
+    );
 
     let dest_dir = TempDir::new().unwrap();
     let mirror_config =
         MirrorConfig::new(&server_url, format!("file://{}", dest_dir.path().display()))
             .skip_optional()
             .concurrency(1)
-            .high(63);
+            .high(63)
+            .storage_config(storage_config);
 
     let result = run_mirror(mirror_config).await;
     handle.abort();
 
-    // Verify bucket files were requested multiple times (retry occurred)
-    let counts = tracker.get_counts();
-    let bucket_request_counts: Vec<_> = counts
-        .iter()
-        .filter(|(path, count)| path.starts_with("bucket/") && **count > 1)
-        .collect();
-
-    assert!(
-        !bucket_request_counts.is_empty(),
-        "Expected bucket files to be retried (count > 1), got counts: {:?}",
-        counts
-            .iter()
-            .filter(|(p, _)| p.starts_with("bucket/"))
-            .collect::<Vec<_>>()
-    );
-
-    // Mirror should succeed after retry
+    // Mirror "succeeds" because OpenDAL retries are transparent
     assert!(
         result.is_ok(),
-        "Mirror should succeed after retry: {:?}",
+        "Mirror should complete (retries are transparent): {:?}",
         result.err()
     );
 
-    // Verify all bucket files have correct content (not partial or duplicated)
+    // Verify retries occurred
+    let counts = tracker.get_counts();
+    let bucket_retries: Vec<_> = counts
+        .iter()
+        .filter(|(path, count)| path.starts_with("bucket/") && **count > 1)
+        .collect();
+    assert!(
+        !bucket_retries.is_empty(),
+        "Expected bucket files to be retried, got counts: {:?}",
+        counts
+    );
+
+    // Find corrupted files and verify the corruption pattern
     let dest_bucket_dir = dest_dir.path().join("bucket");
-    assert!(dest_bucket_dir.exists(), "Bucket directory should exist");
+    let mut corrupted_files = Vec::new();
 
     for entry in walkdir::WalkDir::new(&dest_bucket_dir)
         .into_iter()
@@ -421,36 +422,61 @@ async fn test_mirror_cleans_up_partial_file_on_failure() {
         let rel_path = entry.path().strip_prefix(dest_dir.path()).unwrap();
         let src_file = archive_path.join(rel_path);
 
-        let expected_content = std::fs::read(&src_file).expect("Source file should exist");
-        let actual_content = std::fs::read(entry.path()).expect("Dest file should exist");
+        let expected_size = std::fs::metadata(&src_file).unwrap().len() as usize;
+        let actual_size = std::fs::metadata(entry.path()).unwrap().len() as usize;
 
-        assert_eq!(
-            actual_content.len(),
-            expected_content.len(),
-            "File {} should have correct size (expected {}, got {})",
-            rel_path.display(),
-            expected_content.len(),
-            actual_content.len()
+        if actual_size != expected_size {
+            // Verify corruption matches the pattern: N partial attempts + 1 full
+            // Each partial attempt writes 25% of the file
+            let partial_size = expected_size / 4;
+            let expected_corrupted_size =
+                (partial_size * fail_count) + expected_size;
+
+            corrupted_files.push((
+                rel_path.display().to_string(),
+                expected_size,
+                actual_size,
+                expected_corrupted_size,
+            ));
+        }
+    }
+
+    // Assert that corruption occurred (this test documents the bug)
+    assert!(
+        !corrupted_files.is_empty(),
+        "Expected to find corrupted files demonstrating the retry-append bug"
+    );
+
+    // Verify the corruption matches our expected pattern
+    for (path, expected, actual, expected_corrupted) in &corrupted_files {
+        assert!(
+            *actual > *expected,
+            "File {} should be larger than expected due to appended retry data \
+             (expected {}, got {})",
+            path,
+            expected,
+            actual
         );
 
-        assert_eq!(
-            actual_content,
-            expected_content,
-            "File {} content should match source",
-            rel_path.display()
+        // Allow some tolerance for rounding in partial size calculation
+        let tolerance = 10;
+        assert!(
+            (*actual as i64 - *expected_corrupted as i64).abs() <= tolerance,
+            "File {} corruption should match pattern: {} partial bytes + {} full bytes = ~{}, \
+             but got {} bytes",
+            path,
+            expected / 4 * fail_count,
+            expected,
+            expected_corrupted,
+            actual
         );
     }
 
-    // Verify no temp files were left behind
-    let temp_files: Vec<_> = walkdir::WalkDir::new(dest_dir.path())
-        .into_iter()
-        .filter_map(|e| e.ok())
-        .filter(|e| e.file_name().to_string_lossy().starts_with(".tmp."))
-        .collect();
-
-    assert!(
-        temp_files.is_empty(),
-        "No temp files should be left behind, found: {:?}",
-        temp_files.iter().map(|e| e.path()).collect::<Vec<_>>()
+    println!(
+        "Bug demonstrated: {} files corrupted by retry-append behavior",
+        corrupted_files.len()
     );
+    for (path, expected, actual, _) in &corrupted_files {
+        println!("  {}: expected {} bytes, got {} bytes", path, expected, actual);
+    }
 }

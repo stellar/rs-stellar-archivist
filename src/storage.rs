@@ -147,10 +147,9 @@ pub struct StorageConfig {
     pub max_concurrent: usize,
     /// Bandwidth limit in bytes per second (0 = unlimited)
     pub bandwidth_limit: u32,
-    /// Use atomic file writes (write to temp file, then rename)
+    /// Use atomic file writes with fsync (write to temp file, fsync, then rename).
+    /// When false, bypasses OpenDAL and writes directly via tokio::fs for better performance.
     pub atomic_file_writes: bool,
-    /// Call fsync after each file write
-    pub fsync_file_writes: bool,
 }
 
 impl StorageConfig {
@@ -164,7 +163,6 @@ impl StorageConfig {
         io_timeout: Duration,
         bandwidth_limit: u32,
         atomic_file_writes: bool,
-        fsync_file_writes: bool,
     ) -> Self {
         Self {
             max_retries,
@@ -175,7 +173,6 @@ impl StorageConfig {
             io_timeout,
             bandwidth_limit,
             atomic_file_writes,
-            fsync_file_writes,
         }
     }
 }
@@ -190,8 +187,8 @@ pub struct OpendalStore {
     root_path: Option<PathBuf>,
     /// Whether this backend supports writes
     writable: bool,
-    /// Whether to call fsync after each file write.
-    fsync_file_writes: bool,
+    /// Whether to use atomic file writes (OpenDAL with fsync) vs direct writes (tokio::fs bypass)
+    atomic_file_writes: bool,
 }
 
 impl OpendalStore {
@@ -201,14 +198,14 @@ impl OpendalStore {
         prefix: impl Into<String>,
         root_path: Option<PathBuf>,
         writable: bool,
-        fsync_file_writes: bool,
+        atomic_file_writes: bool,
     ) -> Self {
         Self {
             operator,
             prefix: prefix.into(),
             root_path,
             writable,
-            fsync_file_writes,
+            atomic_file_writes,
         }
     }
 
@@ -357,7 +354,7 @@ impl OpendalStore {
             "",
             Some(root_path),
             true, // filesystem is writable
-            config.fsync_file_writes,
+            config.atomic_file_writes,
         ))
     }
 
@@ -672,17 +669,17 @@ impl Storage for OpendalStore {
     }
 
     async fn copy_from_reader(&self, object: &str, reader: Reader) -> Result<(), Error> {
-        // If we have a filesystem root and fsync is disabled, use direct tokio::fs writes
+        // If we have a filesystem root and atomic writes are disabled, use direct tokio::fs writes
         // to bypass OpenDAL's WriteGenerator buffering and avoid the fsync in close().
         if let Some(root_path) = &self.root_path {
-            if !self.fsync_file_writes {
+            if !self.atomic_file_writes {
                 return self
                     .copy_from_reader_direct(root_path, object, reader)
                     .await;
             }
         }
 
-        // Otherwise use OpenDAL's writer (required for non-filesystem backends or when fsync is enabled)
+        // Otherwise use OpenDAL's writer (required for non-filesystem backends or when atomic writes are enabled)
         let writer = self.open_writer(object).await?;
         // Convert reader to a stream of Buffer chunks (zero-copy)
         // The range `..` means read all data
