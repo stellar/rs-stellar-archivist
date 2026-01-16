@@ -3,4 +3,3 @@
 .*
 !.gitignore
 !.github
-!.devcontainer

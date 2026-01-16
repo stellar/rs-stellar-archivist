@@ -335,34 +335,83 @@ impl Storage for HttpStore {
     }
 }
 
-/// Create a backend from a URL string
-/// Supports file://, http://, and https:// schemes
-pub async fn from_url(url_str: &str) -> Result<StorageRef, Error> {
-    use std::sync::Arc;
-    use url::Url;
+// ===== Backend Enum =====
 
-    let url = Url::parse(url_str)
-        .map_err(|e| Error::fatal(format!("Failed to parse URL '{}': {}", url_str, e)))?;
+pub enum StorageBackend {
+    File(FileStore),
+    Http(HttpStore),
+}
 
-    match url.scheme() {
-        "file" => {
-            let path = url.path().to_string();
+impl StorageBackend {
+    /// Create a backend from a URL string
+    /// Supports file://, http://, and https:// schemes
+    pub async fn from_url(
+        url_str: &str,
+    ) -> Result<std::sync::Arc<dyn Storage + Send + Sync>, Error> {
+        use std::sync::Arc;
+        use url::Url;
 
-            tracing::debug!(
-                "Creating FileStore with path: {} (from URL: {})",
-                path,
-                url_str
-            );
+        let url = Url::parse(url_str)
+            .map_err(|e| Error::fatal(format!("Failed to parse URL '{}': {}", url_str, e)))?;
 
-            let file_store = FileStore::new(path);
-            let store: StorageRef = Arc::new(file_store);
-            Ok(store)
+        match url.scheme() {
+            "file" => {
+                let path = url.path().to_string();
+
+                tracing::debug!(
+                    "Creating FileStore with path: {} (from URL: {})",
+                    path,
+                    url_str
+                );
+
+                let file_store = FileStore::new(path);
+                let backend = StorageBackend::File(file_store);
+                Ok(Arc::new(backend))
+            }
+            "http" | "https" => {
+                let http_store = HttpStore::new(url.clone());
+                let backend = StorageBackend::Http(http_store);
+                Ok(Arc::new(backend))
+            }
+            scheme => Err(Error::fatal(format!("Unsupported URL scheme: {}", scheme))),
         }
-        "http" | "https" => {
-            let http_store = HttpStore::new(url.clone());
-            let store: StorageRef = Arc::new(http_store);
-            Ok(store)
+    }
+}
+
+#[async_trait]
+impl Storage for StorageBackend {
+    async fn open_reader(&self, object: &str) -> Result<BoxedAsyncRead, Error> {
+        match self {
+            StorageBackend::File(s) => s.open_reader(object).await,
+            StorageBackend::Http(s) => s.open_reader(object).await,
         }
-        scheme => Err(Error::fatal(format!("Unsupported URL scheme: {}", scheme))),
+    }
+
+    async fn exists(&self, object: &str) -> Result<bool, Error> {
+        match self {
+            StorageBackend::File(s) => s.exists(object).await,
+            StorageBackend::Http(s) => s.exists(object).await,
+        }
+    }
+
+    async fn open_writer(&self, object: &str) -> io::Result<BoxedAsyncWrite> {
+        match self {
+            StorageBackend::File(s) => s.open_writer(object).await,
+            StorageBackend::Http(s) => s.open_writer(object).await,
+        }
+    }
+
+    fn supports_writes(&self) -> bool {
+        match self {
+            StorageBackend::File(s) => s.supports_writes(),
+            StorageBackend::Http(s) => s.supports_writes(),
+        }
+    }
+
+    fn get_base_path(&self) -> Option<&std::path::Path> {
+        match self {
+            StorageBackend::File(s) => s.get_base_path(),
+            StorageBackend::Http(s) => s.get_base_path(),
+        }
     }
 }

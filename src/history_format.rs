@@ -341,7 +341,7 @@ pub fn is_zero_hash(hash: &str) -> bool {
 fn round_to_checkpoint(ledger: u32, round_up: bool) -> u32 {
     if ledger < GENESIS_CHECKPOINT_LEDGER {
         GENESIS_CHECKPOINT_LEDGER
-    } else if is_checkpoint(ledger) {
+    } else if (ledger + 1) % CHECKPOINT_FREQUENCY == 0 {
         // Already a checkpoint
         ledger
     } else {
