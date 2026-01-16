@@ -1,7 +1,6 @@
 pub mod history_format;
 pub mod mirror_operation;
 pub mod pipeline;
-pub mod retryable_error_layer;
 pub mod scan_operation;
 pub mod storage;
 pub mod utils;
@@ -182,7 +181,13 @@ pub mod test_helpers {
     }
 
     pub async fn run_scan(config: ScanConfig) -> Result<(), crate::Error> {
-        let operation = ScanOperation::new(config.low, config.high).await?;
+        let operation = ScanOperation::new(
+            config.low,
+            config.high,
+            config.storage_config.max_retries as u32,
+            config.storage_config.retry_min_delay.as_millis() as u64,
+        )
+        .await?;
 
         let pipeline_config = PipelineConfig {
             source: config.archive,

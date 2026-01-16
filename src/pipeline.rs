@@ -7,6 +7,7 @@
 use crate::{
     history_format::{self, bucket_path, checkpoint_path, HistoryFileState},
     storage::StorageConfig,
+    utils::RetryState,
 };
 use bytes::Buf;
 use futures_util::{
@@ -68,8 +69,8 @@ pub trait Operation: Send + Sync + 'static {
 
     /// Process an object from an in-memory buffer.
     /// Used when the content is already loaded (e.g., history files that are parsed).
-    async fn process_buffer(&self, path: &str, buffer: Buffer)
-        -> Result<(), crate::storage::Error>;
+    /// Each operation handles success/failure recording internally.
+    async fn process_buffer(&self, path: &str, buffer: Buffer);
 
     /// Record a successful file processing
     fn record_success(&self, path: &str);
@@ -211,37 +212,48 @@ impl<Op: Operation> Pipeline<Op> {
 
     /// Process a history file for a checkpoint.
     /// Downloads and parses the history JSON, then processes buckets.
-    /// Retries are handled by the storage layer (OpenDAL).
+    /// Retries are handled at this level to avoid file corruption from partial streams.
     async fn process_history(self: Arc<Self>, checkpoint: u32) {
         use futures_util::TryStreamExt;
 
         let history_path = checkpoint_path("history", checkpoint);
 
-        // Download the history file (storage layer handles retries)
-        // Use into_stream to handle chunked transfer encoding properly
-        let download_result: Result<Buffer, crate::storage::Error> = async {
-            let reader = self.src_store.open_reader(&history_path).await?;
-            // Convert to stream and collect all chunks into a single buffer
-            let stream = reader
-                .into_stream(..)
-                .await
-                .map_err(|e| crate::storage::Error::fatal(format!("Stream error: {}", e)))?;
-            let chunks: Vec<Buffer> = stream
-                .try_collect()
-                .await
-                .map_err(|e| crate::storage::Error::fatal(format!("Read error: {}", e)))?;
-            // Merge chunks into a single buffer
-            let buffer: Buffer = chunks.into_iter().flatten().collect();
-            Ok(buffer)
-        }
-        .await;
+        // Retry state for downloading the history file
+        let mut retry_state = RetryState::new(
+            self.config.storage_config.max_retries as u32,
+            self.config.storage_config.retry_min_delay.as_millis() as u64,
+        );
 
-        let buffer = match download_result {
-            Ok(buf) => buf,
-            Err(e) => {
-                error!("Failed to download history file {}: {}", history_path, e);
-                self.operation.record_failure(&history_path).await;
-                return;
+        // Download the history file with retries at this level
+        // Use into_stream to handle chunked transfer encoding properly
+        let buffer = loop {
+            let download_result: Result<Buffer, crate::storage::Error> = async {
+                let reader = self.src_store.open_reader(&history_path).await?;
+                // Convert to stream and collect all chunks into a single buffer
+                let stream = reader
+                    .into_stream(..)
+                    .await
+                    .map_err(|e| crate::storage::from_opendal_error(e, "Stream error"))?;
+                let chunks: Vec<Buffer> = stream
+                    .try_collect()
+                    .await
+                    .map_err(|e| crate::storage::from_opendal_error(e, "Read error"))?;
+                // Merge chunks into a single buffer
+                let buffer: Buffer = chunks.into_iter().flatten().collect();
+                Ok(buffer)
+            }
+            .await;
+
+            match download_result {
+                Ok(buf) => break buf,
+                Err(e) => {
+                    if retry_state.should_retry(&e, "download history file", &history_path) {
+                        retry_state.backoff().await;
+                        continue;
+                    }
+                    self.operation.record_failure(&history_path).await;
+                    return;
+                }
             }
         };
 
@@ -258,33 +270,11 @@ impl<Op: Operation> Pipeline<Op> {
 
         match parse_result {
             Ok(state) => {
-                // For existence-only checks, we already downloaded and parsed the history file,
-                // so just record success. For mirror, we need to write it to destination.
-                if self.operation.existence_check_only() {
-                    self.operation.record_success(&history_path);
-                    self.clone().process_buckets(state).await;
-                } else {
-                    // Write the history file (we already have content in buffer) and process buckets concurrently
-                    let history_path_clone = history_path.clone();
-                    let write_history = async {
-                        match self
-                            .operation
-                            .process_buffer(&history_path_clone, buffer)
-                            .await
-                        {
-                            Ok(()) => self.operation.record_success(&history_path_clone),
-                            Err(e) => {
-                                error!(
-                                    "Failed to write history file {}: {}",
-                                    history_path_clone, e
-                                );
-                                self.operation.record_failure(&history_path_clone).await;
-                            }
-                        }
-                    };
-                    let buckets = self.clone().process_buckets(state);
-                    let _ = join(write_history, buckets).await;
-                }
+                // Process the history file and process buckets concurrently
+                let history_path_clone = history_path.clone();
+                let process_history = self.operation.process_buffer(&history_path_clone, buffer);
+                let buckets = self.clone().process_buckets(state);
+                let _ = join(process_history, buckets).await;
             }
             Err(e) => {
                 error!(
@@ -324,7 +314,7 @@ impl<Op: Operation> Pipeline<Op> {
     }
 
     /// Process a single file (bucket, ledger, transactions, results, scp).
-    /// Retries are handled by the storage layer (OpenDAL).
+    /// All retries are handled at this level - no automatic retries in OpenDAL.
     async fn process_file(self: Arc<Self>, path: String) {
         // Pre-check: allow operation to skip without querying source
         if let Some(result) = self.operation.pre_check(&path).await {
@@ -342,42 +332,64 @@ impl<Op: Operation> Pipeline<Op> {
             }
         }
 
+        let mut retry_state = RetryState::new(
+            self.config.storage_config.max_retries as u32,
+            self.config.storage_config.retry_min_delay.as_millis() as u64,
+        );
+
         // For existence-only checks, we don't need to open a reader or call process_object
         if self.operation.existence_check_only() {
-            match self.src_store.exists(&path).await {
-                Ok(true) => {
-                    debug!("Exists: {}", path);
-                    self.operation.record_success(&path);
-                }
-                Ok(false) => {
-                    error!("File not found: {}", path);
-                    self.operation.record_failure(&path).await;
-                }
-                Err(e) => {
-                    error!("Failed to check existence for {}: {}", path, e);
-                    self.operation.record_failure(&path).await;
+            loop {
+                match self.src_store.exists(&path).await {
+                    Ok(true) => {
+                        debug!("Exists: {}", path);
+                        self.operation.record_success(&path);
+                        return;
+                    }
+                    Ok(false) => {
+                        error!("File not found: {}", path);
+                        self.operation.record_failure(&path).await;
+                        return;
+                    }
+                    Err(e) => {
+                        if retry_state.should_retry(&e, "check existence of", &path) {
+                            retry_state.backoff().await;
+                            continue;
+                        }
+                        self.operation.record_failure(&path).await;
+                        return;
+                    }
                 }
             }
-        } else {
-            // Normal path - open a reader for actual content streaming
+        }
+
+        loop {
             let reader = match self.src_store.open_reader(&path).await {
                 Ok(reader) => reader,
                 Err(e) => {
-                    error!("Failed to open reader for {}: {}", path, e);
+                    if retry_state.should_retry(&e, "open reader for", &path) {
+                        retry_state.backoff().await;
+                        continue;
+                    }
                     self.operation.record_failure(&path).await;
                     return;
                 }
             };
 
-            // Process the file
+            // Process the file - process_object cleans up partial files on error
             match self.operation.process_object(&path, reader).await {
                 Ok(()) => {
                     debug!("Processed: {}", path);
                     self.operation.record_success(&path);
+                    return;
                 }
                 Err(e) => {
-                    error!("Failed to process {}: {}", path, e);
+                    if retry_state.should_retry(&e, "process", &path) {
+                        retry_state.backoff().await;
+                        continue;
+                    }
                     self.operation.record_failure(&path).await;
+                    return;
                 }
             }
         }

@@ -46,6 +46,10 @@ pub struct MirrorOperation {
     high: Option<u32>,
     allow_mirror_gaps: bool,
 
+    // Retry configuration for source fetches
+    max_retries: u32,
+    retry_min_delay_ms: u64,
+
     // Cached destination checkpoint at start of operation (or None if destination doesn't exist)
     initial_dest_checkpoint: OnceCell<Option<u32>>,
 }
@@ -76,6 +80,8 @@ impl MirrorOperation {
             low,
             high,
             allow_mirror_gaps,
+            max_retries: storage_config.max_retries as u32,
+            retry_min_delay_ms: storage_config.retry_min_delay.as_millis() as u64,
             initial_dest_checkpoint: OnceCell::new(),
         })
     }
@@ -85,8 +91,14 @@ impl MirrorOperation {
     async fn get_initial_dest_well_known_checkpoint(&self) -> Option<u32> {
         self.initial_dest_checkpoint
             .get_or_init(|| async {
-                // Try to read the destination's .well-known file (local file, no retries required)
-                match fetch_well_known_history_file(&self.dst_store).await {
+                // Try to read the destination's .well-known file
+                match fetch_well_known_history_file(
+                    &self.dst_store,
+                    self.max_retries,
+                    self.retry_min_delay_ms,
+                )
+                .await
+                {
                     Ok(has) => Some(has.current_ledger),
                     Err(_) => None, // No existing archive
                 }
@@ -190,6 +202,29 @@ impl MirrorOperation {
 
         Ok(())
     }
+
+    /// Clean up a partial file at the destination path before retrying.
+    /// Only needed when atomic writes are disabled
+    async fn cleanup_partial_file(&self, path: &str) -> Result<(), StorageError> {
+        if self.dst_store.uses_atomic_writes() {
+            return Ok(());
+        }
+
+        if let Some(base_path) = self.dst_store.get_base_path() {
+            let file_path = base_path.join(path);
+            if file_path.exists() {
+                tokio::fs::remove_file(&file_path).await.map_err(|e| {
+                    StorageError::fatal(format!(
+                        "Failed to remove partial file {}: {}",
+                        file_path.display(),
+                        e
+                    ))
+                })?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -211,9 +246,10 @@ impl Operation for MirrorOperation {
         //    - If destination doesn't exist: start from genesis checkpoint
 
         // First, get the source's latest checkpoint to know what's available
-        let source_state = fetch_well_known_history_file(source)
-            .await
-            .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
+        let source_state =
+            fetch_well_known_history_file(source, self.max_retries, self.retry_min_delay_ms)
+                .await
+                .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
         let source_checkpoint =
             history_format::round_to_lower_checkpoint(source_state.current_ledger);
 
@@ -350,53 +386,26 @@ impl Operation for MirrorOperation {
     }
 
     async fn process_object(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
-        // Stream from source reader to destination using streaming copy
-        let write_result = self.dst_store.copy_from_reader(path, reader).await;
-
-        match write_result {
+        match self.dst_store.copy_from_reader(path, reader).await {
             Ok(_) => Ok(()),
             Err(e) => {
-                // Streaming/write error - clean up partial file before retrying
-                if let Some(base_path) = self.dst_store.get_base_path() {
-                    let file_path = base_path.join(path);
-                    if file_path.exists() {
-                        if let Err(rm_err) = tokio::fs::remove_file(&file_path).await {
-                            // If we fail to clean up the partial file, we can't retry
-                            return Err(StorageError::fatal(format!(
-                                "Failed to remove partial file {}: {}",
-                                file_path.display(),
-                                rm_err
-                            )));
-                        }
-                    }
-                }
-                // Partial file cleaned up, safe to retry
-                Err(StorageError::retry(format!("Stream error: {}", e)))
+                self.cleanup_partial_file(path).await?;
+                Err(e)
             }
         }
     }
 
-    async fn process_buffer(&self, path: &str, buffer: Buffer) -> Result<(), StorageError> {
-        // Write buffer to destination
-        let write_result = self.dst_store.write(path, buffer).await;
-
-        match write_result {
-            Ok(_) => Ok(()),
+    async fn process_buffer(&self, path: &str, buffer: Buffer) {
+        match self.dst_store.write(path, buffer).await {
+            Ok(_) => {
+                self.stats.record_success(path);
+            }
             Err(e) => {
-                // Write error - clean up partial file before retrying
-                if let Some(base_path) = self.dst_store.get_base_path() {
-                    let file_path = base_path.join(path);
-                    if file_path.exists() {
-                        if let Err(rm_err) = tokio::fs::remove_file(&file_path).await {
-                            return Err(StorageError::fatal(format!(
-                                "Failed to remove partial file {}: {}",
-                                file_path.display(),
-                                rm_err
-                            )));
-                        }
-                    }
+                if let Err(cleanup_err) = self.cleanup_partial_file(path).await {
+                    error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
                 }
-                Err(StorageError::retry(format!("Write error: {}", e)))
+                error!("Failed to write history file {}: {}", path, e);
+                self.stats.record_failure(path).await;
             }
         }
     }

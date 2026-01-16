@@ -28,14 +28,25 @@ pub struct ScanOperation {
     // User-specified arguments from CLI
     low: Option<u32>,
     high: Option<u32>,
+
+    // Retry configuration for source fetches
+    max_retries: u32,
+    retry_min_delay_ms: u64,
 }
 
 impl ScanOperation {
-    pub async fn new(low: Option<u32>, high: Option<u32>) -> Result<Self, Error> {
+    pub async fn new(
+        low: Option<u32>,
+        high: Option<u32>,
+        max_retries: u32,
+        retry_min_delay_ms: u64,
+    ) -> Result<Self, Error> {
         Ok(Self {
             stats: ArchiveStats::new(),
             low,
             high,
+            max_retries,
+            retry_min_delay_ms,
         })
     }
 }
@@ -46,9 +57,10 @@ impl Operation for ScanOperation {
         &self,
         source: &StorageRef,
     ) -> Result<(u32, u32), crate::pipeline::Error> {
-        let source_state = fetch_well_known_history_file(source)
-            .await
-            .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))?;
+        let source_state =
+            fetch_well_known_history_file(source, self.max_retries, self.retry_min_delay_ms)
+                .await
+                .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))?;
         let source_checkpoint =
             history_format::round_to_lower_checkpoint(source_state.current_ledger);
 
@@ -63,11 +75,9 @@ impl Operation for ScanOperation {
         )
     }
 
-    async fn process_buffer(&self, _path: &str, _buffer: Buffer) -> Result<(), StorageError> {
-        // For now, scan just checks existence.
-        unreachable!(
-            "ScanOperation uses existence_check_only(), process_buffer should not be called"
-        )
+    async fn process_buffer(&self, path: &str, _buffer: Buffer) {
+        // Scan doesn't write - just record that we successfully downloaded and parsed the history
+        self.stats.record_success(path);
     }
 
     fn record_success(&self, path: &str) {

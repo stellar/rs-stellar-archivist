@@ -8,13 +8,12 @@
 
 #![allow(dead_code)] // Test utilities may not all be used in every test run
 
-use crate::retryable_error_layer::{
-    NON_STANDARD_RETRYABLE_HTTP_ERRORS, STANDARD_RETRYABLE_HTTP_ERRORS,
-};
+use crate::utils::{NON_STANDARD_RETRYABLE_HTTP_ERRORS, STANDARD_RETRYABLE_HTTP_ERRORS};
 use axum::{routing::get_service, Router};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
@@ -168,6 +167,7 @@ impl FlakyServerConfig {
 #[derive(Clone)]
 pub struct RequestTracker {
     counts: Arc<Mutex<HashMap<String, usize>>>,
+    timestamps: Arc<Mutex<HashMap<String, Vec<Instant>>>>,
     /// Tracks files that have been successfully fetched (200 OK with full body)
     successful_fetches: Arc<Mutex<std::collections::HashSet<String>>>,
 }
@@ -176,15 +176,24 @@ impl RequestTracker {
     pub fn new() -> Self {
         Self {
             counts: Arc::new(Mutex::new(HashMap::new())),
+            timestamps: Arc::new(Mutex::new(HashMap::new())),
             successful_fetches: Arc::new(Mutex::new(std::collections::HashSet::new())),
         }
     }
 
     pub fn increment(&self, path: &str) -> usize {
+        let now = Instant::now();
+
         let mut counts = self.counts.lock().unwrap();
         let count = counts.entry(path.to_string()).or_insert(0);
         *count += 1;
-        *count
+        let result = *count;
+        drop(counts);
+
+        let mut timestamps = self.timestamps.lock().unwrap();
+        timestamps.entry(path.to_string()).or_default().push(now);
+
+        result
     }
 
     /// Record a successful fetch. Panics if this file was already successfully fetched.
@@ -202,6 +211,69 @@ impl RequestTracker {
 
     pub fn get_counts(&self) -> HashMap<String, usize> {
         self.counts.lock().unwrap().clone()
+    }
+
+    pub fn get_timestamps(&self, path: &str) -> Vec<Instant> {
+        self.timestamps
+            .lock()
+            .unwrap()
+            .get(path)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Verify that retry delays follow exponential backoff pattern.
+    /// Returns Ok if delays are within tolerance, Err with details otherwise.
+    ///
+    /// Expected backoff sequence: 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 5000ms (capped)
+    /// Tolerance specifies the allowed deviation (e.g., 0.2 means delays must be within ±20% of expected).
+    pub fn verify_backoff_timing(
+        &self,
+        path: &str,
+        initial_backoff_ms: u64,
+        tolerance: f64,
+    ) -> Result<(), String> {
+        let timestamps = self.get_timestamps(path);
+        if timestamps.len() < 2 {
+            return Ok(()); // No retries, nothing to verify
+        }
+
+        let mut expected_backoff_ms = initial_backoff_ms;
+        for i in 1..timestamps.len() {
+            let actual_delay = timestamps[i].duration_since(timestamps[i - 1]);
+            let actual_ms = actual_delay.as_millis() as u64;
+            let min_expected = (expected_backoff_ms as f64 * (1.0 - tolerance)) as u64;
+            let max_expected = (expected_backoff_ms as f64 * (1.0 + tolerance)) as u64;
+
+            if actual_ms < min_expected {
+                return Err(format!(
+                    "Retry {} -> {}: delay {}ms is below minimum {}ms (expected ~{}ms ±{}%)",
+                    i,
+                    i + 1,
+                    actual_ms,
+                    min_expected,
+                    expected_backoff_ms,
+                    (tolerance * 100.0) as u32
+                ));
+            }
+
+            if actual_ms > max_expected {
+                return Err(format!(
+                    "Retry {} -> {}: delay {}ms exceeds maximum {}ms (expected ~{}ms ±{}%)",
+                    i,
+                    i + 1,
+                    actual_ms,
+                    max_expected,
+                    expected_backoff_ms,
+                    (tolerance * 100.0) as u32
+                ));
+            }
+
+            // Advance expected backoff (doubles, capped at 5000ms)
+            expected_backoff_ms = (expected_backoff_ms * 2).min(5000);
+        }
+
+        Ok(())
     }
 }
 
