@@ -7,7 +7,6 @@
 //! - Concurrent request limiting
 //! - Request logging
 
-use crate::retryable_error_layer::RetryableErrorLayer;
 use async_trait::async_trait;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
@@ -65,10 +64,12 @@ pub type StorageRef = Arc<dyn Storage + Send + Sync>;
 /// Core unified storage trait for all backends
 #[async_trait]
 pub trait Storage: Send + Sync {
-    /// Open an OpenDAL reader for the object with buffering enabled
+    /// Open an OpenDAL reader for the object.
+    /// Note: No automatic retries - retries are handled at the pipeline level.
     async fn open_reader(&self, object: &str) -> Result<Reader, Error>;
 
-    /// Check if object exists
+    /// Check if object exists.
+    /// Note: No automatic retries - retries are handled at the pipeline level.
     async fn exists(&self, object: &str) -> Result<bool, Error>;
 
     /// Open an OpenDAL writer for the object with buffering enabled.
@@ -86,11 +87,11 @@ pub trait Storage: Send + Sync {
         writer
             .write(data)
             .await
-            .map_err(|e| Error::retry(format!("Failed to write to {}: {}", object, e)))?;
+            .map_err(|e| from_opendal_error(e, &format!("Failed to write to {}", object)))?;
         writer
             .close()
             .await
-            .map_err(|e| Error::retry(format!("Failed to close writer for {}: {}", object, e)))?;
+            .map_err(|e| from_opendal_error(e, &format!("Failed to close writer for {}", object)))?;
         Ok(())
     }
 
@@ -105,15 +106,15 @@ pub trait Storage: Send + Sync {
         let mut stream = reader
             .into_stream(..)
             .await
-            .map_err(|e| Error::retry(format!("Failed to create stream for {}: {}", object, e)))?;
+            .map_err(|e| from_opendal_error(e, &format!("Failed to create stream for {}", object)))?;
 
         let mut sink = writer.into_sink();
         sink.send_all(&mut stream)
             .await
-            .map_err(|e| Error::retry(format!("Failed to write data to {}: {}", object, e)))?;
+            .map_err(|e| from_opendal_error(e, &format!("Failed to write data to {}", object)))?;
         sink.close()
             .await
-            .map_err(|e| Error::retry(format!("Failed to close writer for {}: {}", object, e)))?;
+            .map_err(|e| from_opendal_error(e, &format!("Failed to close writer for {}", object)))?;
         Ok(())
     }
 
@@ -125,6 +126,12 @@ pub trait Storage: Send + Sync {
     /// Get the base filesystem path if this is a filesystem backend
     fn get_base_path(&self) -> Option<&std::path::Path> {
         None
+    }
+
+    /// Check if this backend uses atomic writes (temp file + rename).
+    /// When true, failed writes don't leave partial files at the destination.
+    fn uses_atomic_writes(&self) -> bool {
+        false
     }
 }
 
@@ -217,33 +224,26 @@ impl OpendalStore {
         Self::apply_layers_with_http_client(builder, config, None)
     }
 
-    /// Apply standard layers to an operator builder with optional custom HTTP client
+    /// Apply standard layers to an operator builder with optional custom HTTP client.
+    /// Note: No RetryLayer - retries are handled at the pipeline level to avoid
+    /// file corruption from partial writes during streaming operations.
     fn apply_layers_with_http_client<B: opendal::Builder>(
         builder: B,
         config: &StorageConfig,
         http_client: Option<opendal::raw::HttpClient>,
     ) -> Result<Operator, Error> {
         // Build operator with layers
-        // IMPORTANT: TimeoutLayer must come BEFORE RetryLayer per OpenDAL docs
         // Order of layers (innermost to outermost):
-        //   Service -> HttpClient -> Timeout -> RetryableError -> Retry -> ConcurrentLimit -> Logging
-        // Note: RetryableErrorLayer must come before RetryLayer to mark non-standard 5xx codes as
-        //       temporary before the retry decision is made.
+        //   Service -> HttpClient -> Timeout -> ConcurrentLimit -> Logging
         // Note: ThrottleLayer is applied at the end since it needs the final Operator type
+        // Note: No RetryLayer - retries are handled at the pipeline level with proper error
+        //       classification (see from_opendal_error)
         let op = Operator::new(builder)
             .map_err(|e| Error::fatal(format!("Failed to create operator: {}", e)))?
             .layer(
                 layers::TimeoutLayer::default()
                     .with_timeout(config.timeout)
                     .with_io_timeout(config.io_timeout),
-            )
-            .layer(RetryableErrorLayer::new())
-            .layer(
-                layers::RetryLayer::new()
-                    .with_max_times(config.max_retries)
-                    .with_min_delay(config.retry_min_delay)
-                    .with_max_delay(config.retry_max_delay)
-                    .with_jitter(),
             )
             .layer(layers::ConcurrentLimitLayer::new(config.max_concurrent))
             .layer(layers::LoggingLayer::default())
@@ -296,27 +296,27 @@ impl OpendalStore {
         // Ensure parent directory exists
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                Error::retry(format!("Failed to create directory {:?}: {}", parent, e))
+                from_io_error(e, &format!("Failed to create directory {:?}", parent))
             })?;
         }
 
         // Open file directly with tokio::fs
         let mut file = tokio::fs::File::create(&file_path)
             .await
-            .map_err(|e| Error::retry(format!("Failed to create file {:?}: {}", file_path, e)))?;
+            .map_err(|e| from_io_error(e, &format!("Failed to create file {:?}", file_path)))?;
 
         // Stream data from reader to file
         let mut stream = reader
             .into_stream(..)
             .await
-            .map_err(|e| Error::retry(format!("Failed to create stream for {}: {}", object, e)))?;
+            .map_err(|e| from_opendal_error(e, &format!("Failed to create stream for {}", object)))?;
 
         while let Some(result) = stream.next().await {
             let buffer =
-                result.map_err(|e| Error::retry(format!("Failed to read from source: {}", e)))?;
+                result.map_err(|e| from_opendal_error(e, "Failed to read from source"))?;
             for bytes in buffer {
                 file.write_all(&bytes).await.map_err(|e| {
-                    Error::retry(format!("Failed to write to {:?}: {}", file_path, e))
+                    from_io_error(e, &format!("Failed to write to {:?}", file_path))
                 })?;
             }
         }
@@ -324,7 +324,7 @@ impl OpendalStore {
         // Flush to OS buffers (but no fsync)
         file.flush()
             .await
-            .map_err(|e| Error::retry(format!("Failed to flush {:?}: {}", file_path, e)))?;
+            .map_err(|e| from_io_error(e, &format!("Failed to flush {:?}", file_path)))?;
 
         Ok(())
     }
@@ -341,12 +341,12 @@ impl OpendalStore {
         let root_path: PathBuf = root.into();
         let root_str = root_path.to_string_lossy().to_string();
 
-        // Conditionally use atomic_write_dir based on config
         let builder = if config.atomic_file_writes {
             Fs::default().root(&root_str).atomic_write_dir(&root_str)
         } else {
             Fs::default().root(&root_str)
         };
+
         let operator = Self::apply_layers(builder, config)?;
 
         Ok(Self::from_operator(
@@ -405,14 +405,15 @@ impl OpendalStore {
         tracing::debug!("HTTP backend: endpoint={}, root={}", endpoint, root);
 
         let builder = Http::default().endpoint(&endpoint).root(root);
-
-        // Create custom HTTP client with proper User-Agent
         let http_client = Self::create_http_client()?;
-
         let operator = Self::apply_layers_with_http_client(builder, config, Some(http_client))?;
 
         Ok(Self::from_operator(
-            operator, "", None, false, false, // HTTP is read-only
+            operator,
+            "",
+            None,
+            false, // HTTP is read-only
+            false,
         ))
     }
 
@@ -432,7 +433,6 @@ impl OpendalStore {
         use opendal::services::S3;
 
         let mut builder = S3::default().bucket(bucket);
-
         if let Some(region) = region {
             builder = builder.region(region);
         }
@@ -447,7 +447,6 @@ impl OpendalStore {
         }
 
         let operator = Self::apply_layers(builder, config)?;
-
         Ok(Self::from_operator(operator, prefix, None, false, false))
     }
 
@@ -463,7 +462,6 @@ impl OpendalStore {
         use opendal::services::Gcs;
 
         let mut builder = Gcs::default().bucket(bucket);
-
         if let Some(cred) = credential {
             builder = builder.credential(cred);
         }
@@ -472,7 +470,6 @@ impl OpendalStore {
         }
 
         let operator = Self::apply_layers(builder, config)?;
-
         Ok(Self::from_operator(operator, prefix, None, false, false))
     }
 
@@ -489,7 +486,6 @@ impl OpendalStore {
         use opendal::services::Azblob;
 
         let mut builder = Azblob::default().container(container);
-
         if let Some(name) = account_name {
             builder = builder.account_name(name);
         }
@@ -501,7 +497,6 @@ impl OpendalStore {
         }
 
         let operator = Self::apply_layers(builder, config)?;
-
         Ok(Self::from_operator(operator, prefix, None, false, false))
     }
 
@@ -524,7 +519,6 @@ impl OpendalStore {
             .application_key(application_key);
 
         let operator = Self::apply_layers(builder, config)?;
-
         Ok(Self::from_operator(operator, prefix, None, false, false))
     }
 
@@ -541,7 +535,6 @@ impl OpendalStore {
         use opendal::services::Sftp;
 
         let mut builder = Sftp::default().endpoint(endpoint);
-
         if let Some(user) = user {
             builder = builder.user(user);
         }
@@ -553,7 +546,6 @@ impl OpendalStore {
         }
 
         let operator = Self::apply_layers(builder, config)?;
-
         Ok(Self::from_operator(operator, prefix, None, false, false))
     }
 
@@ -569,23 +561,45 @@ impl OpendalStore {
         use opendal::services::Swift;
 
         let mut builder = Swift::default().container(container).endpoint(endpoint);
-
         if let Some(token) = token {
             builder = builder.token(token);
         }
 
         let operator = Self::apply_layers(builder, config)?;
-
         Ok(Self::from_operator(operator, prefix, None, false, false))
     }
+}
+
+/// Check if an error message contains an HTTP status code and classify it.
+/// Returns Some(ErrorClass) if an HTTP status was found, None otherwise.
+fn classify_http_status_in_error(err_string: &str) -> Option<ErrorClass> {
+    use crate::utils::{NON_STANDARD_RETRYABLE_HTTP_ERRORS, STANDARD_RETRYABLE_HTTP_ERRORS};
+
+    // Check for retryable status codes first (5xx and special cases like 408, 429)
+    for &(code, _) in STANDARD_RETRYABLE_HTTP_ERRORS
+        .iter()
+        .chain(NON_STANDARD_RETRYABLE_HTTP_ERRORS.iter())
+    {
+        if err_string.contains(&format!("status: {}", code)) {
+            return Some(ErrorClass::Retry);
+        }
+    }
+
+    // Check for 4xx client errors (fatal, should not retry)
+    for code in 400..500u16 {
+        if err_string.contains(&format!("status: {}", code)) {
+            return Some(ErrorClass::Fatal);
+        }
+    }
+
+    None
 }
 
 /// Classify an OpenDAL error into our ErrorClass
 fn classify_opendal_error(err: &opendal::Error) -> ErrorClass {
     match err.kind() {
         ErrorKind::NotFound => ErrorClass::NotFound,
-        // Retryable errors
-        ErrorKind::RateLimited | ErrorKind::Unexpected => ErrorClass::Retry,
+        ErrorKind::RateLimited => ErrorClass::Retry,
         // Fatal errors
         ErrorKind::Unsupported
         | ErrorKind::ConfigInvalid
@@ -596,8 +610,36 @@ fn classify_opendal_error(err: &opendal::Error) -> ErrorClass {
         | ErrorKind::AlreadyExists
         | ErrorKind::RangeNotSatisfied
         | ErrorKind::ConditionNotMatch => ErrorClass::Fatal,
-        // Default to retry for unknown errors
+        // For Unexpected and other errors, check the error message for HTTP status codes
+        _ => {
+            let err_string = err.to_string();
+            classify_http_status_in_error(&err_string).unwrap_or(ErrorClass::Retry)
+        }
+    }
+}
+
+/// Convert an OpenDAL error to our Error type with proper classification
+pub fn from_opendal_error(err: opendal::Error, context: &str) -> Error {
+    let class = classify_opendal_error(&err);
+    Error {
+        class,
+        message: format!("{}: {}", context, err),
+    }
+}
+
+/// Convert a std::io::Error to our Error type with proper classification
+pub fn from_io_error(err: std::io::Error, context: &str) -> Error {
+    let class = match err.kind() {
+        std::io::ErrorKind::NotFound => ErrorClass::NotFound,
+        std::io::ErrorKind::PermissionDenied => ErrorClass::Fatal,
+        std::io::ErrorKind::AlreadyExists => ErrorClass::Fatal,
+        std::io::ErrorKind::InvalidInput | std::io::ErrorKind::InvalidData => ErrorClass::Fatal,
+        // Transient errors that may succeed on retry
         _ => ErrorClass::Retry,
+    };
+    Error {
+        class,
+        message: format!("{}: {}", context, err),
     }
 }
 
@@ -686,17 +728,17 @@ impl Storage for OpendalStore {
         let mut stream = reader
             .into_stream(..)
             .await
-            .map_err(|e| Error::retry(format!("Failed to create stream for {}: {}", object, e)))?;
+            .map_err(|e| from_opendal_error(e, &format!("Failed to create stream for {}", object)))?;
 
         let mut sink = writer.into_sink();
         sink.send_all(&mut stream)
             .await
-            .map_err(|e| Error::retry(format!("Failed to write data to {}: {}", object, e)))?;
+            .map_err(|e| from_opendal_error(e, &format!("Failed to write data to {}", object)))?;
 
         // Always call close() when using OpenDAL writer - it's required to flush internal buffers
         sink.close()
             .await
-            .map_err(|e| Error::retry(format!("Failed to close writer for {}: {}", object, e)))?;
+            .map_err(|e| from_opendal_error(e, &format!("Failed to close writer for {}", object)))?;
         Ok(())
     }
 
@@ -706,6 +748,10 @@ impl Storage for OpendalStore {
 
     fn get_base_path(&self) -> Option<&Path> {
         self.root_path.as_deref()
+    }
+
+    fn uses_atomic_writes(&self) -> bool {
+        self.atomic_file_writes
     }
 }
 

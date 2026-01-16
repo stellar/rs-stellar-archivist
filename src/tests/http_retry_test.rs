@@ -132,13 +132,13 @@ async fn test_retries_on_transient_http_errors(#[case] op: Operation) {
         let result = op.run(&server_url).await;
         handle.abort();
 
-        verify_retries_occurred(&tracker, op, status_code, description);
+        let failure_type = format!("HTTP {} ({})", status_code, description);
+        verify_retries_occurred(&tracker, op, &failure_type);
         assert!(
             result.is_ok(),
-            "{:?} should succeed after retrying HTTP {} ({}): {:?}",
+            "{:?} should succeed after retrying {}: {:?}",
             op,
-            status_code,
-            description,
+            failure_type,
             result.err()
         );
     }
@@ -161,27 +161,80 @@ async fn test_retries_on_connection_drops(#[case] op: Operation) {
     let result = op.run(&server_url).await;
     handle.abort();
 
-    let counts = tracker.get_counts();
-    let retried: Vec<_> = counts
-        .iter()
-        .filter(|(path, count)| path.starts_with(op.path_prefix()) && **count > 1)
-        .collect();
-
-    assert!(
-        !retried.is_empty(),
-        "{:?}: Connection drops should trigger retries, got counts: {:?}",
-        op,
-        counts
-            .iter()
-            .filter(|(p, _)| p.starts_with(op.path_prefix()))
-            .collect::<Vec<_>>()
-    );
+    verify_retries_occurred(&tracker, op, "connection drop");
     assert!(
         result.is_ok(),
         "{:?} should succeed after retrying connection drops: {:?}",
         op,
         result.err()
     );
+}
+
+/// Tests that retry delays follow exponential backoff pattern.
+/// We test with different failure counts to verify delays double each time:
+/// - 1 failure:  ~100ms
+/// - 2 failures: ~100ms, ~200ms
+/// - 3 failures: ~100ms, ~200ms, ~400ms
+#[rstest]
+#[case::one_failure(1)]
+#[case::two_failures(2)]
+#[case::three_failures(3)]
+#[tokio::test]
+async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
+    let archive_path = test_archive_path();
+
+    // Use 503 Service Unavailable as a representative transient error
+    let config = FlakyServerConfig::archive_status_error(
+        archive_path,
+        503,
+        fail_count,
+        "bucket/", // Target bucket files for mirror operation
+    );
+    let (server_url, tracker, handle) = start_flaky_server(config).await;
+
+    let dest_dir = TempDir::new().unwrap();
+    let result = run_mirror(
+        MirrorConfig::new(&server_url, format!("file://{}", dest_dir.path().display()))
+            .skip_optional()
+            .concurrency(1) // Single concurrency to get clean timing measurements
+            .high(63),
+    )
+    .await;
+    handle.abort();
+
+    assert!(
+        result.is_ok(),
+        "Mirror should succeed after {} retries: {:?}",
+        fail_count,
+        result.err()
+    );
+
+    // Find a path that was retried the expected number of times
+    let counts = tracker.get_counts();
+    let retried_paths: Vec<_> = counts
+        .iter()
+        .filter(|(path, count)| path.starts_with("bucket/") && **count == fail_count + 1)
+        .collect();
+
+    assert!(
+        !retried_paths.is_empty(),
+        "Expected at least one bucket file to be retried {} times, got counts: {:?}",
+        fail_count,
+        counts
+            .iter()
+            .filter(|(p, _)| p.starts_with("bucket/"))
+            .collect::<Vec<_>>()
+    );
+
+    // Verify exponential backoff timing (100ms initial, ±20% tolerance)
+    for (path, _) in &retried_paths {
+        if let Err(e) = tracker.verify_backoff_timing(path, 100, 0.2) {
+            panic!(
+                "Exponential backoff failed for {} with {} failures: {}",
+                path, fail_count, e
+            );
+        }
+    }
 }
 
 //=============================================================================
@@ -202,7 +255,7 @@ async fn test_fails_on_permanent_http_errors(#[case] op: Operation) {
             1000, // Always fail
             op.path_prefix(),
         );
-        let (server_url, _tracker, handle) = start_flaky_server(config).await;
+        let (server_url, tracker, handle) = start_flaky_server(config).await;
 
         let result = op.run(&server_url).await;
         handle.abort();
@@ -214,6 +267,21 @@ async fn test_fails_on_permanent_http_errors(#[case] op: Operation) {
             status_code,
             description
         );
+
+        // Verify no retries occurred - each path should only be requested once
+        let counts = tracker.get_counts();
+        let retried: Vec<_> = counts
+            .iter()
+            .filter(|(path, count)| path.starts_with(op.path_prefix()) && **count > 1)
+            .collect();
+        assert!(
+            retried.is_empty(),
+            "{:?}: HTTP {} ({}) should not trigger retries, but these paths were retried: {:?}",
+            op,
+            status_code,
+            description,
+            retried
+        );
     }
 }
 
@@ -221,12 +289,7 @@ async fn test_fails_on_permanent_http_errors(#[case] op: Operation) {
 // Helper Functions
 //=============================================================================
 
-fn verify_retries_occurred(
-    tracker: &RequestTracker,
-    op: Operation,
-    status_code: u16,
-    description: &str,
-) {
+fn verify_retries_occurred(tracker: &RequestTracker, op: Operation, failure_type: &str) {
     let counts = tracker.get_counts();
     let retried: Vec<_> = counts
         .iter()
@@ -235,10 +298,9 @@ fn verify_retries_occurred(
 
     assert!(
         !retried.is_empty(),
-        "{:?}: HTTP {} ({}) should trigger retries, got counts: {:?}",
+        "{:?}: {} should trigger retries, got counts: {:?}",
         op,
-        status_code,
-        description,
+        failure_type,
         counts
             .iter()
             .filter(|(p, _)| p.starts_with(op.path_prefix()))
@@ -338,24 +400,18 @@ async fn test_scan_head_response_handling(
 // Mid-stream Failure Tests
 //=============================================================================
 
-/// Demonstrates a data corruption bug with mid-stream download failures.
+/// Tests that retries properly handle mid-stream download failures
+/// without causing file corruption.
 ///
-/// When the server sends 200 OK with Content-Length but drops the connection after
-/// sending partial data, OpenDAL's retry layer retries the HTTP request from byte 0.
-/// However, our streaming write has already written the partial data to the destination.
-/// The retry data gets APPENDED, resulting in a corrupted file.
-///
-/// Example with a 129-byte file and fail_count=2 (25% partial each time):
-///   - Attempt 1: writes 32 bytes, connection drops
-///   - Attempt 2: writes 32 bytes (from byte 0), connection drops
-///   - Attempt 3: writes 129 bytes (from byte 0)
-///   - Result: 32 + 32 + 129 = 193 bytes (CORRUPTED)
-///
-/// This test verifies the bug exists by checking that files are larger than expected.
-/// Note: atomic_file_writes=true doesn't help because the temp file still receives
-/// appended data before being renamed.
+/// The server sends 200 OK with Content-Length but drops the connection after
+/// sending partial data (25%). The pipeline detects this and retries the entire
+/// file download from scratch, ensuring the destination file is not corrupted.
+/// Tests both with and without atomic file writes
+#[rstest]
+#[case::with_atomic_writes(true)]
+#[case::without_atomic_writes(false)]
 #[tokio::test]
-async fn test_partial_body_retry_causes_corruption() {
+async fn test_partial_body_retry_succeeds_without_corruption(#[case] atomic_file_writes: bool) {
     use crate::storage::StorageConfig;
     use std::time::Duration;
 
@@ -368,7 +424,6 @@ async fn test_partial_body_retry_causes_corruption() {
     let config = FlakyServerConfig::archive_partial_body(archive_path.clone(), fail_count);
     let (server_url, tracker, handle) = start_flaky_server(config).await;
 
-    // Enable atomic writes to verify they don't prevent the corruption
     let storage_config = StorageConfig::new(
         3,                          // max_retries
         Duration::from_millis(100), // retry_min_delay
@@ -377,7 +432,7 @@ async fn test_partial_body_retry_causes_corruption() {
         Duration::from_secs(30),    // timeout
         Duration::from_secs(300),   // io_timeout
         0,                          // bandwidth_limit
-        true,                       // atomic_file_writes
+        atomic_file_writes,
     );
 
     let dest_dir = TempDir::new().unwrap();
@@ -391,10 +446,11 @@ async fn test_partial_body_retry_causes_corruption() {
     let result = run_mirror(mirror_config).await;
     handle.abort();
 
-    // Mirror "succeeds" because OpenDAL retries are transparent
+    // Mirror should succeed
     assert!(
         result.is_ok(),
-        "Mirror should complete (retries are transparent): {:?}",
+        "Mirror (atomic_writes={}) should complete successfully: {:?}",
+        atomic_file_writes,
         result.err()
     );
 
@@ -410,7 +466,7 @@ async fn test_partial_body_retry_causes_corruption() {
         counts
     );
 
-    // Find corrupted files and verify the corruption pattern
+    // Find any files with wrong sizes
     let dest_bucket_dir = dest_dir.path().join("bucket");
     let mut corrupted_files = Vec::new();
 
@@ -426,57 +482,20 @@ async fn test_partial_body_retry_causes_corruption() {
         let actual_size = std::fs::metadata(entry.path()).unwrap().len() as usize;
 
         if actual_size != expected_size {
-            // Verify corruption matches the pattern: N partial attempts + 1 full
-            // Each partial attempt writes 25% of the file
-            let partial_size = expected_size / 4;
-            let expected_corrupted_size =
-                (partial_size * fail_count) + expected_size;
-
             corrupted_files.push((
                 rel_path.display().to_string(),
                 expected_size,
                 actual_size,
-                expected_corrupted_size,
             ));
         }
     }
 
-    // Assert that corruption occurred (this test documents the bug)
+    // Assert that no corruption occurred
     assert!(
-        !corrupted_files.is_empty(),
-        "Expected to find corrupted files demonstrating the retry-append bug"
+        corrupted_files.is_empty(),
+        "Expected no corrupted files (atomic_writes={}), but found {} corrupted files: {:?}",
+        atomic_file_writes,
+        corrupted_files.len(),
+        corrupted_files
     );
-
-    // Verify the corruption matches our expected pattern
-    for (path, expected, actual, expected_corrupted) in &corrupted_files {
-        assert!(
-            *actual > *expected,
-            "File {} should be larger than expected due to appended retry data \
-             (expected {}, got {})",
-            path,
-            expected,
-            actual
-        );
-
-        // Allow some tolerance for rounding in partial size calculation
-        let tolerance = 10;
-        assert!(
-            (*actual as i64 - *expected_corrupted as i64).abs() <= tolerance,
-            "File {} corruption should match pattern: {} partial bytes + {} full bytes = ~{}, \
-             but got {} bytes",
-            path,
-            expected / 4 * fail_count,
-            expected,
-            expected_corrupted,
-            actual
-        );
-    }
-
-    println!(
-        "Bug demonstrated: {} files corrupted by retry-append behavior",
-        corrupted_files.len()
-    );
-    for (path, expected, actual, _) in &corrupted_files {
-        println!("  {}: expected {} bytes, got {} bytes", path, expected, actual);
-    }
 }

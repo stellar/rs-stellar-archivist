@@ -8,6 +8,45 @@ use crate::history_format::{self, HistoryFileState};
 use crate::pipeline;
 use crate::storage::StorageRef;
 
+//=============================================================================
+// Retryable HTTP Error Codes
+//=============================================================================
+
+/// Standard HTTP server errors that are typically retried (500, 502, 503, 504).
+pub const STANDARD_RETRYABLE_HTTP_ERRORS: &[(u16, &str)] = &[
+    (500, "Internal Server Error"),
+    (502, "Bad Gateway"),
+    (503, "Service Unavailable"),
+    (504, "Gateway Timeout"),
+];
+
+/// Non-standard HTTP status codes that should be treated as retryable.
+///
+/// References:
+/// - Cloudflare: https://developers.cloudflare.com/support/troubleshooting/cloudflare-errors/troubleshooting-cloudflare-5xx-errors/
+/// - Unofficial codes: https://en.wikipedia.org/wiki/List_of_HTTP_status_codes#Unofficial_codes
+pub const NON_STANDARD_RETRYABLE_HTTP_ERRORS: &[(u16, &str)] = &[
+    // Standard retryable errors that some clients don't retry by default
+    (408, "Request Timeout"),
+    (429, "Too Many Requests"),
+    // Cloudflare-specific errors
+    (520, "Cloudflare Unknown Error"),
+    (521, "Cloudflare Web Server Is Down"),
+    (522, "Cloudflare Connection Timed Out"),
+    (523, "Cloudflare Origin Is Unreachable"),
+    (524, "Cloudflare A Timeout Occurred"),
+    (530, "Cloudflare Origin DNS Error"),
+    // Informal/proxy-specific errors
+    (509, "Bandwidth Limit Exceeded"), // Apache/cPanel
+    (529, "Site is Overloaded"),       // Qualys SSLLabs
+    (598, "Network Read Timeout"),     // Informal, nginx
+    (599, "Network Connect Timeout"),  // Informal, nginx
+];
+
+//=============================================================================
+// Error Types
+//=============================================================================
+
 /// Utils module errors - just wraps errors from other modules
 #[derive(Error, Debug)]
 pub enum Error {
@@ -204,10 +243,36 @@ impl RetryState {
         }
     }
 
-    /// Record an attempt and return true if we should retry, false if max retries exceeded
-    pub fn record_attempt(&mut self) -> bool {
-        self.attempt += 1;
-        self.attempt <= self.max_retries
+    /// Evaluate an error and determine if we should retry.
+    ///
+    /// If the error is retryable and we haven't exhausted retries:
+    /// - Logs retry count
+    /// - Returns true (caller should call backoff() and retry)
+    ///
+    /// If the error is not retryable or retries are exhausted:
+    /// - Logs an error
+    /// - Returns false (caller should record failure and stop)
+    pub fn should_retry(
+        &mut self,
+        error: &crate::storage::Error,
+        action: &str,
+        path: &str,
+    ) -> bool {
+        use crate::storage::ErrorClass;
+
+        if error.class == ErrorClass::Retry {
+            self.attempt += 1;
+            if self.attempt <= self.max_retries {
+                debug!(
+                    "Retry {}/{} {} {}: {}",
+                    self.attempt, self.max_retries, action, path, error
+                );
+                return true;
+            }
+        }
+
+        error!("Failed to {} {}: {}", action, path, error);
+        false
     }
 
     /// Wait for the backoff period and increase it for next time
@@ -218,39 +283,58 @@ impl RetryState {
 }
 
 /// Fetch and validate .well-known/stellar-history.json from store
-/// Retries are handled by the storage layer (OpenDAL).
-pub async fn fetch_well_known_history_file(store: &StorageRef) -> Result<HistoryFileState, Error> {
+///
+/// Parameters:
+/// - `store`: The storage backend to fetch from
+/// - `max_retries`: Maximum number of retry attempts (0 for no retries, e.g., for local filesystem)
+/// - `retry_min_delay_ms`: Initial backoff delay in milliseconds
+pub async fn fetch_well_known_history_file(
+    store: &StorageRef,
+    max_retries: u32,
+    retry_min_delay_ms: u64,
+) -> Result<HistoryFileState, Error> {
     use crate::history_format::ROOT_WELL_KNOWN_PATH;
     use futures_util::TryStreamExt;
     use opendal::Buffer;
 
     debug!("Fetching .well-known from path: {}", ROOT_WELL_KNOWN_PATH);
 
-    // Open and read the file using streaming to handle chunked transfer encoding
-    let reader = store.open_reader(ROOT_WELL_KNOWN_PATH).await.map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Failed to open {}: {}", ROOT_WELL_KNOWN_PATH, e),
-        )
-    })?;
+    let mut retry_state = RetryState::new(max_retries, retry_min_delay_ms);
 
-    // Convert to stream and collect all chunks
-    let stream = reader.into_stream(..).await.map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Stream error for {}: {}", ROOT_WELL_KNOWN_PATH, e),
-        )
-    })?;
+    // Download the .well-known file with retries at this level
+    let buffer = loop {
+        let download_result: Result<Buffer, crate::storage::Error> = async {
+            let reader = store.open_reader(ROOT_WELL_KNOWN_PATH).await?;
+            // Convert to stream and collect all chunks
+            let stream = reader
+                .into_stream(..)
+                .await
+                .map_err(|e| crate::storage::from_opendal_error(e, "Stream error"))?;
+            let chunks: Vec<Buffer> = stream
+                .try_collect()
+                .await
+                .map_err(|e| crate::storage::from_opendal_error(e, "Read error"))?;
+            // Merge chunks into a single buffer
+            let buffer: Buffer = chunks.into_iter().flatten().collect();
+            Ok(buffer)
+        }
+        .await;
 
-    let chunks: Vec<Buffer> = stream.try_collect().await.map_err(|e| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            format!("Reading {}: {}", ROOT_WELL_KNOWN_PATH, e),
-        )
-    })?;
-
-    // Merge chunks into a single buffer
-    let buffer: Buffer = chunks.into_iter().flatten().collect();
+        match download_result {
+            Ok(buf) => break buf,
+            Err(e) => {
+                if retry_state.should_retry(&e, "download", ROOT_WELL_KNOWN_PATH) {
+                    retry_state.backoff().await;
+                    continue;
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::Other,
+                    format!("Failed to fetch {}: {}", ROOT_WELL_KNOWN_PATH, e),
+                )
+                .into());
+            }
+        }
+    };
 
     // Parse the JSON
     tracing::debug!("Read {} bytes from {}", buffer.len(), ROOT_WELL_KNOWN_PATH);

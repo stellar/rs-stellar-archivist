@@ -34,7 +34,13 @@ impl ScanCmd {
         }
 
         // Create the scan operation
-        let operation = ScanOperation::new(self.low, self.high).await?;
+        let operation = ScanOperation::new(
+            self.low,
+            self.high,
+            args.storage_config.max_retries as u32,
+            args.storage_config.retry_min_delay.as_millis() as u64,
+        )
+        .await?;
 
         // Configure the pipeline with low/high bounds and storage config
         let pipeline_config = PipelineConfig {
