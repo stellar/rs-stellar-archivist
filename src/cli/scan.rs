@@ -39,6 +39,7 @@ impl ScanCmd {
             self.high,
             args.storage_config.max_retries as u32,
             args.storage_config.retry_min_delay.as_millis() as u64,
+            args.verify,
         )
         .await?;
 

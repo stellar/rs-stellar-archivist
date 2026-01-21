@@ -27,6 +27,7 @@ pub mod pipeline;
 pub mod scan_operation;
 pub mod storage;
 pub mod utils;
+pub mod verify;
 
 #[cfg(feature = "cli")]
 pub mod cli;
@@ -87,6 +88,7 @@ pub mod test_helpers {
         pub low: Option<u32>,
         pub high: Option<u32>,
         pub storage_config: StorageConfig,
+        pub verify: bool,
     }
 
     impl ScanConfig {
@@ -99,6 +101,7 @@ pub mod test_helpers {
                 low: None,
                 high: None,
                 storage_config: test_storage_config(),
+                verify: false,
             }
         }
 
@@ -136,6 +139,12 @@ pub mod test_helpers {
             self.storage_config = config;
             self
         }
+
+        /// Enable hash verification
+        pub fn verify(mut self) -> Self {
+            self.verify = true;
+            self
+        }
     }
 
     pub struct MirrorConfig {
@@ -148,6 +157,7 @@ pub mod test_helpers {
         pub overwrite: bool,
         pub allow_mirror_gaps: bool,
         pub storage_config: StorageConfig,
+        pub verify: bool,
     }
 
     impl MirrorConfig {
@@ -163,6 +173,7 @@ pub mod test_helpers {
                 overwrite: false,
                 allow_mirror_gaps: false,
                 storage_config: test_storage_config(),
+                verify: false,
             }
         }
 
@@ -214,6 +225,12 @@ pub mod test_helpers {
             self.storage_config = config;
             self
         }
+
+        /// Enable hash verification
+        pub fn verify(mut self) -> Self {
+            self.verify = true;
+            self
+        }
     }
 
     pub async fn run_scan(config: ScanConfig) -> Result<(), crate::Error> {
@@ -222,6 +239,7 @@ pub mod test_helpers {
             config.high,
             config.storage_config.max_retries as u32,
             config.storage_config.retry_min_delay.as_millis() as u64,
+            config.verify,
         )
         .await?;
 
@@ -251,6 +269,7 @@ pub mod test_helpers {
             config.high,
             config.allow_mirror_gaps,
             &config.storage_config,
+            config.verify,
         )
         .await?;
 

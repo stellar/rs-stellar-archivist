@@ -94,6 +94,10 @@ struct Cli {
     /// Use atomic file writes with fsync (write to temp file, then rename). More durable but slower.
     #[arg(long, global = true, default_value_t = false)]
     atomic_file_writes: bool,
+
+    /// Verify SHA256 hash of bucket files by decompressing and hashing content
+    #[arg(long, global = true)]
+    verify: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -110,6 +114,7 @@ pub struct GlobalArgs {
     pub concurrency: usize,
     pub skip_optional: bool,
     pub storage_config: StorageConfig,
+    pub verify: bool,
 }
 
 /// Run the CLI with the given arguments
@@ -154,6 +159,7 @@ where
             cli.bandwidth_limit,
             cli.atomic_file_writes,
         ),
+        verify: cli.verify,
     };
 
     match cli.command {

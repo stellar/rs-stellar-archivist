@@ -103,6 +103,7 @@ async fn remove_bucket_and_verify_scan_fails(
                 low: None,
                 high: None,
                 storage_config: test_storage_config(),
+                verify: false,
             };
 
             run_scan(scan_config).await.expect_err(error_msg);
@@ -269,6 +270,7 @@ async fn test_scan_detects_corrupt_files(
         low: None,
         high: None,
         storage_config: test_storage_config(),
+        verify: false,
     };
 
     run_scan(scan_config)
@@ -296,6 +298,7 @@ async fn test_scan_missing_scp_with_optional_flag() {
         low: None,
         high: None,
         storage_config: test_storage_config(),
+        verify: false,
     };
 
     run_scan(scan_required)
@@ -310,6 +313,7 @@ async fn test_scan_missing_scp_with_optional_flag() {
         low: None,
         high: None,
         storage_config: test_storage_config(),
+        verify: false,
     };
 
     run_scan(scan_optional)
@@ -330,6 +334,7 @@ async fn test_scan_complete_archive() {
         low: None,
         high: None,
         storage_config: test_storage_config(),
+        verify: false,
     };
 
     // Scan should succeed on complete archive
@@ -355,6 +360,7 @@ async fn test_scan_http_archive() {
         low: None,
         high: None,
         storage_config: test_storage_config(),
+        verify: false,
     };
 
     run_scan(scan_config).await.unwrap_or_else(|e| {

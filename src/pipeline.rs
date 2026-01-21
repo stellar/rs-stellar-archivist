@@ -174,7 +174,10 @@ impl<Op: Operation> Pipeline<Op> {
                 fut.await;
                 let completed = i + 1;
                 if completed % PROGRESS_REPORTING_FREQUENCY == 0 || completed == total_count {
-                    info!("Progress: {}/{} checkpoints processed", completed, total_count);
+                    info!(
+                        "Progress: {}/{} checkpoints processed",
+                        completed, total_count
+                    );
                 }
             })
             .await;

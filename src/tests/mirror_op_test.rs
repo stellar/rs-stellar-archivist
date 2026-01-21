@@ -200,6 +200,7 @@ async fn test_mirror_full_archive() {
         overwrite: false,
         allow_mirror_gaps: false,
         storage_config: test_storage_config(),
+        verify: false,
     };
 
     run_mirror(mirror_config).await.expect("Full mirror failed");
@@ -212,6 +213,7 @@ async fn test_mirror_full_archive() {
         low: None,
         high: None,
         storage_config: test_storage_config(),
+        verify: false,
     })
     .await
     .expect("Scan of full archive failed");
@@ -249,6 +251,7 @@ async fn test_mirror_bounded() {
         overwrite: false,
         allow_mirror_gaps: false,
         storage_config: test_storage_config(),
+        verify: false,
     };
 
     run_mirror(mirror_config)
@@ -263,6 +266,7 @@ async fn test_mirror_bounded() {
         low: None,
         high: None,
         storage_config: test_storage_config(),
+        verify: false,
     })
     .await
     .expect("Scan of bounded archive failed");
@@ -299,6 +303,7 @@ async fn test_mirror_skip_optional() {
         overwrite: false,
         allow_mirror_gaps: false,
         storage_config: test_storage_config(),
+        verify: false,
     };
 
     run_mirror(mirror_config)
@@ -316,6 +321,7 @@ async fn test_mirror_skip_optional() {
         low: None,
         high: None,
         storage_config: test_storage_config(),
+        verify: false,
     })
     .await
     .expect("Scan of archive without optional files failed");
@@ -747,6 +753,7 @@ async fn test_mirror_http_to_filesystem() {
         overwrite: false,
         allow_mirror_gaps: false,
         storage_config: test_storage_config(),
+        verify: false,
     };
 
     run_mirror(mirror_config).await.unwrap_or_else(|e| {
@@ -762,6 +769,7 @@ async fn test_mirror_http_to_filesystem() {
         low: None,
         high: None,
         storage_config: test_storage_config(),
+        verify: false,
     };
 
     run_scan(scan_config).await.unwrap_or_else(|e| {
@@ -841,6 +849,7 @@ async fn test_mirror_race_condition_with_advancing_archive() {
         overwrite: false,
         allow_mirror_gaps: false,
         storage_config: test_storage_config(),
+        verify: false,
     };
 
     run_mirror(mirror_config).await.unwrap_or_else(|e| {
