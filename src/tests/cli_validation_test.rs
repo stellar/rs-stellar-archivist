@@ -64,14 +64,14 @@ async fn test_rejects_nonexistent_source(#[case] operation: &str) {
 
 #[tokio::test]
 async fn test_mirror_creates_destination_if_not_exists() {
-    use super::utils::test_archive_path;
+    use super::utils::testnet_small_archive_path;
     use tempfile::TempDir;
 
     // Create a temp directory, then use a subdirectory that doesn't exist yet
     let temp_base = TempDir::new().expect("Failed to create temp base");
     let dest_path = temp_base.path().join("new-dest-directory");
 
-    let src = file_url_from_path(&test_archive_path());
+    let src = file_url_from_path(&testnet_small_archive_path());
     let dst = file_url_from_path(&dest_path);
     let config = MirrorConfig::new(&src, &dst).skip_optional().high(63);
 
@@ -93,11 +93,11 @@ async fn test_mirror_creates_destination_if_not_exists() {
 #[case::mirror("mirror")]
 #[tokio::test]
 async fn test_rejects_low_greater_than_high(#[case] operation: &str) {
-    use super::utils::test_archive_path;
+    use super::utils::testnet_small_archive_path;
     use crate::test_helpers::{run_scan, ScanConfig};
     use tempfile::TempDir;
 
-    let src = file_url_from_path(&test_archive_path());
+    let src = file_url_from_path(&testnet_small_archive_path());
 
     let result = match operation {
         "scan" => run_scan(ScanConfig::new(&src).low(2000).high(1000)).await,

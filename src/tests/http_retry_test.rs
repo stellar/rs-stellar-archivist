@@ -34,6 +34,9 @@ pub enum Operation {
     Mirror,
 }
 
+const PUBNET_CHECKPOINT_LOW: u32 = 11999999;
+const PUBNET_CHECKPOINT_HIGH: u32 = 12001023;
+
 impl Operation {
     fn path_prefix(&self) -> &'static str {
         match self {
@@ -53,7 +56,10 @@ impl Operation {
 
         match self {
             Operation::Scan => {
-                let mut config = ScanConfig::new(server_url).skip_optional().high(63);
+                let mut config = ScanConfig::new(server_url)
+                    .skip_optional()
+                    .low(PUBNET_CHECKPOINT_LOW)
+                    .high(PUBNET_CHECKPOINT_HIGH);
                 if verify {
                     config = config.verify();
                 }
@@ -76,7 +82,8 @@ impl Operation {
                 let mut config = MirrorConfig::new(server_url, file_url_from_path(dest_dir.path()))
                     .skip_optional()
                     .concurrency(1)
-                    .high(63)
+                    .low(PUBNET_CHECKPOINT_LOW)
+                    .high(PUBNET_CHECKPOINT_HIGH)
                     .storage_config(storage_config);
                 if verify {
                     config = config.verify();
@@ -255,7 +262,8 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
         MirrorConfig::new(&server_url, file_url_from_path(dest_dir.path()))
             .skip_optional()
             .concurrency(1)
-            .high(63)
+            .low(PUBNET_CHECKPOINT_LOW)
+            .high(PUBNET_CHECKPOINT_HIGH)
             .storage_config(storage_config),
     )
     .await;
@@ -285,7 +293,7 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
     );
 
     for (path, _) in &retried_paths {
-        if let Err(e) = tracker.verify_backoff_timing(path, 1000, 200) {
+        if let Err(e) = tracker.verify_backoff_timing(path, 1000, 200, 700) {
             panic!("Exponential backoff failed for {path} with {fail_count} failures: {e}");
         }
     }
@@ -433,7 +441,13 @@ async fn test_scan_head_response_handling(
     };
 
     let (server_url, server_handle) = start_http_server_with_app(app).await;
-    let result = run_scan(ScanConfig::new(&server_url).skip_optional().high(63)).await;
+    let result = run_scan(
+        ScanConfig::new(&server_url)
+            .skip_optional()
+            .low(PUBNET_CHECKPOINT_LOW)
+            .high(PUBNET_CHECKPOINT_HIGH),
+    )
+    .await;
     server_handle.abort();
 
     if expect_failure {
@@ -476,7 +490,7 @@ async fn test_partial_body_retry_succeeds_without_corruption(
 
     let archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("testdata")
-        .join("testnet-archive-small");
+        .join("pubnet-archive-old-txset");
 
     // Server sends 200 OK with Content-Length but only 25% of body, twice, then succeeds
     let fail_count = 2;
@@ -498,7 +512,8 @@ async fn test_partial_body_retry_succeeds_without_corruption(
     let mut mirror_config = MirrorConfig::new(&server_url, file_url_from_path(dest_dir.path()))
         .skip_optional()
         .concurrency(1)
-        .high(63)
+        .low(PUBNET_CHECKPOINT_LOW)
+        .high(PUBNET_CHECKPOINT_HIGH)
         .storage_config(storage_config);
 
     if verify {

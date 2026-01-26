@@ -4,8 +4,8 @@
 //! by decompressing and checking SHA256 hashes against the filename.
 
 use super::utils::{
-    copy_test_archive, get_files_by_pattern, start_flaky_server, test_archive_path,
-    FlakyServerConfig,
+    copy_test_archive, file_url_from_path, get_files_by_pattern, start_flaky_server,
+    test_archive_path, FlakyServerConfig,
 };
 use crate::test_helpers::{run_mirror, run_scan, test_storage_config, MirrorConfig, ScanConfig};
 use flate2::write::GzEncoder;
@@ -26,32 +26,54 @@ enum Operation {
     Mirror,
 }
 
+const PUBNET_CHECKPOINT_LOW: u32 = 11999999;
+const PUBNET_CHECKPOINT_HIGH: u32 = 12001023;
+
 impl Operation {
-    /// Run the operation with --verify enabled
     async fn run_with_verify(&self, src_url: &str) -> Result<(), crate::Error> {
         match self {
-            Operation::Scan => run_scan(ScanConfig::new(src_url).skip_optional().verify()).await,
+            Operation::Scan => {
+                run_scan(
+                    ScanConfig::new(src_url)
+                        .skip_optional()
+                        .verify()
+                        .low(PUBNET_CHECKPOINT_LOW)
+                        .high(PUBNET_CHECKPOINT_HIGH),
+                )
+                .await
+            }
             Operation::Mirror => {
                 let dest_dir = TempDir::new().unwrap();
                 run_mirror(
-                    MirrorConfig::new(src_url, format!("file://{}", dest_dir.path().display()))
+                    MirrorConfig::new(src_url, file_url_from_path(dest_dir.path()))
                         .skip_optional()
-                        .verify(),
+                        .verify()
+                        .low(PUBNET_CHECKPOINT_LOW)
+                        .high(PUBNET_CHECKPOINT_HIGH),
                 )
                 .await
             }
         }
     }
 
-    /// Run the operation without --verify
     async fn run_without_verify(&self, src_url: &str) -> Result<(), crate::Error> {
         match self {
-            Operation::Scan => run_scan(ScanConfig::new(src_url).skip_optional()).await,
+            Operation::Scan => {
+                run_scan(
+                    ScanConfig::new(src_url)
+                        .skip_optional()
+                        .low(PUBNET_CHECKPOINT_LOW)
+                        .high(PUBNET_CHECKPOINT_HIGH),
+                )
+                .await
+            }
             Operation::Mirror => {
                 let dest_dir = TempDir::new().unwrap();
                 run_mirror(
-                    MirrorConfig::new(src_url, format!("file://{}", dest_dir.path().display()))
-                        .skip_optional(),
+                    MirrorConfig::new(src_url, file_url_from_path(dest_dir.path()))
+                        .skip_optional()
+                        .low(PUBNET_CHECKPOINT_LOW)
+                        .high(PUBNET_CHECKPOINT_HIGH),
                 )
                 .await
             }
@@ -131,7 +153,7 @@ fn setup_corrupted_archive(corruption: CorruptionType) -> (TempDir, PathBuf) {
 #[case::mirror(Operation::Mirror)]
 #[tokio::test]
 async fn test_verify_valid_archive(#[case] op: Operation) {
-    let archive = format!("file://{}", test_archive_path().display());
+    let archive = file_url_from_path(&test_archive_path());
 
     let result = op.run_with_verify(&archive).await;
 
@@ -156,7 +178,7 @@ async fn test_verify_valid_archive(#[case] op: Operation) {
 #[tokio::test]
 async fn test_verify_detects_corruption(#[case] op: Operation, #[case] corruption: CorruptionType) {
     let (_temp_dir, archive_path) = setup_corrupted_archive(corruption);
-    let archive_url = format!("file://{}", archive_path.display());
+    let archive_url = file_url_from_path(&archive_path);
 
     let result = op.run_with_verify(&archive_url).await;
 
@@ -180,7 +202,7 @@ async fn test_no_verify_ignores_corruption(
     #[case] corruption: CorruptionType,
 ) {
     let (_temp_dir, archive_path) = setup_corrupted_archive(corruption);
-    let archive_url = format!("file://{}", archive_path.display());
+    let archive_url = file_url_from_path(&archive_path);
 
     let result = op.run_without_verify(&archive_url).await;
 
@@ -198,30 +220,29 @@ async fn test_no_verify_ignores_corruption(
 // Mirror with Verify End-to-End Test
 //=============================================================================
 
-/// Test that mirroring with --verify produces a verifiable archive
 #[tokio::test]
 async fn test_mirror_verify_produces_verifiable_archive() {
-    let src_archive = format!("file://{}", test_archive_path().display());
+    let src_archive = file_url_from_path(&test_archive_path());
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let mirror_dest = temp_dir.path().to_str().unwrap();
+    let mirror_dest = file_url_from_path(temp_dir.path());
 
-    // Mirror with verification
     run_mirror(
-        MirrorConfig::new(&src_archive, format!("file://{}", mirror_dest))
+        MirrorConfig::new(&src_archive, &mirror_dest)
             .skip_optional()
-            .verify(),
+            .verify()
+            .low(PUBNET_CHECKPOINT_LOW)
+            .high(PUBNET_CHECKPOINT_HIGH),
     )
     .await
     .expect("Mirror with --verify should succeed");
 
-    // Verify the mirrored archive with scan --verify
     run_scan(ScanConfig {
-        archive: format!("file://{}", mirror_dest),
+        archive: mirror_dest,
         concurrency: 4,
         skip_optional: true,
-        low: None,
-        high: None,
+        low: Some(PUBNET_CHECKPOINT_LOW),
+        high: Some(PUBNET_CHECKPOINT_HIGH),
         storage_config: test_storage_config(),
         verify: true,
     })
@@ -287,8 +308,8 @@ async fn test_mirror_verify_continues_on_corruption() {
 
     let temp_dest = TempDir::new().unwrap();
     let dest_path = temp_dest.path();
-    let src_url = format!("file://{}", src_path.display());
-    let dest_url = format!("file://{}", dest_path.display());
+    let src_url = file_url_from_path(&src_path);
+    let dest_url = file_url_from_path(dest_path);
 
     let result = run_mirror(
         MirrorConfig::new(&src_url, &dest_url)

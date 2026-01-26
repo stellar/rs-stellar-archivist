@@ -98,6 +98,13 @@ pub trait Operation: Send + Sync + 'static {
     async fn pre_check(&self, _path: &str) -> Option<Result<(), crate::storage::Error>> {
         None // Default: always proceed to source
     }
+
+    /// Called when all files for a checkpoint have been processed.
+    /// This is the hook for per-checkpoint verification to trigger
+    /// and release memory for the completed checkpoint.
+    fn checkpoint_complete(&self, _checkpoint: u32) {
+        // No-op by default
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -204,6 +211,9 @@ impl<Op: Operation> Pipeline<Op> {
             let scp = self.clone().process_file(path);
             let _ = join3(hist, cats, scp).await;
         }
+
+        // Notify operation that all files for this checkpoint are processed
+        self.operation.checkpoint_complete(checkpoint);
     }
 
     /// Process a history file for a checkpoint.

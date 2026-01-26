@@ -14,3 +14,7 @@ mod scan_op_test;
 mod utils;
 #[cfg(test)]
 mod verify_test;
+#[cfg(test)]
+mod xdr_verification_e2e_test;
+#[cfg(test)]
+mod xdr_verify_test;
