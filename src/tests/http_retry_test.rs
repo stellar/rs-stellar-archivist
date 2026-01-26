@@ -171,33 +171,40 @@ async fn test_retries_on_connection_drops(#[case] op: Operation) {
 }
 
 /// Tests that retry delays follow exponential backoff pattern.
-/// We test with different failure counts to verify delays double each time:
-/// - 1 failure:  ~100ms
-/// - 2 failures: ~100ms, ~200ms
-/// - 3 failures: ~100ms, ~200ms, ~400ms
+/// Uses 1s initial backoff so 100ms system jitter is only ~10% tolerance.
 #[rstest]
 #[case::one_failure(1)]
 #[case::two_failures(2)]
 #[case::three_failures(3)]
 #[tokio::test]
 async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
+    use crate::storage::StorageConfig;
+    use std::time::Duration;
+
     let archive_path = test_archive_path();
 
     // Use 503 Service Unavailable as a representative transient error
-    let config = FlakyServerConfig::archive_status_error(
-        archive_path,
-        503,
-        fail_count,
-        "bucket/", // Target bucket files for mirror operation
-    );
+    let config = FlakyServerConfig::archive_status_error(archive_path, 503, fail_count, "bucket/");
     let (server_url, tracker, handle) = start_flaky_server(config).await;
+
+    let storage_config = StorageConfig::new(
+        3,
+        Duration::from_secs(1), // Use large timeout values so jitter doesn't affect unit tests.
+        Duration::from_secs(30),
+        64,
+        Duration::from_secs(30),
+        Duration::from_secs(300),
+        0,
+        false,
+    );
 
     let dest_dir = TempDir::new().unwrap();
     let result = run_mirror(
         MirrorConfig::new(&server_url, format!("file://{}", dest_dir.path().display()))
             .skip_optional()
-            .concurrency(1) // Single concurrency to get clean timing measurements
-            .high(63),
+            .concurrency(1)
+            .high(63)
+            .storage_config(storage_config),
     )
     .await;
     handle.abort();
@@ -209,7 +216,6 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
         result.err()
     );
 
-    // Find a path that was retried the expected number of times
     let counts = tracker.get_counts();
     let retried_paths: Vec<_> = counts
         .iter()
@@ -226,9 +232,8 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
             .collect::<Vec<_>>()
     );
 
-    // Verify exponential backoff timing (100ms initial, ±20% tolerance)
     for (path, _) in &retried_paths {
-        if let Err(e) = tracker.verify_backoff_timing(path, 100, 0.2) {
+        if let Err(e) = tracker.verify_backoff_timing(path, 1000, 100) {
             panic!(
                 "Exponential backoff failed for {} with {} failures: {}",
                 path, fail_count, e
@@ -482,11 +487,7 @@ async fn test_partial_body_retry_succeeds_without_corruption(#[case] atomic_file
         let actual_size = std::fs::metadata(entry.path()).unwrap().len() as usize;
 
         if actual_size != expected_size {
-            corrupted_files.push((
-                rel_path.display().to_string(),
-                expected_size,
-                actual_size,
-            ));
+            corrupted_files.push((rel_path.display().to_string(), expected_size, actual_size));
         }
     }
 

@@ -226,12 +226,12 @@ impl RequestTracker {
     /// Returns Ok if delays are within tolerance, Err with details otherwise.
     ///
     /// Expected backoff sequence: 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 5000ms (capped)
-    /// Tolerance specifies the allowed deviation (e.g., 0.2 means delays must be within ±20% of expected).
+    /// Tolerance specifies the allowed deviation
     pub fn verify_backoff_timing(
         &self,
         path: &str,
         initial_backoff_ms: u64,
-        tolerance: f64,
+        tolerance_ms: u64,
     ) -> Result<(), String> {
         let timestamps = self.get_timestamps(path);
         if timestamps.len() < 2 {
@@ -242,30 +242,30 @@ impl RequestTracker {
         for i in 1..timestamps.len() {
             let actual_delay = timestamps[i].duration_since(timestamps[i - 1]);
             let actual_ms = actual_delay.as_millis() as u64;
-            let min_expected = (expected_backoff_ms as f64 * (1.0 - tolerance)) as u64;
-            let max_expected = (expected_backoff_ms as f64 * (1.0 + tolerance)) as u64;
+            let min_expected = expected_backoff_ms.saturating_sub(tolerance_ms);
+            let max_expected = expected_backoff_ms + tolerance_ms;
 
             if actual_ms < min_expected {
                 return Err(format!(
-                    "Retry {} -> {}: delay {}ms is below minimum {}ms (expected ~{}ms ±{}%)",
+                    "Retry {} -> {}: delay {}ms is below minimum {}ms (expected ~{}ms ±{}ms)",
                     i,
                     i + 1,
                     actual_ms,
                     min_expected,
                     expected_backoff_ms,
-                    (tolerance * 100.0) as u32
+                    tolerance_ms
                 ));
             }
 
             if actual_ms > max_expected {
                 return Err(format!(
-                    "Retry {} -> {}: delay {}ms exceeds maximum {}ms (expected ~{}ms ±{}%)",
+                    "Retry {} -> {}: delay {}ms exceeds maximum {}ms (expected ~{}ms ±{}ms)",
                     i,
                     i + 1,
                     actual_ms,
                     max_expected,
                     expected_backoff_ms,
-                    (tolerance * 100.0) as u32
+                    tolerance_ms
                 ));
             }
 

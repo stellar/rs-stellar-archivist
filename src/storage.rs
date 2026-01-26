@@ -88,10 +88,9 @@ pub trait Storage: Send + Sync {
             .write(data)
             .await
             .map_err(|e| from_opendal_error(e, &format!("Failed to write to {}", object)))?;
-        writer
-            .close()
-            .await
-            .map_err(|e| from_opendal_error(e, &format!("Failed to close writer for {}", object)))?;
+        writer.close().await.map_err(|e| {
+            from_opendal_error(e, &format!("Failed to close writer for {}", object))
+        })?;
         Ok(())
     }
 
@@ -103,18 +102,17 @@ pub trait Storage: Send + Sync {
 
         // Convert reader to a stream of Buffer chunks (zero-copy)
         // The range `..` means read all data
-        let mut stream = reader
-            .into_stream(..)
-            .await
-            .map_err(|e| from_opendal_error(e, &format!("Failed to create stream for {}", object)))?;
+        let mut stream = reader.into_stream(..).await.map_err(|e| {
+            from_opendal_error(e, &format!("Failed to create stream for {}", object))
+        })?;
 
         let mut sink = writer.into_sink();
         sink.send_all(&mut stream)
             .await
             .map_err(|e| from_opendal_error(e, &format!("Failed to write data to {}", object)))?;
-        sink.close()
-            .await
-            .map_err(|e| from_opendal_error(e, &format!("Failed to close writer for {}", object)))?;
+        sink.close().await.map_err(|e| {
+            from_opendal_error(e, &format!("Failed to close writer for {}", object))
+        })?;
         Ok(())
     }
 
@@ -306,14 +304,12 @@ impl OpendalStore {
             .map_err(|e| from_io_error(e, &format!("Failed to create file {:?}", file_path)))?;
 
         // Stream data from reader to file
-        let mut stream = reader
-            .into_stream(..)
-            .await
-            .map_err(|e| from_opendal_error(e, &format!("Failed to create stream for {}", object)))?;
+        let mut stream = reader.into_stream(..).await.map_err(|e| {
+            from_opendal_error(e, &format!("Failed to create stream for {}", object))
+        })?;
 
         while let Some(result) = stream.next().await {
-            let buffer =
-                result.map_err(|e| from_opendal_error(e, "Failed to read from source"))?;
+            let buffer = result.map_err(|e| from_opendal_error(e, "Failed to read from source"))?;
             for bytes in buffer {
                 file.write_all(&bytes).await.map_err(|e| {
                     from_io_error(e, &format!("Failed to write to {:?}", file_path))
@@ -409,10 +405,7 @@ impl OpendalStore {
         let operator = Self::apply_layers_with_http_client(builder, config, Some(http_client))?;
 
         Ok(Self::from_operator(
-            operator,
-            "",
-            None,
-            false, // HTTP is read-only
+            operator, "", None, false, // HTTP is read-only
             false,
         ))
     }
@@ -725,10 +718,9 @@ impl Storage for OpendalStore {
         let writer = self.open_writer(object).await?;
         // Convert reader to a stream of Buffer chunks (zero-copy)
         // The range `..` means read all data
-        let mut stream = reader
-            .into_stream(..)
-            .await
-            .map_err(|e| from_opendal_error(e, &format!("Failed to create stream for {}", object)))?;
+        let mut stream = reader.into_stream(..).await.map_err(|e| {
+            from_opendal_error(e, &format!("Failed to create stream for {}", object))
+        })?;
 
         let mut sink = writer.into_sink();
         sink.send_all(&mut stream)
@@ -736,9 +728,9 @@ impl Storage for OpendalStore {
             .map_err(|e| from_opendal_error(e, &format!("Failed to write data to {}", object)))?;
 
         // Always call close() when using OpenDAL writer - it's required to flush internal buffers
-        sink.close()
-            .await
-            .map_err(|e| from_opendal_error(e, &format!("Failed to close writer for {}", object)))?;
+        sink.close().await.map_err(|e| {
+            from_opendal_error(e, &format!("Failed to close writer for {}", object))
+        })?;
         Ok(())
     }
 

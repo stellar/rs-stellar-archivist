@@ -7,7 +7,7 @@ on:
   merge_group:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref_protected == 'true' && github.sha || github.ref }}-{{ github.event_name }}
+  group: ${{ github.workflow }}-${{ github.ref_protected == 'true' && github.sha || github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 jobs:
@@ -34,7 +34,7 @@ jobs:
         sys:
         - os: ubuntu-latest
           target: x86_64-unknown-linux-gnu
-        - os: macos-13
+        - os: macos-15-intel
           target: x86_64-apple-darwin
         - os: macos-latest
           target: aarch64-apple-darwin
@@ -44,8 +44,10 @@ jobs:
     steps:
     - uses: actions/checkout@v3
     - uses: stellar/actions/rust-cache@main
+      if: runner.os != 'Windows'
     - name: Use the minimum supported Rust version
       if: matrix.rust == 'msrv'
+      shell: bash
       run: |
         msrv="$(cargo metadata --format-version 1 --no-deps | jq -r '.packages | map(.rust_version) | map(values) | min')"
         rustup override set $msrv
@@ -54,6 +56,7 @@ jobs:
       # Only error on warnings and checks for the msrv, because new versions of
       # Rust will frequently add new warnings and checks.
       if: matrix.rust == 'msrv'
+      shell: bash
       run: echo RUSTFLAGS='-Dwarnings -Dclippy::all -Dclippy::pedantic' >> $GITHUB_ENV
     - run: rustup update
     - run: rustup target add ${{ matrix.sys.target }}
