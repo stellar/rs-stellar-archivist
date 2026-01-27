@@ -596,13 +596,13 @@ async fn test_partial_body_retry_succeeds_without_corruption(
                     hasher.update(&decompressed);
                     let actual_hash = hex::encode(hasher.finalize());
 
-                    if actual_hash != expected_hash {
+                    if actual_hash == expected_hash {
+                        verified_count += 1;
+                    } else {
                         hash_errors.push(format!(
                             "{}: expected {}, got {}",
                             filename, expected_hash, actual_hash
                         ));
-                    } else {
-                        verified_count += 1;
                     }
                 }
                 Err(e) => {
