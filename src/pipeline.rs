@@ -16,10 +16,7 @@ use futures_util::{
 };
 use lru::LruCache;
 use opendal::{Buffer, Reader};
-use std::sync::{
-    atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
-};
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use tracing::{debug, error, info};
 
@@ -120,7 +117,6 @@ pub struct Pipeline<Op: Operation> {
     config: PipelineConfig,
     src_store: crate::storage::StorageRef,
     bucket_lru: Mutex<LruCache<String, ()>>,
-    progress_tracker: AtomicUsize,
 }
 
 impl<Op: Operation> Pipeline<Op> {
@@ -145,7 +141,6 @@ impl<Op: Operation> Pipeline<Op> {
             config,
             src_store,
             bucket_lru,
-            progress_tracker: AtomicUsize::new(0),
         })
     }
 
@@ -174,12 +169,11 @@ impl<Op: Operation> Pipeline<Op> {
 
         // Process checkpoints concurrently, limiting to config.concurrency at a time
         stream::iter(checkpoints)
-            .for_each_concurrent(self.config.concurrency, |fut| async {
+            .enumerate()
+            .for_each_concurrent(self.config.concurrency, |(i, fut)| async move {
                 fut.await;
-                let completed = self.progress_tracker.fetch_add(1, Ordering::Relaxed) + 1;
-                if completed.is_multiple_of(PROGRESS_REPORTING_FREQUENCY)
-                    || completed == total_count
-                {
+                let completed = i + 1;
+                if completed % PROGRESS_REPORTING_FREQUENCY == 0 || completed == total_count {
                     info!(
                         "Progress: {}/{} checkpoints processed",
                         completed, total_count

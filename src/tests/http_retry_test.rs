@@ -42,21 +42,48 @@ impl Operation {
         }
     }
 
-    async fn run(&self, server_url: &str) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    async fn run(
+        &self,
+        server_url: &str,
+        verify: bool,
+        atomic_file_writes: bool,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        use crate::storage::StorageConfig;
+        use std::time::Duration;
+
         match self {
-            Operation::Scan => run_scan(ScanConfig::new(server_url).skip_optional().high(63))
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>),
+            Operation::Scan => {
+                let mut config = ScanConfig::new(server_url).skip_optional().high(63);
+                if verify {
+                    config = config.verify();
+                }
+                run_scan(config)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+            }
             Operation::Mirror => {
+                let storage_config = StorageConfig::new(
+                    3,
+                    Duration::from_millis(100),
+                    Duration::from_secs(30),
+                    64,
+                    Duration::from_secs(30),
+                    Duration::from_secs(300),
+                    0,
+                    atomic_file_writes,
+                );
                 let dest_dir = TempDir::new().unwrap();
-                run_mirror(
-                    MirrorConfig::new(server_url, file_url_from_path(dest_dir.path()))
-                        .skip_optional()
-                        .concurrency(1)
-                        .high(63),
-                )
-                .await
-                .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
+                let mut config = MirrorConfig::new(server_url, file_url_from_path(dest_dir.path()))
+                    .skip_optional()
+                    .concurrency(1)
+                    .high(63)
+                    .storage_config(storage_config);
+                if verify {
+                    config = config.verify();
+                }
+                run_mirror(config)
+                    .await
+                    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)
             }
         }
     }
@@ -68,10 +95,18 @@ impl Operation {
 
 /// Tests that transient errors on .well-known/stellar-history.json trigger retries.
 #[rstest]
-#[case::scan(Operation::Scan)]
-#[case::mirror(Operation::Mirror)]
+#[case::scan(Operation::Scan, false, false)]
+#[case::scan_verify(Operation::Scan, true, false)]
+#[case::mirror(Operation::Mirror, false, false)]
+#[case::mirror_verify(Operation::Mirror, true, false)]
+#[case::mirror_atomic(Operation::Mirror, false, true)]
+#[case::mirror_verify_atomic(Operation::Mirror, true, true)]
 #[tokio::test]
-async fn test_retries_on_transient_well_known_errors(#[case] op: Operation) {
+async fn test_retries_on_transient_well_known_errors(
+    #[case] op: Operation,
+    #[case] verify: bool,
+    #[case] atomic: bool,
+) {
     let archive_path = test_archive_path();
 
     for (status_code, description) in transient_http_errors() {
@@ -83,7 +118,7 @@ async fn test_retries_on_transient_well_known_errors(#[case] op: Operation) {
         );
         let (server_url, tracker, handle) = start_flaky_server(config).await;
 
-        let result = op.run(&server_url).await;
+        let result = op.run(&server_url, verify, atomic).await;
         handle.abort();
 
         // Verify retries occurred on .well-known
@@ -95,13 +130,15 @@ async fn test_retries_on_transient_well_known_errors(#[case] op: Operation) {
 
         assert!(
             well_known_count > 1,
-            "{op:?}: HTTP {status_code} ({description}) on .well-known should trigger retries, got count: {well_known_count}"
+            "{op:?} (verify={verify}, atomic={atomic}): HTTP {status_code} ({description}) on .well-known should trigger retries, got count: {well_known_count}"
         );
 
         assert!(
             result.is_ok(),
-            "{:?} should succeed after retrying .well-known HTTP {} ({}): {:?}",
+            "{:?} (verify={}, atomic={}) should succeed after retrying .well-known HTTP {} ({}): {:?}",
             op,
+            verify,
+            atomic,
             status_code,
             description,
             result.err()
@@ -110,10 +147,18 @@ async fn test_retries_on_transient_well_known_errors(#[case] op: Operation) {
 }
 
 #[rstest]
-#[case::scan(Operation::Scan)]
-#[case::mirror(Operation::Mirror)]
+#[case::scan(Operation::Scan, false, false)]
+#[case::scan_verify(Operation::Scan, true, false)]
+#[case::mirror(Operation::Mirror, false, false)]
+#[case::mirror_verify(Operation::Mirror, true, false)]
+#[case::mirror_atomic(Operation::Mirror, false, true)]
+#[case::mirror_verify_atomic(Operation::Mirror, true, true)]
 #[tokio::test]
-async fn test_retries_on_transient_http_errors(#[case] op: Operation) {
+async fn test_retries_on_transient_http_errors(
+    #[case] op: Operation,
+    #[case] verify: bool,
+    #[case] atomic: bool,
+) {
     let archive_path = test_archive_path();
 
     for (status_code, description) in transient_http_errors() {
@@ -125,15 +170,17 @@ async fn test_retries_on_transient_http_errors(#[case] op: Operation) {
         );
         let (server_url, tracker, handle) = start_flaky_server(config).await;
 
-        let result = op.run(&server_url).await;
+        let result = op.run(&server_url, verify, atomic).await;
         handle.abort();
 
         let failure_type = format!("HTTP {status_code} ({description})");
         verify_retries_occurred(&tracker, op, &failure_type);
         assert!(
             result.is_ok(),
-            "{:?} should succeed after retrying {}: {:?}",
+            "{:?} (verify={}, atomic={}) should succeed after retrying {}: {:?}",
             op,
+            verify,
+            atomic,
             failure_type,
             result.err()
         );
@@ -141,10 +188,18 @@ async fn test_retries_on_transient_http_errors(#[case] op: Operation) {
 }
 
 #[rstest]
-#[case::scan(Operation::Scan)]
-#[case::mirror(Operation::Mirror)]
+#[case::scan(Operation::Scan, false, false)]
+#[case::scan_verify(Operation::Scan, true, false)]
+#[case::mirror(Operation::Mirror, false, false)]
+#[case::mirror_verify(Operation::Mirror, true, false)]
+#[case::mirror_atomic(Operation::Mirror, false, true)]
+#[case::mirror_verify_atomic(Operation::Mirror, true, true)]
 #[tokio::test]
-async fn test_retries_on_connection_drops(#[case] op: Operation) {
+async fn test_retries_on_connection_drops(
+    #[case] op: Operation,
+    #[case] verify: bool,
+    #[case] atomic: bool,
+) {
     let archive_path = test_archive_path();
 
     let config = FlakyServerConfig::archive_connection_drop(
@@ -154,14 +209,16 @@ async fn test_retries_on_connection_drops(#[case] op: Operation) {
     );
     let (server_url, tracker, handle) = start_flaky_server(config).await;
 
-    let result = op.run(&server_url).await;
+    let result = op.run(&server_url, verify, atomic).await;
     handle.abort();
 
     verify_retries_occurred(&tracker, op, "connection drop");
     assert!(
         result.is_ok(),
-        "{:?} should succeed after retrying connection drops: {:?}",
+        "{:?} (verify={}, atomic={}) should succeed after retrying connection drops: {:?}",
         op,
+        verify,
+        atomic,
         result.err()
     );
 }
@@ -239,10 +296,18 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
 //=============================================================================
 
 #[rstest]
-#[case::scan(Operation::Scan)]
-#[case::mirror(Operation::Mirror)]
+#[case::scan(Operation::Scan, false, false)]
+#[case::scan_verify(Operation::Scan, true, false)]
+#[case::mirror(Operation::Mirror, false, false)]
+#[case::mirror_verify(Operation::Mirror, true, false)]
+#[case::mirror_atomic(Operation::Mirror, false, true)]
+#[case::mirror_verify_atomic(Operation::Mirror, true, true)]
 #[tokio::test]
-async fn test_fails_on_permanent_http_errors(#[case] op: Operation) {
+async fn test_fails_on_permanent_http_errors(
+    #[case] op: Operation,
+    #[case] verify: bool,
+    #[case] atomic: bool,
+) {
     let archive_path = test_archive_path();
 
     for (status_code, description) in PERMANENT_HTTP_ERRORS {
@@ -254,12 +319,12 @@ async fn test_fails_on_permanent_http_errors(#[case] op: Operation) {
         );
         let (server_url, tracker, handle) = start_flaky_server(config).await;
 
-        let result = op.run(&server_url).await;
+        let result = op.run(&server_url, verify, atomic).await;
         handle.abort();
 
         assert!(
             result.is_err(),
-            "{op:?} should fail on HTTP {status_code} ({description})"
+            "{op:?} (verify={verify}, atomic={atomic}) should fail on HTTP {status_code} ({description})"
         );
 
         // Verify no retries occurred - each path should only be requested once
@@ -270,7 +335,7 @@ async fn test_fails_on_permanent_http_errors(#[case] op: Operation) {
             .collect();
         assert!(
             retried.is_empty(),
-            "{op:?}: HTTP {status_code} ({description}) should not trigger retries, but these paths were retried: {retried:?}"
+            "{op:?} (verify={verify}, atomic={atomic}): HTTP {status_code} ({description}) should not trigger retries, but these paths were retried: {retried:?}"
         );
     }
 }
@@ -394,12 +459,18 @@ async fn test_scan_head_response_handling(
 /// The server sends 200 OK with Content-Length but drops the connection after
 /// sending partial data (25%). The pipeline detects this and retries the entire
 /// file download from scratch, ensuring the destination file is not corrupted.
-/// Tests both with and without atomic file writes
+/// When verify=true, also independently verifies each bucket file's SHA256 hash
+/// by decompressing and hashing, comparing against the hash in the filename.
 #[rstest]
-#[case::with_atomic_writes(true)]
-#[case::without_atomic_writes(false)]
+#[case::atomic_no_verify(true, false)]
+#[case::atomic_with_verify(true, true)]
+#[case::non_atomic_no_verify(false, false)]
+#[case::non_atomic_with_verify(false, true)]
 #[tokio::test]
-async fn test_partial_body_retry_succeeds_without_corruption(#[case] atomic_file_writes: bool) {
+async fn test_partial_body_retry_succeeds_without_corruption(
+    #[case] atomic_file_writes: bool,
+    #[case] verify: bool,
+) {
     use crate::storage::StorageConfig;
     use std::time::Duration;
 
@@ -424,11 +495,15 @@ async fn test_partial_body_retry_succeeds_without_corruption(#[case] atomic_file
     );
 
     let dest_dir = TempDir::new().unwrap();
-    let mirror_config = MirrorConfig::new(&server_url, file_url_from_path(dest_dir.path()))
+    let mut mirror_config = MirrorConfig::new(&server_url, file_url_from_path(dest_dir.path()))
         .skip_optional()
         .concurrency(1)
         .high(63)
         .storage_config(storage_config);
+
+    if verify {
+        mirror_config = mirror_config.verify();
+    }
 
     let result = run_mirror(mirror_config).await;
     handle.abort();
@@ -436,8 +511,9 @@ async fn test_partial_body_retry_succeeds_without_corruption(#[case] atomic_file
     // Mirror should succeed
     assert!(
         result.is_ok(),
-        "Mirror (atomic_writes={}) should complete successfully: {:?}",
+        "Mirror (atomic_writes={}, verify={}) should complete successfully: {:?}",
         atomic_file_writes,
+        verify,
         result.err()
     );
 
@@ -452,7 +528,7 @@ async fn test_partial_body_retry_succeeds_without_corruption(#[case] atomic_file
         "Expected bucket files to be retried, got counts: {counts:?}"
     );
 
-    // Find any files with wrong sizes
+    // Verify file sizes match source
     let dest_bucket_dir = dest_dir.path().join("bucket");
     let mut corrupted_files = Vec::new();
 
@@ -472,12 +548,79 @@ async fn test_partial_body_retry_succeeds_without_corruption(#[case] atomic_file
         }
     }
 
-    // Assert that no corruption occurred
     assert!(
         corrupted_files.is_empty(),
-        "Expected no corrupted files (atomic_writes={}), but found {} corrupted files: {:?}",
+        "Expected no corrupted files (atomic_writes={}, verify={}), but found {} corrupted: {:?}",
         atomic_file_writes,
+        verify,
         corrupted_files.len(),
         corrupted_files
     );
+
+    // When verify is enabled, also independently verify bucket hashes
+    if verify {
+        use flate2::read::GzDecoder;
+        use sha2::{Digest, Sha256};
+        use std::io::Read;
+
+        let mut verified_count = 0;
+        let mut hash_errors = Vec::new();
+
+        for entry in walkdir::WalkDir::new(&dest_bucket_dir)
+            .into_iter()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_type().is_file())
+        {
+            let path = entry.path();
+            let filename = path.file_name().unwrap().to_str().unwrap();
+
+            // Skip non-bucket files
+            if !filename.starts_with("bucket-") || !filename.ends_with(".xdr.gz") {
+                continue;
+            }
+
+            // Extract expected hash from filename (bucket-{hash}.xdr.gz)
+            let expected_hash = filename
+                .strip_prefix("bucket-")
+                .and_then(|s| s.strip_suffix(".xdr.gz"))
+                .unwrap();
+
+            // Read, decompress, and hash
+            let compressed_data = std::fs::read(path).unwrap();
+            let mut decoder = GzDecoder::new(&compressed_data[..]);
+            let mut decompressed = Vec::new();
+
+            match decoder.read_to_end(&mut decompressed) {
+                Ok(_) => {
+                    let mut hasher = Sha256::new();
+                    hasher.update(&decompressed);
+                    let actual_hash = hex::encode(hasher.finalize());
+
+                    if actual_hash == expected_hash {
+                        verified_count += 1;
+                    } else {
+                        hash_errors.push(format!(
+                            "{}: expected {}, got {}",
+                            filename, expected_hash, actual_hash
+                        ));
+                    }
+                }
+                Err(e) => {
+                    hash_errors.push(format!("{}: decompression failed: {}", filename, e));
+                }
+            }
+        }
+
+        assert!(
+            hash_errors.is_empty(),
+            "Bucket hash verification failed (atomic_writes={}): {:?}",
+            atomic_file_writes,
+            hash_errors
+        );
+
+        assert!(
+            verified_count > 0,
+            "Expected to verify at least one bucket file"
+        );
+    }
 }

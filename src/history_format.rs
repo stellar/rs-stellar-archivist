@@ -430,6 +430,7 @@ pub fn checkpoint_from_filename(filename: &str) -> Option<u32> {
 }
 
 /// Extract bucket hash from a bucket filename like "bucket-b5c7cd74192aa750429bfaa8cde27a41a729643a194fb474be765da982ece22a.xdr.gz"
+/// Returns lowercase hash for consistent comparison with hex::encode output.
 #[must_use]
 pub fn bucket_hash_from_filename(filename: &str) -> Option<String> {
     if !filename.starts_with("bucket-") {
@@ -441,10 +442,24 @@ pub fn bucket_hash_from_filename(filename: &str) -> Option<String> {
 
     // Validate it's a proper bucket hash (64 hex chars)
     if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
-        Some(hash.to_string())
+        Some(hash.to_ascii_lowercase())
     } else {
         None
     }
+}
+
+pub fn bucket_hash_from_path(path: &str) -> Option<String> {
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|f| f.to_str())?;
+    bucket_hash_from_filename(filename)
+}
+
+/// Check if a path is a bucket file.
+pub fn is_bucket_file(path: &str) -> bool {
+    path.starts_with("bucket/")
+        && path.ends_with(".xdr.gz")
+        && bucket_hash_from_path(path).is_some()
 }
 
 // Generate archive path for checkpoint file using string category (for backwards compatibility)
