@@ -7,14 +7,28 @@ authors = ["Stellar Development Foundation <info@stellar.org>"]
 license = "Apache-2.0"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.74.0"
+rust-version = "1.89.0"
 
 [lib]
 name = "stellar_archivist"
 
 [features]
-default = ["cli"]
+default = ["cli", "opendal-all"]
 cli = ["dep:clap", "dep:tracing-subscriber"]
+
+# OpenDAL-based storage backends (fs and http are always enabled)
+opendal-s3 = ["opendal/services-s3"]
+opendal-gcs = ["opendal/services-gcs"]
+opendal-azblob = ["opendal/services-azblob"]
+opendal-b2 = ["opendal/services-b2"]
+opendal-sftp = ["opendal/services-sftp"] # Unix-only (uses openssh)
+opendal-swift = ["opendal/services-swift"]
+
+# Convenience feature to enable all cross-platform cloud storage backends
+opendal-all = ["opendal-s3", "opendal-gcs", "opendal-azblob", "opendal-b2", "opendal-swift"]
+
+# Unix-only backends (includes SFTP)
+opendal-unix = ["opendal-sftp"]
 
 [[bin]]
 name = "stellar-archivist"
@@ -33,13 +47,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "ansi"]
 futures-util = { version = "0.3" }
 url = { version = "2.5" }
 async-trait = "0.1"
-reqwest = { version = "0.12", default-features = false, features = [
-    "rustls-tls",        # TLS backend (force rustls, no native-tls)
-    "http2",             # Enable HTTP/2 support
-    "stream",            # Streaming responses
-] }
 tokio-util = { version = "0.7.16", features = ["compat", "io"] }
 lru = { version = "0.12" }
+opendal = { version = "0.55", default-features = false, features = ["services-fs", "services-http", "layers-throttle"] }
+bytes = { version = "1" }
+futures-io = { version = "0.3" }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+normalize-path = { version = "0.2.1" }
 
 [dev-dependencies]
 tempfile = { version = "3.5.0" }
@@ -50,3 +64,4 @@ tower = { version = "0.5" }
 tower-http = { version = "0.6", features = ["fs"] }
 walkdir = { version = "2" }
 wiremock = { version = "0.6" }
+path-slash = { version = "0.2" }

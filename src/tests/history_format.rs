@@ -182,9 +182,8 @@ fn test_optional_fields(
     let serialized = serde_json::to_string(&has).unwrap();
     for field in &fields_to_remove {
         assert!(
-            !serialized.contains(&format!("\"{}\"", field)),
-            "Serialized JSON should not contain removed field: {}",
-            field
+            !serialized.contains(&format!("\"{field}\"")),
+            "Serialized JSON should not contain removed field: {field}"
         );
     }
 }
@@ -219,9 +218,7 @@ fn test_invalid_current_ledger(
             error,
             crate::history_format::Error::InvalidCurrentLedger { .. }
         ),
-        "Expected InvalidCurrentLedger for ledger {}, got {:?}",
-        ledger,
-        error
+        "Expected InvalidCurrentLedger for ledger {ledger}, got {error:?}"
     );
 }
 
@@ -259,9 +256,7 @@ fn test_invalid_next_state_structure(
     let error = has.validate().unwrap_err();
     assert!(
         matches!(error, crate::history_format::Error::InvalidNextState { state: s, .. } if s == expected_state),
-        "Expected InvalidNextState with state {}, got {:?}",
-        expected_state,
-        error
+        "Expected InvalidNextState with state {expected_state}, got {error:?}"
     );
 }
 
@@ -419,9 +414,7 @@ fn test_get_checkpoint_range(mut canonical_v1_json: serde_json::Value) {
         for checkpoint in checkpoints {
             assert!(
                 is_checkpoint(checkpoint),
-                "Generated checkpoint {} for ledger {} should be valid",
-                checkpoint,
-                ledger
+                "Generated checkpoint {checkpoint} for ledger {ledger} should be valid"
             );
         }
     }

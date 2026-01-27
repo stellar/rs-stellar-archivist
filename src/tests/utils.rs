@@ -8,7 +8,10 @@
 
 #![allow(dead_code)] // Test utilities may not all be used in every test run
 
+use crate::utils::{NON_STANDARD_RETRYABLE_HTTP_ERRORS, STANDARD_RETRYABLE_HTTP_ERRORS};
 use axum::{routing::get_service, Router};
+use normalize_path::NormalizePath;
+use path_slash::PathExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -16,6 +19,7 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
+use url::Url;
 use walkdir::WalkDir;
 
 //=============================================================================
@@ -29,11 +33,25 @@ pub fn test_archive_path() -> PathBuf {
         .join("testnet-archive-small")
 }
 
+pub fn file_url_from_path(path: &Path) -> String {
+    let normalized = path.normalize();
+    Url::from_file_path(&normalized)
+        .unwrap_or_else(|()| panic!("Failed to build file URL for {}", normalized.display()))
+        .to_string()
+}
+
+pub fn path_to_slash_string(path: &Path) -> String {
+    path.normalize().to_slash_lossy().into_owned()
+}
+
 /// Copy the test archive to a destination directory
 pub fn copy_test_archive(dst: &Path) -> Result<(), std::io::Error> {
     let src = test_archive_path();
 
-    for entry in WalkDir::new(&src).into_iter().filter_map(|e| e.ok()) {
+    for entry in WalkDir::new(&src)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
         let src_path = entry.path();
         let relative = src_path.strip_prefix(&src).unwrap();
         let dst_path = dst.join(relative);
@@ -52,11 +70,11 @@ pub fn get_files_by_pattern(archive_path: &Path, pattern: &str) -> Vec<PathBuf> 
     let mut files = Vec::new();
     for entry in WalkDir::new(archive_path)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
     {
         if entry.file_type().is_file() {
             let path = entry.path();
-            let path_str = path.to_string_lossy();
+            let path_str = path_to_slash_string(path);
             if path_str.contains(pattern) {
                 files.push(path.to_path_buf());
             }
@@ -71,7 +89,7 @@ pub fn get_files_by_pattern(archive_path: &Path, pattern: &str) -> Vec<PathBuf> 
 
 /// Start an HTTP server serving the specified archive path using axum/ServeDir
 pub async fn start_http_server(archive_path: &Path) -> (String, tokio::task::JoinHandle<()>) {
-    let app = Router::new().fallback(get_service(ServeDir::new(archive_path.to_path_buf())));
+    let app = Router::new().fallback(get_service(ServeDir::new(archive_path)));
     start_http_server_with_app(app).await
 }
 
@@ -82,7 +100,7 @@ pub async fn start_http_server_with_app(app: Router) -> (String, tokio::task::Jo
         .expect("Failed to bind to address");
 
     let addr = listener.local_addr().expect("Failed to get local address");
-    let url = format!("http://{}", addr);
+    let url = format!("http://{addr}");
 
     let handle = tokio::spawn(async move {
         axum::serve(listener, app)
@@ -199,13 +217,11 @@ impl RequestTracker {
     /// This ensures each file is only downloaded once.
     pub fn record_success(&self, path: &str) {
         let mut fetches = self.successful_fetches.lock().unwrap();
-        if !fetches.insert(path.to_string()) {
-            panic!(
-                "File '{}' was successfully fetched more than once! \
-                 This indicates a bug in deduplication or caching logic.",
-                path
-            );
-        }
+        assert!(
+            fetches.insert(path.to_string()),
+            "File '{path}' was successfully fetched more than once! \
+                 This indicates a bug in deduplication or caching logic."
+        )
     }
 
     pub fn get_counts(&self) -> HashMap<String, usize> {
@@ -225,12 +241,12 @@ impl RequestTracker {
     /// Returns Ok if delays are within tolerance, Err with details otherwise.
     ///
     /// Expected backoff sequence: 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 5000ms (capped)
-    /// Tolerance allows for timing jitter.
+    /// Tolerance specifies the allowed deviation
     pub fn verify_backoff_timing(
         &self,
         path: &str,
         initial_backoff_ms: u64,
-        tolerance: f64,
+        tolerance_ms: u64,
     ) -> Result<(), String> {
         let timestamps = self.get_timestamps(path);
         if timestamps.len() < 2 {
@@ -241,16 +257,30 @@ impl RequestTracker {
         for i in 1..timestamps.len() {
             let actual_delay = timestamps[i].duration_since(timestamps[i - 1]);
             let actual_ms = actual_delay.as_millis() as u64;
-            let min_expected = (expected_backoff_ms as f64 * tolerance) as u64;
+            let min_expected = expected_backoff_ms.saturating_sub(tolerance_ms);
+            let max_expected = expected_backoff_ms + tolerance_ms;
 
             if actual_ms < min_expected {
                 return Err(format!(
-                    "Retry {} -> {}: delay {}ms is below minimum {}ms (expected ~{}ms)",
+                    "Retry {} -> {}: delay {}ms is below minimum {}ms (expected ~{}ms ±{}ms)",
                     i,
                     i + 1,
                     actual_ms,
                     min_expected,
-                    expected_backoff_ms
+                    expected_backoff_ms,
+                    tolerance_ms
+                ));
+            }
+
+            if actual_ms > max_expected {
+                return Err(format!(
+                    "Retry {} -> {}: delay {}ms exceeds maximum {}ms (expected ~{}ms ±{}ms)",
+                    i,
+                    i + 1,
+                    actual_ms,
+                    max_expected,
+                    expected_backoff_ms,
+                    tolerance_ms
                 ));
             }
 
@@ -301,10 +331,7 @@ pub async fn start_flaky_server(
                 let first_line = request.lines().next().unwrap_or("");
                 let mut parts = first_line.split_whitespace();
                 let method = parts.next().unwrap_or("");
-                let path = parts
-                    .next()
-                    .map(|p| p.trim_start_matches('/'))
-                    .unwrap_or("");
+                let path = parts.next().map_or("", |p| p.trim_start_matches('/'));
                 let is_head = method == "HEAD";
 
                 let count = tracker.increment(path);
@@ -312,16 +339,15 @@ pub async fn start_flaky_server(
                 // Determine the content to serve
                 let content = if let Some(ref archive_path) = cfg.archive_path {
                     let file_path = archive_path.join(path);
-                    match std::fs::read(&file_path) {
-                        Ok(c) => c,
-                        Err(_) => {
-                            // 404 Not Found
-                            let response = "HTTP/1.1 404 Not Found\r\n\
-                                           Content-Length: 0\r\n\
-                                           Connection: close\r\n\r\n";
-                            let _ = socket.write_all(response.as_bytes()).await;
-                            return;
-                        }
+                    if let Ok(c) = std::fs::read(&file_path) {
+                        c
+                    } else {
+                        // 404 Not Found
+                        let response = "HTTP/1.1 404 Not Found\r\n\
+                                       Content-Length: 0\r\n\
+                                       Connection: close\r\n\r\n";
+                        let _ = socket.write_all(response.as_bytes()).await;
+                        return;
                     }
                 } else {
                     Vec::new()
@@ -333,7 +359,7 @@ pub async fn start_flaky_server(
                     && cfg
                         .connection_drop_path_prefix
                         .as_ref()
-                        .map_or(true, |prefix| path.starts_with(prefix));
+                        .is_none_or(|prefix| path.starts_with(prefix));
 
                 if should_drop {
                     // Just drop the socket without sending any response
@@ -347,7 +373,7 @@ pub async fn start_flaky_server(
                     && cfg
                         .error_status_path_prefix
                         .as_ref()
-                        .map_or(true, |prefix| path.starts_with(prefix));
+                        .is_none_or(|prefix| path.starts_with(prefix));
 
                 if should_status_error {
                     let status = cfg.error_status_code.unwrap();
@@ -364,10 +390,9 @@ pub async fn start_flaky_server(
                         _ => "Error",
                     };
                     let response = format!(
-                        "HTTP/1.1 {} {}\r\n\
+                        "HTTP/1.1 {status} {reason}\r\n\
                          Content-Length: 0\r\n\
-                         Connection: close\r\n\r\n",
-                        status, reason
+                         Connection: close\r\n\r\n"
                     );
                     let _ = socket.write_all(response.as_bytes()).await;
                     return;
@@ -379,7 +404,7 @@ pub async fn start_flaky_server(
                     && cfg
                         .partial_body_path_prefix
                         .as_ref()
-                        .map_or(true, |prefix| path.starts_with(prefix));
+                        .is_none_or(|prefix| path.starts_with(prefix));
 
                 if should_partial_fail {
                     // Send 200 OK with full Content-Length, but only partial body
@@ -422,25 +447,18 @@ pub async fn start_flaky_server(
     // Give the server time to start
     tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
 
-    (format!("http://{}", addr), tracker, handle)
+    (format!("http://{addr}"), tracker, handle)
 }
 
-//=============================================================================
-// HTTP Error Constants
-//=============================================================================
-
-/// Transient HTTP errors that should trigger retry behavior.
-/// These are recoverable errors where retrying may succeed.
-pub const TRANSIENT_HTTP_ERRORS: &[(u16, &str)] = &[
-    (500, "Internal Server Error"),
-    (502, "Bad Gateway"),
-    (503, "Service Unavailable"),
-    (504, "Gateway Timeout"),
-    (429, "Too Many Requests"),
-    (408, "Request Timeout"),
-];
-
-/// Permanent HTTP errors that should not trigger retry behavior.
-/// These indicate a definitive failure condition.
-pub const PERMANENT_HTTP_ERRORS: &[(u16, &str)] =
-    &[(404, "Not Found"), (403, "Forbidden"), (400, "Bad Request")];
+/// Returns all transient HTTP errors that should trigger retry behavior.
+///
+/// This combines:
+/// - Standard HTTP errors (500, 502, 503, 504) - handled by `OpenDAL` natively
+/// - Non-standard errors (429, Cloudflare, proxy, etc.) - handled by our `RetryableErrorLayer`
+pub fn transient_http_errors() -> Vec<(u16, &'static str)> {
+    STANDARD_RETRYABLE_HTTP_ERRORS
+        .iter()
+        .chain(NON_STANDARD_RETRYABLE_HTTP_ERRORS.iter())
+        .copied()
+        .collect()
+}

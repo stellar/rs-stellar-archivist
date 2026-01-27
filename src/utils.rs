@@ -1,3 +1,4 @@
+use bytes::Buf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
@@ -6,6 +7,45 @@ use tracing::{debug, error, info, warn};
 use crate::history_format::{self, HistoryFileState};
 use crate::pipeline;
 use crate::storage::StorageRef;
+
+//=============================================================================
+// Retryable HTTP Error Codes
+//=============================================================================
+
+/// Standard HTTP server errors that are typically retried (500, 502, 503, 504).
+pub const STANDARD_RETRYABLE_HTTP_ERRORS: &[(u16, &str)] = &[
+    (500, "Internal Server Error"),
+    (502, "Bad Gateway"),
+    (503, "Service Unavailable"),
+    (504, "Gateway Timeout"),
+];
+
+/// Non-standard HTTP status codes that should be treated as retryable.
+///
+/// References:
+/// - Cloudflare: <https://developers.cloudflare.com/support/troubleshooting/cloudflare-errors/troubleshooting-cloudflare-5xx-errors>/
+/// - Unofficial codes: <https://en.wikipedia.org/wiki/List_of_HTTP_status_codes#Unofficial_codes>
+pub const NON_STANDARD_RETRYABLE_HTTP_ERRORS: &[(u16, &str)] = &[
+    // Standard retryable errors that some clients don't retry by default
+    (408, "Request Timeout"),
+    (429, "Too Many Requests"),
+    // Cloudflare-specific errors
+    (520, "Cloudflare Unknown Error"),
+    (521, "Cloudflare Web Server Is Down"),
+    (522, "Cloudflare Connection Timed Out"),
+    (523, "Cloudflare Origin Is Unreachable"),
+    (524, "Cloudflare A Timeout Occurred"),
+    (530, "Cloudflare Origin DNS Error"),
+    // Informal/proxy-specific errors
+    (509, "Bandwidth Limit Exceeded"), // Apache/cPanel
+    (529, "Site is Overloaded"),       // Qualys SSLLabs
+    (598, "Network Read Timeout"),     // Informal, nginx
+    (599, "Network Connect Timeout"),  // Informal, nginx
+];
+
+//=============================================================================
+// Error Types
+//=============================================================================
 
 /// Utils module errors - just wraps errors from other modules
 #[derive(Error, Debug)]
@@ -32,6 +72,7 @@ pub enum Error {
 }
 
 /// Helper function to map pipeline errors to library errors
+#[must_use]
 pub fn map_pipeline_error(err: pipeline::Error) -> crate::Error {
     match err {
         pipeline::Error::ScanOperation(scan_err) => crate::Error::ScanOperation(scan_err),
@@ -68,7 +109,14 @@ pub struct ArchiveStats {
     pub failed_list: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
+impl Default for ArchiveStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ArchiveStats {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             successful_files: AtomicU64::new(0),
@@ -195,6 +243,7 @@ pub struct RetryState {
 }
 
 impl RetryState {
+    #[must_use]
     pub fn new(max_retries: u32, initial_backoff_ms: u64) -> Self {
         Self {
             attempt: 0,
@@ -203,10 +252,36 @@ impl RetryState {
         }
     }
 
-    /// Record an attempt and return true if we should retry, false if max retries exceeded
-    pub fn record_attempt(&mut self) -> bool {
-        self.attempt += 1;
-        self.attempt <= self.max_retries
+    /// Evaluate an error and determine if we should retry.
+    ///
+    /// If the error is retryable and we haven't exhausted retries:
+    /// - Logs retry count
+    /// - Returns true (caller should call `backoff()` and retry)
+    ///
+    /// If the error is not retryable or retries are exhausted:
+    /// - Logs an error
+    /// - Returns false (caller should record failure and stop)
+    pub fn should_retry(
+        &mut self,
+        error: &crate::storage::Error,
+        action: &str,
+        path: &str,
+    ) -> bool {
+        use crate::storage::ErrorClass;
+
+        if error.class == ErrorClass::Retry {
+            self.attempt += 1;
+            if self.attempt <= self.max_retries {
+                debug!(
+                    "Retry {}/{} {} {}: {}",
+                    self.attempt, self.max_retries, action, path, error
+                );
+                return true;
+            }
+        }
+
+        error!("Failed to {} {}: {}", action, path, error);
+        false
     }
 
     /// Wait for the backoff period and increase it for next time
@@ -217,75 +292,74 @@ impl RetryState {
 }
 
 /// Fetch and validate .well-known/stellar-history.json from store
+///
+/// Parameters:
+/// - `store`: The storage backend to fetch from
+/// - `max_retries`: Maximum number of retry attempts (0 for no retries, e.g., for local filesystem)
+/// - `retry_min_delay_ms`: Initial backoff delay in milliseconds
 pub async fn fetch_well_known_history_file(
     store: &StorageRef,
     max_retries: u32,
-    initial_backoff_ms: u64,
+    retry_min_delay_ms: u64,
 ) -> Result<HistoryFileState, Error> {
     use crate::history_format::ROOT_WELL_KNOWN_PATH;
-    use crate::storage::ErrorClass;
-    use tokio::io::AsyncReadExt;
+    use futures_util::TryStreamExt;
+    use opendal::Buffer;
 
     debug!("Fetching .well-known from path: {}", ROOT_WELL_KNOWN_PATH);
 
-    let mut retry = RetryState::new(max_retries, initial_backoff_ms);
+    let mut retry_state = RetryState::new(max_retries, retry_min_delay_ms);
 
-    loop {
-        // Try to open and read the file
-        let result: Result<Vec<u8>, (ErrorClass, String)> = async {
-            let mut reader = store.open_reader(ROOT_WELL_KNOWN_PATH).await.map_err(|e| {
-                (
-                    e.class,
-                    format!("Failed to open {}: {}", ROOT_WELL_KNOWN_PATH, e),
-                )
-            })?;
-
-            let mut buffer = Vec::new();
-            reader.read_to_end(&mut buffer).await.map_err(|e| {
-                // IO errors during read are typically retryable
-                (
-                    ErrorClass::Retry,
-                    format!("Reading {}: {}", ROOT_WELL_KNOWN_PATH, e),
-                )
-            })?;
-
+    // Download the .well-known file with retries at this level
+    let buffer = loop {
+        let download_result: Result<Buffer, crate::storage::Error> = async {
+            let reader = store.open_reader(ROOT_WELL_KNOWN_PATH).await?;
+            // Convert to stream and collect all chunks
+            let stream = reader
+                .into_stream(..)
+                .await
+                .map_err(|e| crate::storage::from_opendal_error(e, "Stream error"))?;
+            let chunks: Vec<Buffer> = stream
+                .try_collect()
+                .await
+                .map_err(|e| crate::storage::from_opendal_error(e, "Read error"))?;
+            // Merge chunks into a single buffer
+            let buffer: Buffer = chunks.into_iter().flatten().collect();
             Ok(buffer)
         }
         .await;
 
-        match result {
-            Ok(buffer) => {
-                // Parse the JSON
-                let state: HistoryFileState = serde_json::from_slice(&buffer).map_err(|e| {
-                    crate::history_format::Error::InvalidJson {
-                        path: ROOT_WELL_KNOWN_PATH.to_string(),
-                        error: e.to_string(),
-                    }
-                })?;
-
-                // Validate the .well-known format
-                state.validate()?;
-
-                return Ok(state);
-            }
-            Err((error_class, msg)) => {
-                if matches!(error_class, ErrorClass::Retry) && retry.record_attempt() {
-                    debug!(
-                        "Retrying {} (attempt {}/{}): {}, backing off {}ms",
-                        ROOT_WELL_KNOWN_PATH,
-                        retry.attempt,
-                        retry.max_retries,
-                        msg,
-                        retry.backoff_ms
-                    );
-                    retry.backoff().await;
+        match download_result {
+            Ok(buf) => break buf,
+            Err(e) => {
+                if retry_state.should_retry(&e, "download", ROOT_WELL_KNOWN_PATH) {
+                    retry_state.backoff().await;
                     continue;
                 }
-
-                return Err(std::io::Error::new(std::io::ErrorKind::Other, msg).into());
+                return Err(std::io::Error::other(format!(
+                    "Failed to fetch {ROOT_WELL_KNOWN_PATH}: {e}"
+                ))
+                .into());
             }
         }
+    };
+
+    // Parse the JSON
+    tracing::debug!("Read {} bytes from {}", buffer.len(), ROOT_WELL_KNOWN_PATH);
+    if buffer.len() < 200 {
+        tracing::debug!("Content: {:?}", String::from_utf8_lossy(&buffer.to_vec()));
     }
+    let state: HistoryFileState = serde_json::from_reader(buffer.reader()).map_err(|e| {
+        crate::history_format::Error::InvalidJson {
+            path: ROOT_WELL_KNOWN_PATH.to_string(),
+            error: e.to_string(),
+        }
+    })?;
+
+    // Validate the .well-known format
+    state.validate()?;
+
+    Ok(state)
 }
 
 /// Compute checkpoint bounds using a pre-fetched source checkpoint

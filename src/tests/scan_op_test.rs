@@ -1,8 +1,11 @@
 //! Tests for scan command operations
 
-use super::utils::{copy_test_archive, get_files_by_pattern, start_http_server, test_archive_path};
-use crate::storage::{HttpStore, Storage};
-use crate::test_helpers::{run_scan, ScanConfig};
+use super::utils::{
+    copy_test_archive, file_url_from_path, get_files_by_pattern, start_http_server,
+    test_archive_path,
+};
+use crate::storage::{OpendalStore, Storage, StorageConfig};
+use crate::test_helpers::{run_scan, test_storage_config, ScanConfig};
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rstest::rstest;
@@ -94,11 +97,12 @@ async fn remove_bucket_and_verify_scan_fails(
             std::fs::remove_file(bucket_file).expect("Failed to remove bucket file");
 
             let scan_config = ScanConfig {
-                archive: format!("file://{}", archive_path.to_str().unwrap()),
+                archive: file_url_from_path(archive_path),
                 concurrency: 8,
                 skip_optional: false,
                 low: None,
                 high: None,
+                storage_config: test_storage_config(),
             };
 
             run_scan(scan_config).await.expect_err(error_msg);
@@ -113,7 +117,7 @@ async fn remove_bucket_and_verify_scan_fails(
 
 #[tokio::test]
 async fn test_scan_low_beyond_current() {
-    let archive = format!("file://{}", test_archive_path().display());
+    let archive = file_url_from_path(&test_archive_path());
 
     // Test with low beyond the archive's current ledger - should fail
     let result = run_scan(ScanConfig::new(&archive).skip_optional().low(20000)).await;
@@ -125,7 +129,7 @@ async fn test_scan_low_beyond_current() {
 
 #[tokio::test]
 async fn test_scan_high_beyond_current() {
-    let archive = format!("file://{}", test_archive_path().display());
+    let archive = file_url_from_path(&test_archive_path());
 
     // Test with high beyond the archive's current ledger - should warn but not fail
     let result = run_scan(ScanConfig::new(&archive).skip_optional().high(20000)).await;
@@ -185,7 +189,7 @@ async fn test_scan_detects_missing_bucket(#[case] source: BucketSource, #[case] 
     remove_bucket_and_verify_scan_fails(
         archive_path,
         &bucket_to_remove,
-        &format!("Scan should fail with missing {}", description),
+        &format!("Scan should fail with missing {description}"),
     )
     .await;
 }
@@ -236,8 +240,7 @@ async fn test_scan_detects_corrupt_files(
                 .collect();
             assert!(
                 !files.is_empty(),
-                "Test archive must have files matching pattern '{}'",
-                pattern
+                "Test archive must have files matching pattern '{pattern}'"
             );
             remove_random_file(&files);
         }
@@ -248,8 +251,7 @@ async fn test_scan_detects_corrupt_files(
                 .collect();
             assert!(
                 !files.is_empty(),
-                "Test archive must have files matching pattern '{}'",
-                pattern
+                "Test archive must have files matching pattern '{pattern}'"
             );
             let mut rng = StdRng::from_entropy();
             let idx = rng.gen_range(0..files.len());
@@ -261,16 +263,17 @@ async fn test_scan_detects_corrupt_files(
     }
 
     let scan_config = ScanConfig {
-        archive: format!("file://{}", archive_path.to_str().unwrap()),
+        archive: file_url_from_path(archive_path),
         concurrency: 8,
         skip_optional: false,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     };
 
     run_scan(scan_config)
         .await
-        .expect_err(&format!("Scan should fail with {}", description));
+        .expect_err(&format!("Scan should fail with {description}"));
 }
 
 #[tokio::test]
@@ -287,11 +290,12 @@ async fn test_scan_missing_scp_with_optional_flag() {
 
     // First scan with skip_optional: false - should fail
     let scan_required = ScanConfig {
-        archive: format!("file://{}", archive_path.to_str().unwrap()),
+        archive: file_url_from_path(archive_path),
         concurrency: 8,
         skip_optional: false, // SCP files are required
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     };
 
     run_scan(scan_required)
@@ -300,11 +304,12 @@ async fn test_scan_missing_scp_with_optional_flag() {
 
     // Second scan with skip_optional: true - should succeed
     let scan_optional = ScanConfig {
-        archive: format!("file://{}", archive_path.to_str().unwrap()),
+        archive: file_url_from_path(archive_path),
         concurrency: 8,
         skip_optional: true, // SCP files are optional
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     };
 
     run_scan(scan_optional)
@@ -319,11 +324,12 @@ async fn test_scan_complete_archive() {
     let test_archive_path = test_archive_path();
 
     let scan_config = ScanConfig {
-        archive: format!("file://{}", test_archive_path.display()),
+        archive: file_url_from_path(&test_archive_path),
         concurrency: 8,
         skip_optional: false,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     };
 
     // Scan should succeed on complete archive
@@ -348,11 +354,12 @@ async fn test_scan_http_archive() {
         skip_optional: false,
         low: None,
         high: None,
+        storage_config: test_storage_config(),
     };
 
     run_scan(scan_config).await.unwrap_or_else(|e| {
         server_handle.abort();
-        panic!("HTTP scan failed: {}", e);
+        panic!("HTTP scan failed: {e}");
     });
 
     server_handle.abort();
@@ -361,25 +368,48 @@ async fn test_scan_http_archive() {
 /// Smoke test against live Stellar archive infrastructure.
 /// Tests HTTP/HTTPS connections and trailing slash URL handling.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires network access to live Stellar archive"]
 async fn smoke_live_stellar_archive_connection() {
+    use std::time::Duration;
+
     let urls = [
         "http://history.stellar.org/prd/core-live/core_live_001",
         "https://history.stellar.org/prd/core-live/core_live_001/",
     ];
 
     for url_str in urls {
-        let store = HttpStore::new(url_str.parse().unwrap());
-        let mut reader = store
+        let config = StorageConfig::new(
+            3,                          // max_retries
+            Duration::from_millis(100), // retry_min_delay
+            Duration::from_secs(30),    // retry_max_delay
+            64,                         // max_concurrent
+            Duration::from_secs(30),    // timeout
+            Duration::from_secs(300),   // io_timeout
+            0,                          // bandwidth_limit
+            false,                      // atomic_file_writes
+        );
+        let store = OpendalStore::http(url_str, &config)
+            .unwrap_or_else(|e| panic!("{url_str}: failed to create store: {e}"));
+        let reader = store
             .open_reader(".well-known/stellar-history.json")
             .await
             .unwrap_or_else(|e| panic!("{url_str}: connection failed: {e}"));
 
-        let mut buf = [0u8; 100];
-        let n = tokio::io::AsyncReadExt::read(&mut reader, &mut buf)
+        // Use into_stream to handle chunked transfer encoding properly
+        use futures_util::TryStreamExt;
+        use opendal::Buffer;
+
+        let stream = reader
+            .into_stream(..)
+            .await
+            .unwrap_or_else(|e| panic!("{url_str}: stream failed: {e}"));
+
+        let chunks: Vec<Buffer> = stream
+            .try_collect()
             .await
             .unwrap_or_else(|e| panic!("{url_str}: read failed: {e}"));
 
-        assert!(n > 0, "{url_str}: no data received");
+        let buffer: Buffer = chunks.into_iter().flatten().collect();
+        assert!(!buffer.is_empty(), "{url_str}: no data received");
     }
 }

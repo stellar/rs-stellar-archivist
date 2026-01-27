@@ -133,7 +133,7 @@ impl HistoryFileState {
                 } else if let Some(ref output) = level.next.output {
                     if !is_valid_bucket_hash(output) {
                         return Err(Error::MalformedBucketHash {
-                            reason: format!("invalid hash: {}", output),
+                            reason: format!("invalid hash: {output}"),
                         });
                     }
                 }
@@ -160,7 +160,7 @@ impl HistoryFileState {
                 } else if let Some(ref curr) = level.next.curr {
                     if !is_valid_bucket_hash(curr) {
                         return Err(Error::MalformedBucketHash {
-                            reason: format!("invalid hash: {}", curr),
+                            reason: format!("invalid hash: {curr}"),
                         });
                     }
                 }
@@ -175,16 +175,16 @@ impl HistoryFileState {
                 } else if let Some(ref snap) = level.next.snap {
                     if !is_valid_bucket_hash(snap) {
                         return Err(Error::MalformedBucketHash {
-                            reason: format!("invalid hash: {}", snap),
+                            reason: format!("invalid hash: {snap}"),
                         });
                     }
                 }
 
                 if let Some(ref shadow) = level.next.shadow {
-                    for hash in shadow.iter() {
+                    for hash in shadow {
                         if !is_valid_bucket_hash(hash) {
                             return Err(Error::MalformedBucketHash {
-                                reason: format!("invalid hash: {}", hash),
+                                reason: format!("invalid hash: {hash}"),
                             });
                         }
                     }
@@ -252,6 +252,7 @@ impl HistoryFileState {
     }
 
     // Extract all unique bucket hashes from current state, except for empty buckets with 0 hash
+    #[must_use]
     pub fn buckets(&self) -> Vec<String> {
         let mut result = Vec::new();
 
@@ -317,11 +318,13 @@ impl HistoryFileState {
 }
 
 // Check if ledger is a checkpoint (63, 127, 191, ...)
+#[must_use]
 pub fn is_checkpoint(ledger: u32) -> bool {
-    ledger > 0 && (ledger + 1) % CHECKPOINT_FREQUENCY == 0
+    ledger > 0 && (ledger + 1).is_multiple_of(CHECKPOINT_FREQUENCY)
 }
 
 // Validate bucket hash format (64 hex chars)
+#[must_use]
 pub fn is_valid_bucket_hash(hash: &str) -> bool {
     if hash.len() != 64 {
         return false;
@@ -330,14 +333,15 @@ pub fn is_valid_bucket_hash(hash: &str) -> bool {
     hash.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+#[must_use]
 pub fn is_zero_hash(hash: &str) -> bool {
     hash == "0000000000000000000000000000000000000000000000000000000000000000"
 }
 
 /// Helper function to round to checkpoint boundary
-/// If round_up is true, rounds up; otherwise rounds down
+/// If `round_up` is true, rounds up; otherwise rounds down
 /// If the ledger is already a checkpoint, returns it unchanged
-/// The minimum returned value is GENESIS_CHECKPOINT_LEDGER (63)
+/// The minimum returned value is `GENESIS_CHECKPOINT_LEDGER` (63)
 fn round_to_checkpoint(ledger: u32, round_up: bool) -> u32 {
     if ledger < GENESIS_CHECKPOINT_LEDGER {
         GENESIS_CHECKPOINT_LEDGER
@@ -357,26 +361,27 @@ fn round_to_checkpoint(ledger: u32, round_up: bool) -> u32 {
     }
 }
 
+#[must_use]
 pub fn round_to_lower_checkpoint(ledger: u32) -> u32 {
     round_to_checkpoint(ledger, false)
 }
 
+#[must_use]
 pub fn round_to_upper_checkpoint(ledger: u32) -> u32 {
     round_to_checkpoint(ledger, true)
 }
 
-/// Count the number of checkpoints in the inclusive range [low_checkpoint, high_checkpoint]
+/// Count the number of checkpoints in the inclusive range [`low_checkpoint`, `high_checkpoint`]
 /// Both parameters should already be valid checkpoint values
+#[must_use]
 pub fn count_checkpoints_in_range(low_checkpoint: u32, high_checkpoint: u32) -> usize {
     assert!(
         is_checkpoint(low_checkpoint),
-        "low_checkpoint {} is not a valid checkpoint",
-        low_checkpoint
+        "low_checkpoint {low_checkpoint} is not a valid checkpoint"
     );
     assert!(
         is_checkpoint(high_checkpoint),
-        "high_checkpoint {} is not a valid checkpoint",
-        high_checkpoint
+        "high_checkpoint {high_checkpoint} is not a valid checkpoint"
     );
 
     if high_checkpoint < low_checkpoint {
@@ -387,6 +392,7 @@ pub fn count_checkpoints_in_range(low_checkpoint: u32, high_checkpoint: u32) -> 
 }
 
 // Convert checkpoint to hex path prefix (e.g., "00/00/3f")
+#[must_use]
 pub fn checkpoint_prefix(checkpoint: u32) -> String {
     format!(
         "{:02x}/{:02x}/{:02x}",
@@ -400,7 +406,7 @@ pub fn checkpoint_prefix(checkpoint: u32) -> String {
 pub fn hash_prefix(hash: &str) -> Result<String, Error> {
     if hash.len() < 6 {
         return Err(Error::MalformedBucketHash {
-            reason: format!("hash too short: '{}'", hash),
+            reason: format!("hash too short: '{hash}'"),
         });
     }
     Ok(format!("{}/{}/{}", &hash[0..2], &hash[2..4], &hash[4..6]))
@@ -409,10 +415,11 @@ pub fn hash_prefix(hash: &str) -> Result<String, Error> {
 // Generate archive path for given bucket hash
 pub fn bucket_path(hash: &str) -> Result<String, Error> {
     let prefix = hash_prefix(hash)?;
-    Ok(format!("bucket/{}/bucket-{}.xdr.gz", prefix, hash))
+    Ok(format!("bucket/{prefix}/bucket-{hash}.xdr.gz"))
 }
 
 /// Extract checkpoint number from a checkpoint filename like "history-0000137f.json"
+#[must_use]
 pub fn checkpoint_from_filename(filename: &str) -> Option<u32> {
     let hex_start = filename.rfind('-')?;
     let hex_part = &filename[hex_start + 1..];
@@ -423,6 +430,7 @@ pub fn checkpoint_from_filename(filename: &str) -> Option<u32> {
 }
 
 /// Extract bucket hash from a bucket filename like "bucket-b5c7cd74192aa750429bfaa8cde27a41a729643a194fb474be765da982ece22a.xdr.gz"
+#[must_use]
 pub fn bucket_hash_from_filename(filename: &str) -> Option<String> {
     if !filename.starts_with("bucket-") {
         return None;
@@ -440,6 +448,7 @@ pub fn bucket_hash_from_filename(filename: &str) -> Option<String> {
 }
 
 // Generate archive path for checkpoint file using string category (for backwards compatibility)
+#[must_use]
 pub fn checkpoint_path(category: &str, checkpoint: u32) -> String {
     // All files are compressed except history archive files.
     let ext = match category {
@@ -447,8 +456,5 @@ pub fn checkpoint_path(category: &str, checkpoint: u32) -> String {
         _ => "xdr.gz",
     };
     let prefix = checkpoint_prefix(checkpoint);
-    format!(
-        "{}/{}/{}-{:08x}.{}",
-        category, prefix, category, checkpoint, ext
-    )
+    format!("{category}/{prefix}/{category}-{checkpoint:08x}.{ext}")
 }

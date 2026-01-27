@@ -1,13 +1,13 @@
 //! HTTP error handling tests for scan and mirror operations
 //!
 //! This module tests retry behavior for HTTP errors across both operations:
-//! - Transient errors (5xx, 429, 408) trigger retries with exponential backoff
-//! - Permanent errors (4xx) do not trigger retries
+//! - Transient errors (5xx, 408, 429) trigger retries with exponential backoff
+//! - Permanent errors (4xx except 408, 429) do not trigger retries
 //! - Connection drops trigger retries
 
 use super::utils::{
-    start_flaky_server, start_http_server_with_app, test_archive_path, FlakyServerConfig,
-    RequestTracker, PERMANENT_HTTP_ERRORS, TRANSIENT_HTTP_ERRORS,
+    file_url_from_path, start_flaky_server, start_http_server_with_app, test_archive_path,
+    transient_http_errors, FlakyServerConfig, RequestTracker,
 };
 use crate::test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig};
 use axum::{
@@ -22,6 +22,10 @@ use std::path::PathBuf;
 use tempfile::TempDir;
 use tower::util::ServiceExt;
 use tower_http::services::ServeDir;
+
+/// Permanent HTTP errors that should not trigger retry behavior.
+const PERMANENT_HTTP_ERRORS: &[(u16, &str)] =
+    &[(404, "Not Found"), (403, "Forbidden"), (400, "Bad Request")];
 
 /// Operation type for parameterized tests
 #[derive(Clone, Copy, Debug)]
@@ -46,7 +50,7 @@ impl Operation {
             Operation::Mirror => {
                 let dest_dir = TempDir::new().unwrap();
                 run_mirror(
-                    MirrorConfig::new(server_url, format!("file://{}", dest_dir.path().display()))
+                    MirrorConfig::new(server_url, file_url_from_path(dest_dir.path()))
                         .skip_optional()
                         .concurrency(1)
                         .high(63),
@@ -70,10 +74,10 @@ impl Operation {
 async fn test_retries_on_transient_well_known_errors(#[case] op: Operation) {
     let archive_path = test_archive_path();
 
-    for (status_code, description) in TRANSIENT_HTTP_ERRORS {
+    for (status_code, description) in transient_http_errors() {
         let config = FlakyServerConfig::archive_status_error(
             archive_path.clone(),
-            *status_code,
+            status_code,
             2,              // Fail twice, then succeed
             ".well-known/", // Target the .well-known file
         );
@@ -91,11 +95,7 @@ async fn test_retries_on_transient_well_known_errors(#[case] op: Operation) {
 
         assert!(
             well_known_count > 1,
-            "{:?}: HTTP {} ({}) on .well-known should trigger retries, got count: {}",
-            op,
-            status_code,
-            description,
-            well_known_count
+            "{op:?}: HTTP {status_code} ({description}) on .well-known should trigger retries, got count: {well_known_count}"
         );
 
         assert!(
@@ -106,16 +106,6 @@ async fn test_retries_on_transient_well_known_errors(#[case] op: Operation) {
             description,
             result.err()
         );
-
-        // Verify backoff timing
-        tracker
-            .verify_backoff_timing(".well-known/stellar-history.json", 100, 0.8)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "{:?}: HTTP {} ({}) .well-known backoff timing failed: {}",
-                    op, status_code, description, e
-                )
-            });
     }
 }
 
@@ -126,10 +116,10 @@ async fn test_retries_on_transient_well_known_errors(#[case] op: Operation) {
 async fn test_retries_on_transient_http_errors(#[case] op: Operation) {
     let archive_path = test_archive_path();
 
-    for (status_code, description) in TRANSIENT_HTTP_ERRORS {
+    for (status_code, description) in transient_http_errors() {
         let config = FlakyServerConfig::archive_status_error(
             archive_path.clone(),
-            *status_code,
+            status_code,
             2, // Fail twice, then succeed
             op.path_prefix(),
         );
@@ -138,16 +128,15 @@ async fn test_retries_on_transient_http_errors(#[case] op: Operation) {
         let result = op.run(&server_url).await;
         handle.abort();
 
-        verify_retries_occurred(&tracker, op, *status_code, description);
+        let failure_type = format!("HTTP {status_code} ({description})");
+        verify_retries_occurred(&tracker, op, &failure_type);
         assert!(
             result.is_ok(),
-            "{:?} should succeed after retrying HTTP {} ({}): {:?}",
+            "{:?} should succeed after retrying {}: {:?}",
             op,
-            status_code,
-            description,
+            failure_type,
             result.err()
         );
-        verify_backoff_timing(&tracker, op, *status_code, description);
     }
 }
 
@@ -168,32 +157,80 @@ async fn test_retries_on_connection_drops(#[case] op: Operation) {
     let result = op.run(&server_url).await;
     handle.abort();
 
-    let counts = tracker.get_counts();
-    let retried: Vec<_> = counts
-        .iter()
-        .filter(|(path, count)| path.starts_with(op.path_prefix()) && **count > 1)
-        .collect();
-
-    assert!(
-        !retried.is_empty(),
-        "{:?}: Connection drops should trigger retries, got counts: {:?}",
-        op,
-        counts
-            .iter()
-            .filter(|(p, _)| p.starts_with(op.path_prefix()))
-            .collect::<Vec<_>>()
-    );
+    verify_retries_occurred(&tracker, op, "connection drop");
     assert!(
         result.is_ok(),
         "{:?} should succeed after retrying connection drops: {:?}",
         op,
         result.err()
     );
+}
 
-    if let Some((path, _)) = retried.first() {
-        tracker
-            .verify_backoff_timing(path, 100, 0.8)
-            .unwrap_or_else(|e| panic!("{:?}: Connection drop backoff timing failed: {}", op, e));
+/// Tests that retry delays follow exponential backoff pattern.
+#[rstest]
+#[case::one_failure(1)]
+#[case::two_failures(2)]
+#[case::three_failures(3)]
+#[tokio::test]
+async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
+    use crate::storage::StorageConfig;
+    use std::time::Duration;
+
+    let archive_path = test_archive_path();
+
+    // Use 503 Service Unavailable as a representative transient error
+    let config = FlakyServerConfig::archive_status_error(archive_path, 503, fail_count, "bucket/");
+    let (server_url, tracker, handle) = start_flaky_server(config).await;
+
+    let storage_config = StorageConfig::new(
+        3,
+        Duration::from_secs(1), // Use large timeout values so jitter doesn't affect unit tests.
+        Duration::from_secs(30),
+        64,
+        Duration::from_secs(30),
+        Duration::from_secs(300),
+        0,
+        false,
+    );
+
+    let dest_dir = TempDir::new().unwrap();
+    let result = run_mirror(
+        MirrorConfig::new(&server_url, file_url_from_path(dest_dir.path()))
+            .skip_optional()
+            .concurrency(1)
+            .high(63)
+            .storage_config(storage_config),
+    )
+    .await;
+    handle.abort();
+
+    assert!(
+        result.is_ok(),
+        "Mirror should succeed after {} retries: {:?}",
+        fail_count,
+        result.err()
+    );
+
+    let counts = tracker.get_counts();
+    let retried_paths: Vec<_> = counts
+        .iter()
+        .filter(|(path, count)| path.starts_with("bucket/") && **count == fail_count + 1)
+        .collect();
+
+    assert!(
+        !retried_paths.is_empty(),
+        "Expected at least one bucket file to be retried {} times, got counts: {:?}",
+        fail_count,
+        counts
+            .iter()
+            .filter(|(p, _)| p.starts_with("bucket/"))
+            .collect::<Vec<_>>()
+    );
+
+    for (path, _) in &retried_paths {
+        if let Err(e) = tracker.verify_backoff_timing(path, 1000, 200) {
+            panic!("Exponential backoff failed for {path} with {fail_count} failures: {e}");
+        }
     }
 }
 
@@ -222,26 +259,18 @@ async fn test_fails_on_permanent_http_errors(#[case] op: Operation) {
 
         assert!(
             result.is_err(),
-            "{:?} should fail on HTTP {} ({})",
-            op,
-            status_code,
-            description
+            "{op:?} should fail on HTTP {status_code} ({description})"
         );
 
-        // Verify no retries happened
+        // Verify no retries occurred - each path should only be requested once
         let counts = tracker.get_counts();
         let retried: Vec<_> = counts
             .iter()
             .filter(|(path, count)| path.starts_with(op.path_prefix()) && **count > 1)
             .collect();
-
         assert!(
             retried.is_empty(),
-            "{:?}: HTTP {} ({}) should NOT trigger retries, but got: {:?}",
-            op,
-            status_code,
-            description,
-            retried
+            "{op:?}: HTTP {status_code} ({description}) should not trigger retries, but these paths were retried: {retried:?}"
         );
     }
 }
@@ -250,12 +279,7 @@ async fn test_fails_on_permanent_http_errors(#[case] op: Operation) {
 // Helper Functions
 //=============================================================================
 
-fn verify_retries_occurred(
-    tracker: &RequestTracker,
-    op: Operation,
-    status_code: u16,
-    description: &str,
-) {
+fn verify_retries_occurred(tracker: &RequestTracker, op: Operation, failure_type: &str) {
     let counts = tracker.get_counts();
     let retried: Vec<_> = counts
         .iter()
@@ -264,39 +288,14 @@ fn verify_retries_occurred(
 
     assert!(
         !retried.is_empty(),
-        "{:?}: HTTP {} ({}) should trigger retries, got counts: {:?}",
+        "{:?}: {} should trigger retries, got counts: {:?}",
         op,
-        status_code,
-        description,
+        failure_type,
         counts
             .iter()
             .filter(|(p, _)| p.starts_with(op.path_prefix()))
             .collect::<Vec<_>>()
     );
-}
-
-fn verify_backoff_timing(
-    tracker: &RequestTracker,
-    op: Operation,
-    status_code: u16,
-    description: &str,
-) {
-    let counts = tracker.get_counts();
-    let retried: Vec<_> = counts
-        .iter()
-        .filter(|(path, count)| path.starts_with(op.path_prefix()) && **count > 1)
-        .collect();
-
-    if let Some((path, _)) = retried.first() {
-        tracker
-            .verify_backoff_timing(path, 100, 0.8)
-            .unwrap_or_else(|e| {
-                panic!(
-                    "{:?}: HTTP {} ({}) backoff timing failed: {}",
-                    op, status_code, description, e
-                )
-            });
-    }
 }
 
 //=============================================================================
@@ -375,14 +374,12 @@ async fn test_scan_head_response_handling(
     if expect_failure {
         assert!(
             result.is_err(),
-            "Scan should fail when HEAD returns {}",
-            description
+            "Scan should fail when HEAD returns {description}"
         );
     } else {
         assert!(
             result.is_ok(),
-            "Scan should succeed when HEAD returns {}",
-            description
+            "Scan should succeed when HEAD returns {description}"
         );
     }
 }
@@ -391,63 +388,96 @@ async fn test_scan_head_response_handling(
 // Mid-stream Failure Tests
 //=============================================================================
 
-/// Tests that mid-stream failures (truncated responses) are retried and partial
-/// files are cleaned up. Verifies both that retries occur and that the final
-/// file has correct content (not partial data from failed attempt).
+/// Tests that retries properly handle mid-stream download failures
+/// without causing file corruption.
+///
+/// The server sends 200 OK with Content-Length but drops the connection after
+/// sending partial data (25%). The pipeline detects this and retries the entire
+/// file download from scratch, ensuring the destination file is not corrupted.
+/// Tests both with and without atomic file writes
+#[rstest]
+#[case::with_atomic_writes(true)]
+#[case::without_atomic_writes(false)]
 #[tokio::test]
-async fn test_mirror_cleans_up_partial_file_on_failure() {
+async fn test_partial_body_retry_succeeds_without_corruption(#[case] atomic_file_writes: bool) {
+    use crate::storage::StorageConfig;
+    use std::time::Duration;
+
     let archive_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("testdata")
         .join("testnet-archive-small");
 
-    // Read expected content for verification
-    let bucket_file = archive_path
-        .join("bucket/44/3c/ec/bucket-443cec6682d0e98930ffd71b6f3f450a29fff6b9dd2e0cfaf41bd714926b4422.xdr.gz");
-    let expected_content = std::fs::read(&bucket_file).expect("Test bucket file should exist");
-
-    // Server fails first request to bucket files with partial body, succeeds on retry
-    let config = FlakyServerConfig::archive_partial_body(archive_path, 1);
+    // Server sends 200 OK with Content-Length but only 25% of body, twice, then succeeds
+    let fail_count = 2;
+    let config = FlakyServerConfig::archive_partial_body(archive_path.clone(), fail_count);
     let (server_url, tracker, handle) = start_flaky_server(config).await;
 
+    let storage_config = StorageConfig::new(
+        3,                          // max_retries
+        Duration::from_millis(100), // retry_min_delay
+        Duration::from_secs(30),    // retry_max_delay
+        64,                         // max_concurrent
+        Duration::from_secs(30),    // timeout
+        Duration::from_secs(300),   // io_timeout
+        0,                          // bandwidth_limit
+        atomic_file_writes,
+    );
+
     let dest_dir = TempDir::new().unwrap();
-    let mirror_config =
-        MirrorConfig::new(&server_url, format!("file://{}", dest_dir.path().display()))
-            .skip_optional()
-            .concurrency(1)
-            .high(63);
+    let mirror_config = MirrorConfig::new(&server_url, file_url_from_path(dest_dir.path()))
+        .skip_optional()
+        .concurrency(1)
+        .high(63)
+        .storage_config(storage_config);
 
     let result = run_mirror(mirror_config).await;
     handle.abort();
 
-    // Verify bucket files were retried (count > 1: first fails, retry succeeds)
+    // Mirror should succeed
+    assert!(
+        result.is_ok(),
+        "Mirror (atomic_writes={}) should complete successfully: {:?}",
+        atomic_file_writes,
+        result.err()
+    );
+
+    // Verify retries occurred
     let counts = tracker.get_counts();
-    let bucket_retry_counts: Vec<_> = counts
+    let bucket_retries: Vec<_> = counts
         .iter()
         .filter(|(path, count)| path.starts_with("bucket/") && **count > 1)
         .collect();
     assert!(
-        !bucket_retry_counts.is_empty(),
-        "Expected bucket files to be retried (request count > 1), got counts: {:?}",
-        counts
-            .iter()
-            .filter(|(p, _)| p.starts_with("bucket/"))
-            .collect::<Vec<_>>()
+        !bucket_retries.is_empty(),
+        "Expected bucket files to be retried, got counts: {counts:?}"
     );
 
+    // Find any files with wrong sizes
+    let dest_bucket_dir = dest_dir.path().join("bucket");
+    let mut corrupted_files = Vec::new();
+
+    for entry in walkdir::WalkDir::new(&dest_bucket_dir)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.file_type().is_file())
+    {
+        let rel_path = entry.path().strip_prefix(dest_dir.path()).unwrap();
+        let src_file = archive_path.join(rel_path);
+
+        let expected_size = std::fs::metadata(&src_file).unwrap().len() as usize;
+        let actual_size = std::fs::metadata(entry.path()).unwrap().len() as usize;
+
+        if actual_size != expected_size {
+            corrupted_files.push((rel_path.display().to_string(), expected_size, actual_size));
+        }
+    }
+
+    // Assert that no corruption occurred
     assert!(
-        result.is_ok(),
-        "Mirror should succeed after retry: {:?}",
-        result.err()
-    );
-
-    // Verify the final file has correct content (not partial)
-    let dest_bucket = dest_dir.path()
-        .join("bucket/44/3c/ec/bucket-443cec6682d0e98930ffd71b6f3f450a29fff6b9dd2e0cfaf41bd714926b4422.xdr.gz");
-    let final_content = std::fs::read(&dest_bucket).expect("Bucket file should exist");
-
-    assert_eq!(
-        final_content.len(),
-        expected_content.len(),
-        "Final file should have correct size, not partial"
+        corrupted_files.is_empty(),
+        "Expected no corrupted files (atomic_writes={}), but found {} corrupted files: {:?}",
+        atomic_file_writes,
+        corrupted_files.len(),
+        corrupted_files
     );
 }

@@ -2,8 +2,9 @@
 
 use crate::history_format;
 use crate::pipeline::{async_trait, Operation};
-use crate::storage::{BoxedAsyncRead, Error as StorageError, StorageRef, WRITE_BUF_BYTES};
+use crate::storage::{Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
+use opendal::{Buffer, Reader};
 use thiserror::Error;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
@@ -45,6 +46,10 @@ pub struct MirrorOperation {
     high: Option<u32>,
     allow_mirror_gaps: bool,
 
+    // Retry configuration for source fetches
+    max_retries: u32,
+    retry_min_delay_ms: u64,
+
     // Cached destination checkpoint at start of operation (or None if destination doesn't exist)
     initial_dest_checkpoint: OnceCell<Option<u32>>,
 }
@@ -56,14 +61,15 @@ impl MirrorOperation {
         low: Option<u32>,
         high: Option<u32>,
         allow_mirror_gaps: bool,
+        storage_config: &StorageConfig,
     ) -> Result<Self, Error> {
-        let dst_store = crate::storage::from_url(dst).await?;
+        let dst_store = crate::storage::from_url_with_config(dst, storage_config).await?;
 
         // Destination must support write operations
         if !dst_store.supports_writes() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                format!("Destination storage backend does not support write operations. Only filesystem destinations (file://) are currently supported: {}", dst),
+                format!("Destination storage backend does not support write operations. Only filesystem destinations (file://) are currently supported: {dst}"),
             ).into());
         }
 
@@ -74,6 +80,8 @@ impl MirrorOperation {
             low,
             high,
             allow_mirror_gaps,
+            max_retries: storage_config.max_retries as u32,
+            retry_min_delay_ms: storage_config.retry_min_delay.as_millis() as u64,
             initial_dest_checkpoint: OnceCell::new(),
         })
     }
@@ -81,16 +89,22 @@ impl MirrorOperation {
     /// Get the destination's initial checkpoint from .well-known file, caching the result
     /// Returns None if destination doesn't have a .well-known file
     async fn get_initial_dest_well_known_checkpoint(&self) -> Option<u32> {
-        self.initial_dest_checkpoint
+        *self
+            .initial_dest_checkpoint
             .get_or_init(|| async {
-                // Try to read the destination's .well-known file (local file, no retries required)
-                match fetch_well_known_history_file(&self.dst_store, 0, 0).await {
+                // Try to read the destination's .well-known file
+                match fetch_well_known_history_file(
+                    &self.dst_store,
+                    self.max_retries,
+                    self.retry_min_delay_ms,
+                )
+                .await
+                {
                     Ok(has) => Some(has.current_ledger),
                     Err(_) => None, // No existing archive
                 }
             })
             .await
-            .clone()
     }
 
     async fn maybe_update_well_known(&self, highest_checkpoint: u32) -> Result<(), Error> {
@@ -99,35 +113,33 @@ impl MirrorOperation {
         // 1. There's no existing .well-known file, or
         // 2. The new checkpoint is higher than the existing .well-known file
 
-        let should_update = match self.get_initial_dest_well_known_checkpoint().await {
-            Some(existing_ledger) => {
-                let existing_checkpoint =
-                    history_format::round_to_lower_checkpoint(existing_ledger);
-                if highest_checkpoint > existing_checkpoint {
-                    info!(
-                        "Updating .well-known from checkpoint {} (0x{:08x}) to {} (0x{:08x})",
-                        existing_checkpoint,
-                        existing_checkpoint,
-                        highest_checkpoint,
-                        highest_checkpoint
-                    );
-                    true
-                } else {
-                    info!(
-                        "Keeping existing .well-known at checkpoint {} (0x{:08x}) (mirrored up to {} (0x{:08x}))",
-                        existing_checkpoint, existing_checkpoint, highest_checkpoint, highest_checkpoint
-                    );
-                    false
-                }
-            }
-            None => {
-                // No existing .well-known file - create a new one
+        let should_update = if let Some(existing_ledger) =
+            self.get_initial_dest_well_known_checkpoint().await
+        {
+            let existing_checkpoint = history_format::round_to_lower_checkpoint(existing_ledger);
+            if highest_checkpoint > existing_checkpoint {
                 info!(
-                    "No existing .well-known, creating new one at checkpoint {} (0x{:08x})",
-                    highest_checkpoint, highest_checkpoint
+                    "Updating .well-known from checkpoint {} (0x{:08x}) to {} (0x{:08x})",
+                    existing_checkpoint,
+                    existing_checkpoint,
+                    highest_checkpoint,
+                    highest_checkpoint
                 );
                 true
+            } else {
+                info!(
+                    "Keeping existing .well-known at checkpoint {} (0x{:08x}) (mirrored up to {} (0x{:08x}))",
+                    existing_checkpoint, existing_checkpoint, highest_checkpoint, highest_checkpoint
+                );
+                false
             }
+        } else {
+            // No existing .well-known file - create a new one
+            info!(
+                "No existing .well-known, creating new one at checkpoint {} (0x{:08x})",
+                highest_checkpoint, highest_checkpoint
+            );
+            true
         };
 
         if should_update {
@@ -188,6 +200,29 @@ impl MirrorOperation {
 
         Ok(())
     }
+
+    /// Clean up a partial file at the destination path before retrying.
+    /// Only needed when atomic writes are disabled
+    async fn cleanup_partial_file(&self, path: &str) -> Result<(), StorageError> {
+        if self.dst_store.uses_atomic_writes() {
+            return Ok(());
+        }
+
+        if let Some(base_path) = self.dst_store.get_base_path() {
+            let file_path = base_path.join(path);
+            if file_path.exists() {
+                tokio::fs::remove_file(&file_path).await.map_err(|e| {
+                    StorageError::fatal(format!(
+                        "Failed to remove partial file {}: {}",
+                        file_path.display(),
+                        e
+                    ))
+                })?;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -195,8 +230,6 @@ impl Operation for MirrorOperation {
     async fn get_checkpoint_bounds(
         &self,
         source: &StorageRef,
-        max_retries: u32,
-        initial_backoff_ms: u64,
     ) -> Result<(u32, u32), crate::pipeline::Error> {
         // Determine the effective low checkpoint based on destination .well-known/stellar-history.json and flags
         //
@@ -211,9 +244,10 @@ impl Operation for MirrorOperation {
         //    - If destination doesn't exist: start from genesis checkpoint
 
         // First, get the source's latest checkpoint to know what's available
-        let source_state = fetch_well_known_history_file(source, max_retries, initial_backoff_ms)
-            .await
-            .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
+        let source_state =
+            fetch_well_known_history_file(source, self.max_retries, self.retry_min_delay_ms)
+                .await
+                .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
         let source_checkpoint =
             history_format::round_to_lower_checkpoint(source_state.current_ledger);
 
@@ -254,7 +288,12 @@ impl Operation for MirrorOperation {
 
                 // Check for gaps between highest destination checkpoint and requested low
                 if dest_checkpoint < requested_checkpoint {
-                    if !self.allow_mirror_gaps {
+                    if self.allow_mirror_gaps {
+                        warn!(
+                            "WARNING: Creating gap in archive! Destination ends at ledger {} (checkpoint {} (0x{:08x})) but mirroring from {} (checkpoint {} (0x{:08x}))",
+                            dest_ledger, dest_checkpoint, dest_checkpoint, requested_low, requested_checkpoint, requested_checkpoint
+                        );
+                    } else {
                         return Err(Error::MirrorGapDetected {
                             dest_ledger,
                             dest_checkpoint,
@@ -262,11 +301,6 @@ impl Operation for MirrorOperation {
                             low_checkpoint: requested_checkpoint,
                         }
                         .into());
-                    } else {
-                        warn!(
-                            "WARNING: Creating gap in archive! Destination ends at ledger {} (checkpoint {} (0x{:08x})) but mirroring from {} (checkpoint {} (0x{:08x}))",
-                            dest_ledger, dest_checkpoint, dest_checkpoint, requested_low, requested_checkpoint, requested_checkpoint
-                        );
                     }
 
                     // Start at --low value
@@ -342,50 +376,33 @@ impl Operation for MirrorOperation {
             Err(e) => {
                 // Failed to check existence on destination
                 Some(Err(StorageError::fatal(format!(
-                    "Failed to check existence of destination {}: {}",
-                    path, e
+                    "Failed to check existence of destination {path}: {e}"
                 ))))
             }
         }
     }
 
-    async fn process_object(
-        &self,
-        path: &str,
-        mut reader: BoxedAsyncRead,
-    ) -> Result<(), StorageError> {
-        use tokio::io::{AsyncWriteExt, BufWriter};
-
-        // Stream from source to destination
-        let write_result = async {
-            let writer = self.dst_store.open_writer(path).await?;
-            let mut buf_writer = BufWriter::with_capacity(WRITE_BUF_BYTES, writer);
-
-            tokio::io::copy(&mut reader, &mut buf_writer).await?;
-            buf_writer.flush().await?;
-            Ok::<(), std::io::Error>(())
-        }
-        .await;
-
-        match write_result {
-            Ok(_) => Ok(()),
+    async fn process_object(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
+        match self.dst_store.copy_from_reader(path, reader).await {
+            Ok(()) => Ok(()),
             Err(e) => {
-                // Streaming/write error - clean up partial file before retrying
-                if let Some(base_path) = self.dst_store.get_base_path() {
-                    let file_path = base_path.join(path);
-                    if file_path.exists() {
-                        if let Err(rm_err) = tokio::fs::remove_file(&file_path).await {
-                            // If we fail to clean up the partial file, we can't retry
-                            return Err(StorageError::fatal(format!(
-                                "Failed to remove partial file {}: {}",
-                                file_path.display(),
-                                rm_err
-                            )));
-                        }
-                    }
+                self.cleanup_partial_file(path).await?;
+                Err(e)
+            }
+        }
+    }
+
+    async fn process_buffer(&self, path: &str, buffer: Buffer) {
+        match self.dst_store.write(path, buffer).await {
+            Ok(()) => {
+                self.stats.record_success(path);
+            }
+            Err(e) => {
+                if let Err(cleanup_err) = self.cleanup_partial_file(path).await {
+                    error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
                 }
-                // Partial file cleaned up, safe to retry
-                Err(StorageError::retry(format!("Stream error: {}", e)))
+                error!("Failed to write history file {}: {}", path, e);
+                self.stats.record_failure(path).await;
             }
         }
     }
@@ -396,10 +413,6 @@ impl Operation for MirrorOperation {
 
     async fn record_failure(&self, path: &str) {
         self.stats.record_failure(path).await;
-    }
-
-    fn record_retry(&self) {
-        self.stats.record_retry();
     }
 
     fn record_skipped(&self, path: &str) {
