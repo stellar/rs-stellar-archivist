@@ -131,8 +131,7 @@ where
 
     // Build filter: set default level and suppress noisy HTTP/2 and networking crates
     let filter = EnvFilter::new(format!(
-        "{},opendal={},h2=warn,hyper=warn,hyper_util=warn,reqwest=warn,tokio=warn,tower=warn,rustls=warn",
-        level, level
+        "{level},opendal={level},h2=warn,hyper=warn,hyper_util=warn,reqwest=warn,tokio=warn,tower=warn,rustls=warn"
     ));
 
     let subscriber = fmt::Subscriber::builder()
@@ -140,7 +139,7 @@ where
         .with_target(false)
         .finish();
     tracing::subscriber::set_global_default(subscriber)
-        .map_err(|e| Error::Other(format!("Failed to initialize logging: {}", e)))?;
+        .map_err(|e| Error::Other(format!("Failed to initialize logging: {e}")))?;
 
     let global_args = GlobalArgs {
         concurrency: cli.concurrency,

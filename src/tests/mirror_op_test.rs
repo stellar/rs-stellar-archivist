@@ -27,7 +27,7 @@ fn collect_expected_buckets(source_path: &Path, max_checkpoint: Option<u32>) -> 
 
     for entry in WalkDir::new(source_path)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_file())
     {
         let path = entry.path();
@@ -40,7 +40,7 @@ fn collect_expected_buckets(source_path: &Path, max_checkpoint: Option<u32>) -> 
         let checkpoint = history_format::checkpoint_from_filename(&filename)
             .expect("Failed to extract checkpoint");
 
-        if max_checkpoint.map_or(false, |max| checkpoint > max) {
+        if max_checkpoint.is_some_and(|max| checkpoint > max) {
             continue;
         }
 
@@ -70,7 +70,7 @@ fn is_checkpoint_file(filename: &str) -> bool {
 fn verify_checkpoint_files(source_path: &Path, dest_path: &Path, max_checkpoint: Option<u32>) {
     for entry in WalkDir::new(source_path)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_file())
     {
         let src_file = entry.path();
@@ -82,7 +82,7 @@ fn verify_checkpoint_files(source_path: &Path, dest_path: &Path, max_checkpoint:
             continue;
         }
 
-        let dst_file = dest_path.join(&relative_path);
+        let dst_file = dest_path.join(relative_path);
         let filename = src_file.file_name().unwrap().to_string_lossy();
 
         if let Some(max_cp) = max_checkpoint {
@@ -93,22 +93,17 @@ fn verify_checkpoint_files(source_path: &Path, dest_path: &Path, max_checkpoint:
                 if checkpoint > max_cp {
                     assert!(
                         !dst_file.exists(),
-                        "File beyond bound should not exist: {}",
-                        path_str
+                        "File beyond bound should not exist: {path_str}"
                     );
                 } else {
-                    assert!(dst_file.exists(), "Missing file within bound: {}", path_str);
+                    assert!(dst_file.exists(), "Missing file within bound: {path_str}");
                 }
                 continue;
             }
         }
 
         // Non-checkpoint files or unbounded: should exist
-        assert!(
-            dst_file.exists(),
-            "Missing file in destination: {}",
-            path_str
-        );
+        assert!(dst_file.exists(), "Missing file in destination: {path_str}");
     }
 }
 
@@ -121,7 +116,7 @@ fn verify_destination_files(
 ) {
     for entry in WalkDir::new(dest_path)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_file())
     {
         let dst_file = entry.path();
@@ -140,34 +135,28 @@ fn verify_destination_files(
                 .expect("Failed to extract bucket hash");
             assert!(
                 expected_buckets.remove(&hash),
-                "Unexpected bucket file: {} (hash: {})",
-                path_str,
-                hash
+                "Unexpected bucket file: {path_str} (hash: {hash})"
             );
         } else if let Some(max_cp) = max_checkpoint {
             // Verify checkpoint files are within bounds
             if let Some(checkpoint) = history_format::checkpoint_from_filename(&filename) {
                 assert!(
                     checkpoint <= max_cp,
-                    "File beyond bound: {} (checkpoint {} (0x{:08x}))",
-                    path_str,
-                    checkpoint,
-                    checkpoint
+                    "File beyond bound: {path_str} (checkpoint {checkpoint} (0x{checkpoint:08x}))"
                 );
             }
         }
 
         // Verify content matches source
-        let src_file = source_path.join(&relative_path);
+        let src_file = source_path.join(relative_path);
         assert!(
             src_file.exists(),
-            "No source for destination file: {}",
-            path_str
+            "No source for destination file: {path_str}"
         );
 
         let src_content = std::fs::read(&src_file).expect("Failed to read source");
-        let dst_content = std::fs::read(&dst_file).expect("Failed to read dest");
-        assert_eq!(src_content, dst_content, "Content mismatch: {}", path_str);
+        let dst_content = std::fs::read(dst_file).expect("Failed to read dest");
+        assert_eq!(src_content, dst_content, "Content mismatch: {path_str}");
     }
 }
 
@@ -201,7 +190,7 @@ async fn test_mirror_full_archive() {
 
     let mirror_config = MirrorConfig {
         src: format!("file://{}", test_archive_path.to_str().unwrap()),
-        dst: format!("file://{}", mirror_dest),
+        dst: format!("file://{mirror_dest}"),
         concurrency: 20,
         skip_optional: false,
         high: None,
@@ -215,7 +204,7 @@ async fn test_mirror_full_archive() {
 
     // Verify with scan
     run_scan(ScanConfig {
-        archive: format!("file://{}", mirror_dest),
+        archive: format!("file://{mirror_dest}"),
         concurrency: 4,
         skip_optional: false,
         low: None,
@@ -249,7 +238,7 @@ async fn test_mirror_bounded() {
 
     let mirror_config = MirrorConfig {
         src: format!("file://{}", test_archive_path.to_str().unwrap()),
-        dst: format!("file://{}", mirror_dest),
+        dst: format!("file://{mirror_dest}"),
         concurrency: 20,
         skip_optional: false,
         high: Some(4991),
@@ -265,7 +254,7 @@ async fn test_mirror_bounded() {
 
     // Verify with scan
     run_scan(ScanConfig {
-        archive: format!("file://{}", mirror_dest),
+        archive: format!("file://{mirror_dest}"),
         concurrency: 4,
         skip_optional: false,
         low: None,
@@ -298,7 +287,7 @@ async fn test_mirror_skip_optional() {
 
     let mirror_config = MirrorConfig {
         src: format!("file://{}", test_archive_path.to_str().unwrap()),
-        dst: format!("file://{}", mirror_dest),
+        dst: format!("file://{mirror_dest}"),
         concurrency: 4,
         skip_optional: true,
         high: None,
@@ -317,7 +306,7 @@ async fn test_mirror_skip_optional() {
 
     // Verify with scan (must also skip optional)
     run_scan(ScanConfig {
-        archive: format!("file://{}", mirror_dest),
+        archive: format!("file://{mirror_dest}"),
         concurrency: 4,
         skip_optional: true,
         low: None,
@@ -389,8 +378,7 @@ async fn test_mirror_rejects_gap_creation() {
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("Cannot mirror") && err_msg.contains("would create a gap"),
-        "Expected gap error, got: {}",
-        err_msg
+        "Expected gap error, got: {err_msg}"
     );
 
     // --overwrite flag should not bypass gap check
@@ -619,8 +607,7 @@ async fn test_mirror_replaces_empty_files() {
     let final_size = std::fs::metadata(&ledger_file).unwrap().len();
     assert!(
         final_size > 0,
-        "Empty file should have been re-downloaded, got size {}",
-        final_size
+        "Empty file should have been re-downloaded, got size {final_size}"
     );
 }
 
@@ -748,7 +735,7 @@ async fn test_mirror_http_to_filesystem() {
     // Mirror from HTTP to filesystem
     let mirror_config = MirrorConfig {
         src: server_url.clone(),
-        dst: format!("file://{}", mirror_dest),
+        dst: format!("file://{mirror_dest}"),
         concurrency: 4,
         high: None,
         low: None,
@@ -760,12 +747,12 @@ async fn test_mirror_http_to_filesystem() {
 
     run_mirror(mirror_config).await.unwrap_or_else(|e| {
         server_handle.abort();
-        panic!("HTTP mirror failed: {}", e);
+        panic!("HTTP mirror failed: {e}");
     });
 
     // Verify the mirrored archive
     let scan_config = ScanConfig {
-        archive: format!("file://{}", mirror_dest),
+        archive: format!("file://{mirror_dest}"),
         concurrency: 4,
         skip_optional: false,
         low: None,
@@ -775,7 +762,7 @@ async fn test_mirror_http_to_filesystem() {
 
     run_scan(scan_config).await.unwrap_or_else(|e| {
         server_handle.abort();
-        panic!("Scan of mirrored archive failed: {}", e);
+        panic!("Scan of mirrored archive failed: {e}");
     });
 
     server_handle.abort();
@@ -832,7 +819,7 @@ async fn test_mirror_race_condition_with_advancing_archive() {
                 async move { well_known_content }
             }),
         )
-        .fallback(get_service(ServeDir::new(archive_path.to_path_buf())));
+        .fallback(get_service(ServeDir::new(archive_path)));
 
     let (server_url, server_handle) = start_http_server_with_app(app).await;
 
@@ -842,7 +829,7 @@ async fn test_mirror_race_condition_with_advancing_archive() {
 
     let mirror_config = MirrorConfig {
         src: server_url.clone(),
-        dst: format!("file://{}", mirror_dest),
+        dst: format!("file://{mirror_dest}"),
         concurrency: 4,
         high: None, // Unbounded mirror
         low: None,
@@ -854,7 +841,7 @@ async fn test_mirror_race_condition_with_advancing_archive() {
 
     run_mirror(mirror_config).await.unwrap_or_else(|e| {
         server_handle.abort();
-        panic!("Mirror failed: {}", e);
+        panic!("Mirror failed: {e}");
     });
 
     // Check what .well-known was written with the original destination .well-known file (127)

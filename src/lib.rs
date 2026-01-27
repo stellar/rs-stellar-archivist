@@ -1,3 +1,26 @@
+#![allow(clippy::missing_errors_doc)]
+#![allow(clippy::missing_panics_doc)]
+#![allow(clippy::must_use_candidate)]
+#![allow(clippy::return_self_not_must_use)]
+#![allow(clippy::too_many_lines)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::struct_excessive_bools)]
+#![allow(clippy::fn_params_excessive_bools)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::unreadable_literal)]
+#![allow(clippy::items_after_statements)]
+#![allow(clippy::manual_let_else)]
+#![allow(clippy::uninlined_format_args)]
+#![allow(clippy::trivially_copy_pass_by_ref)]
+#![allow(clippy::redundant_closure_for_method_calls)]
+#![allow(clippy::unused_async)]
+#![allow(clippy::used_underscore_binding)]
+#![allow(clippy::needless_pass_by_value)]
+#![allow(clippy::match_same_arms)]
+#![allow(clippy::semicolon_if_nothing_returned)]
+#![allow(clippy::use_debug)]
+#![allow(clippy::doc_markdown)]
+
 pub mod history_format;
 pub mod mirror_operation;
 pub mod pipeline;
@@ -41,7 +64,8 @@ pub mod test_helpers {
     use std::sync::Arc;
     use std::time::Duration;
 
-    /// Create a StorageConfig suitable for testing (generous timeouts, limited concurrency)
+    /// Create a `StorageConfig` suitable for testing (generous timeouts, limited concurrency)
+    #[must_use]
     pub fn test_storage_config() -> StorageConfig {
         StorageConfig::new(
             3,                          // max_retries
@@ -66,7 +90,7 @@ pub mod test_helpers {
     }
 
     impl ScanConfig {
-        /// Create a new ScanConfig with sensible defaults for testing
+        /// Create a new `ScanConfig` with sensible defaults for testing
         pub fn new(archive: impl Into<String>) -> Self {
             Self {
                 archive: archive.into(),
@@ -79,30 +103,35 @@ pub mod test_helpers {
         }
 
         /// Set concurrency level
+        #[must_use]
         pub fn concurrency(mut self, concurrency: usize) -> Self {
             self.concurrency = concurrency;
             self
         }
 
         /// Skip optional files (SCP)
+        #[must_use]
         pub fn skip_optional(mut self) -> Self {
             self.skip_optional = true;
             self
         }
 
         /// Set the low ledger bound
+        #[must_use]
         pub fn low(mut self, low: u32) -> Self {
             self.low = Some(low);
             self
         }
 
         /// Set the high ledger bound
+        #[must_use]
         pub fn high(mut self, high: u32) -> Self {
             self.high = Some(high);
             self
         }
 
         /// Set custom storage config
+        #[must_use]
         pub fn storage_config(mut self, config: StorageConfig) -> Self {
             self.storage_config = config;
             self
@@ -122,7 +151,7 @@ pub mod test_helpers {
     }
 
     impl MirrorConfig {
-        /// Create a new MirrorConfig with sensible defaults for testing
+        /// Create a new `MirrorConfig` with sensible defaults for testing
         pub fn new(src: impl Into<String>, dst: impl Into<String>) -> Self {
             Self {
                 src: src.into(),
@@ -138,42 +167,49 @@ pub mod test_helpers {
         }
 
         /// Set concurrency level
+        #[must_use]
         pub fn concurrency(mut self, concurrency: usize) -> Self {
             self.concurrency = concurrency;
             self
         }
 
         /// Skip optional files (SCP)
+        #[must_use]
         pub fn skip_optional(mut self) -> Self {
             self.skip_optional = true;
             self
         }
 
         /// Set the low ledger bound
+        #[must_use]
         pub fn low(mut self, low: u32) -> Self {
             self.low = Some(low);
             self
         }
 
         /// Set the high ledger bound
+        #[must_use]
         pub fn high(mut self, high: u32) -> Self {
             self.high = Some(high);
             self
         }
 
         /// Enable overwrite mode
+        #[must_use]
         pub fn overwrite(mut self) -> Self {
             self.overwrite = true;
             self
         }
 
         /// Allow gaps in the mirrored archive
+        #[must_use]
         pub fn allow_mirror_gaps(mut self) -> Self {
             self.allow_mirror_gaps = true;
             self
         }
 
         /// Set custom storage config
+        #[must_use]
         pub fn storage_config(mut self, config: StorageConfig) -> Self {
             self.storage_config = config;
             self

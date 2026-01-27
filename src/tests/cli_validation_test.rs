@@ -36,9 +36,7 @@ async fn test_mirror_rejects_malformed_url(
     let result = cmd_mirror_run(config).await;
     assert!(
         result.is_err(),
-        "Should reject malformed {} URL: '{}'",
-        position,
-        bad_url
+        "Should reject malformed {position} URL: '{bad_url}'"
     );
 }
 
@@ -59,8 +57,7 @@ async fn test_rejects_nonexistent_source(#[case] operation: &str) {
 
     assert!(
         result.is_err(),
-        "{} should reject nonexistent source",
-        operation
+        "{operation} should reject nonexistent source"
     );
 }
 
@@ -80,8 +77,7 @@ async fn test_mirror_creates_destination_if_not_exists() {
     let result = cmd_mirror_run(config).await;
     assert!(
         result.is_ok(),
-        "Should create destination directory if it doesn't exist, got error: {:?}",
-        result
+        "Should create destination directory if it doesn't exist, got error: {result:?}"
     );
 
     assert!(dest_path.exists(), "Destination directory should exist");
@@ -112,16 +108,11 @@ async fn test_rejects_low_greater_than_high(#[case] operation: &str) {
         _ => unreachable!(),
     };
 
-    assert!(
-        result.is_err(),
-        "{} should reject when low > high",
-        operation
-    );
+    assert!(result.is_err(), "{operation} should reject when low > high");
 
     let err_msg = result.unwrap_err().to_string();
     assert!(
         err_msg.contains("low checkpoint") && err_msg.contains("is greater than high checkpoint"),
-        "Error should indicate low > high, got: {}",
-        err_msg
+        "Error should indicate low > high, got: {err_msg}"
     );
 }

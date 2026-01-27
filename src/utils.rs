@@ -23,8 +23,8 @@ pub const STANDARD_RETRYABLE_HTTP_ERRORS: &[(u16, &str)] = &[
 /// Non-standard HTTP status codes that should be treated as retryable.
 ///
 /// References:
-/// - Cloudflare: https://developers.cloudflare.com/support/troubleshooting/cloudflare-errors/troubleshooting-cloudflare-5xx-errors/
-/// - Unofficial codes: https://en.wikipedia.org/wiki/List_of_HTTP_status_codes#Unofficial_codes
+/// - Cloudflare: <https://developers.cloudflare.com/support/troubleshooting/cloudflare-errors/troubleshooting-cloudflare-5xx-errors>/
+/// - Unofficial codes: <https://en.wikipedia.org/wiki/List_of_HTTP_status_codes#Unofficial_codes>
 pub const NON_STANDARD_RETRYABLE_HTTP_ERRORS: &[(u16, &str)] = &[
     // Standard retryable errors that some clients don't retry by default
     (408, "Request Timeout"),
@@ -72,6 +72,7 @@ pub enum Error {
 }
 
 /// Helper function to map pipeline errors to library errors
+#[must_use]
 pub fn map_pipeline_error(err: pipeline::Error) -> crate::Error {
     match err {
         pipeline::Error::ScanOperation(scan_err) => crate::Error::ScanOperation(scan_err),
@@ -108,7 +109,14 @@ pub struct ArchiveStats {
     pub failed_list: Arc<tokio::sync::Mutex<Vec<String>>>,
 }
 
+impl Default for ArchiveStats {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ArchiveStats {
+    #[must_use]
     pub fn new() -> Self {
         Self {
             successful_files: AtomicU64::new(0),
@@ -235,6 +243,7 @@ pub struct RetryState {
 }
 
 impl RetryState {
+    #[must_use]
     pub fn new(max_retries: u32, initial_backoff_ms: u64) -> Self {
         Self {
             attempt: 0,
@@ -247,7 +256,7 @@ impl RetryState {
     ///
     /// If the error is retryable and we haven't exhausted retries:
     /// - Logs retry count
-    /// - Returns true (caller should call backoff() and retry)
+    /// - Returns true (caller should call `backoff()` and retry)
     ///
     /// If the error is not retryable or retries are exhausted:
     /// - Logs an error
@@ -327,10 +336,9 @@ pub async fn fetch_well_known_history_file(
                     retry_state.backoff().await;
                     continue;
                 }
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("Failed to fetch {}: {}", ROOT_WELL_KNOWN_PATH, e),
-                )
+                return Err(std::io::Error::other(format!(
+                    "Failed to fetch {ROOT_WELL_KNOWN_PATH}: {e}"
+                ))
                 .into());
             }
         }

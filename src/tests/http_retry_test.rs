@@ -95,11 +95,7 @@ async fn test_retries_on_transient_well_known_errors(#[case] op: Operation) {
 
         assert!(
             well_known_count > 1,
-            "{:?}: HTTP {} ({}) on .well-known should trigger retries, got count: {}",
-            op,
-            status_code,
-            description,
-            well_known_count
+            "{op:?}: HTTP {status_code} ({description}) on .well-known should trigger retries, got count: {well_known_count}"
         );
 
         assert!(
@@ -132,7 +128,7 @@ async fn test_retries_on_transient_http_errors(#[case] op: Operation) {
         let result = op.run(&server_url).await;
         handle.abort();
 
-        let failure_type = format!("HTTP {} ({})", status_code, description);
+        let failure_type = format!("HTTP {status_code} ({description})");
         verify_retries_occurred(&tracker, op, &failure_type);
         assert!(
             result.is_ok(),
@@ -234,10 +230,7 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
 
     for (path, _) in &retried_paths {
         if let Err(e) = tracker.verify_backoff_timing(path, 1000, 100) {
-            panic!(
-                "Exponential backoff failed for {} with {} failures: {}",
-                path, fail_count, e
-            );
+            panic!("Exponential backoff failed for {path} with {fail_count} failures: {e}");
         }
     }
 }
@@ -267,10 +260,7 @@ async fn test_fails_on_permanent_http_errors(#[case] op: Operation) {
 
         assert!(
             result.is_err(),
-            "{:?} should fail on HTTP {} ({})",
-            op,
-            status_code,
-            description
+            "{op:?} should fail on HTTP {status_code} ({description})"
         );
 
         // Verify no retries occurred - each path should only be requested once
@@ -281,11 +271,7 @@ async fn test_fails_on_permanent_http_errors(#[case] op: Operation) {
             .collect();
         assert!(
             retried.is_empty(),
-            "{:?}: HTTP {} ({}) should not trigger retries, but these paths were retried: {:?}",
-            op,
-            status_code,
-            description,
-            retried
+            "{op:?}: HTTP {status_code} ({description}) should not trigger retries, but these paths were retried: {retried:?}"
         );
     }
 }
@@ -389,14 +375,12 @@ async fn test_scan_head_response_handling(
     if expect_failure {
         assert!(
             result.is_err(),
-            "Scan should fail when HEAD returns {}",
-            description
+            "Scan should fail when HEAD returns {description}"
         );
     } else {
         assert!(
             result.is_ok(),
-            "Scan should succeed when HEAD returns {}",
-            description
+            "Scan should succeed when HEAD returns {description}"
         );
     }
 }
@@ -467,8 +451,7 @@ async fn test_partial_body_retry_succeeds_without_corruption(#[case] atomic_file
         .collect();
     assert!(
         !bucket_retries.is_empty(),
-        "Expected bucket files to be retried, got counts: {:?}",
-        counts
+        "Expected bucket files to be retried, got counts: {counts:?}"
     );
 
     // Find any files with wrong sizes
@@ -477,7 +460,7 @@ async fn test_partial_body_retry_succeeds_without_corruption(#[case] atomic_file
 
     for entry in walkdir::WalkDir::new(&dest_bucket_dir)
         .into_iter()
-        .filter_map(|e| e.ok())
+        .filter_map(std::result::Result::ok)
         .filter(|e| e.file_type().is_file())
     {
         let rel_path = entry.path().strip_prefix(dest_dir.path()).unwrap();

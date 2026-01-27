@@ -2,7 +2,7 @@
 //!
 //! The pipeline coordinates parallel processing of archive checkpoints and their files.
 //! Retry, concurrency limiting, timeout handling, and bandwidth throttling are delegated
-//! to the storage layer (OpenDAL).
+//! to the storage layer (`OpenDAL`).
 
 use crate::{
     history_format::{self, bucket_path, checkpoint_path, HistoryFileState},
@@ -52,14 +52,14 @@ const PROGRESS_REPORTING_FREQUENCY: usize = 100;
 #[async_trait::async_trait]
 pub trait Operation: Send + Sync + 'static {
     /// Get the checkpoint bounds for this operation
-    /// Returns (lower_bound, upper_bound) checkpoints to process
+    /// Returns (`lower_bound`, `upper_bound`) checkpoints to process
     async fn get_checkpoint_bounds(
         &self,
         source: &crate::storage::StorageRef,
     ) -> Result<(u32, u32), Error>;
 
     /// Process an object by streaming its content from the provided reader.
-    /// Only called when existence_check_only() returns false.
+    /// Only called when `existence_check_only()` returns false.
     ///
     /// Returns:
     /// - Ok(()) on success
@@ -130,13 +130,10 @@ impl<Op: Operation> Pipeline<Op> {
             crate::storage::from_url_with_config(&config.source, &config.storage_config)
                 .await
                 .map_err(|e| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::Other,
-                        format!(
-                            "Failed to create storage backend for {}: {}",
-                            config.source, e
-                        ),
-                    )
+                    std::io::Error::other(format!(
+                        "Failed to create storage backend for {}: {}",
+                        config.source, e
+                    ))
                 })?;
 
         let bucket_lru = Mutex::new(LruCache::new(
@@ -317,7 +314,7 @@ impl<Op: Operation> Pipeline<Op> {
     }
 
     /// Process a single file (bucket, ledger, transactions, results, scp).
-    /// All retries are handled at this level - no automatic retries in OpenDAL.
+    /// All retries are handled at this level - no automatic retries in `OpenDAL`.
     async fn process_file(self: Arc<Self>, path: String) {
         // Pre-check: allow operation to skip without querying source
         if let Some(result) = self.operation.pre_check(&path).await {

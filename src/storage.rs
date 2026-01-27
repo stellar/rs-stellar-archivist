@@ -1,6 +1,6 @@
 //! Storage backends for accessing Stellar History Archives
 //!
-//! All storage backends are built on Apache OpenDAL, providing:
+//! All storage backends are built on Apache `OpenDAL`, providing:
 //! - Unified interface across file, HTTP, and cloud storage
 //! - Built-in retry with exponential backoff
 //! - Request timeouts
@@ -51,6 +51,7 @@ impl Error {
         }
     }
 
+    #[must_use]
     pub fn not_found() -> Self {
         Self {
             class: ErrorClass::NotFound,
@@ -64,7 +65,7 @@ pub type StorageRef = Arc<dyn Storage + Send + Sync>;
 /// Core unified storage trait for all backends
 #[async_trait]
 pub trait Storage: Send + Sync {
-    /// Open an OpenDAL reader for the object.
+    /// Open an `OpenDAL` reader for the object.
     /// Note: No automatic retries - retries are handled at the pipeline level.
     async fn open_reader(&self, object: &str) -> Result<Reader, Error>;
 
@@ -72,7 +73,7 @@ pub trait Storage: Send + Sync {
     /// Note: No automatic retries - retries are handled at the pipeline level.
     async fn exists(&self, object: &str) -> Result<bool, Error>;
 
-    /// Open an OpenDAL writer for the object with buffering enabled.
+    /// Open an `OpenDAL` writer for the object with buffering enabled.
     /// Only supported by writable backends (e.g., filesystem).
     /// Caller is responsible for calling `writer.close()` after writing.
     async fn open_writer(&self, _object: &str) -> Result<Writer, Error> {
@@ -87,10 +88,11 @@ pub trait Storage: Send + Sync {
         writer
             .write(data)
             .await
-            .map_err(|e| from_opendal_error(e, &format!("Failed to write to {}", object)))?;
-        writer.close().await.map_err(|e| {
-            from_opendal_error(e, &format!("Failed to close writer for {}", object))
-        })?;
+            .map_err(|e| from_opendal_error(e, &format!("Failed to write to {object}")))?;
+        writer
+            .close()
+            .await
+            .map_err(|e| from_opendal_error(e, &format!("Failed to close writer for {object}")))?;
         Ok(())
     }
 
@@ -102,17 +104,18 @@ pub trait Storage: Send + Sync {
 
         // Convert reader to a stream of Buffer chunks (zero-copy)
         // The range `..` means read all data
-        let mut stream = reader.into_stream(..).await.map_err(|e| {
-            from_opendal_error(e, &format!("Failed to create stream for {}", object))
-        })?;
+        let mut stream = reader
+            .into_stream(..)
+            .await
+            .map_err(|e| from_opendal_error(e, &format!("Failed to create stream for {object}")))?;
 
         let mut sink = writer.into_sink();
         sink.send_all(&mut stream)
             .await
-            .map_err(|e| from_opendal_error(e, &format!("Failed to write data to {}", object)))?;
-        sink.close().await.map_err(|e| {
-            from_opendal_error(e, &format!("Failed to close writer for {}", object))
-        })?;
+            .map_err(|e| from_opendal_error(e, &format!("Failed to write data to {object}")))?;
+        sink.close()
+            .await
+            .map_err(|e| from_opendal_error(e, &format!("Failed to close writer for {object}")))?;
         Ok(())
     }
 
@@ -153,12 +156,13 @@ pub struct StorageConfig {
     /// Bandwidth limit in bytes per second (0 = unlimited)
     pub bandwidth_limit: u32,
     /// Use atomic file writes with fsync (write to temp file, fsync, then rename).
-    /// When false, bypasses OpenDAL and writes directly via tokio::fs for better performance.
+    /// When false, bypasses `OpenDAL` and writes directly via `tokio::fs` for better performance.
     pub atomic_file_writes: bool,
 }
 
 impl StorageConfig {
-    /// Create a new StorageConfig with explicit values
+    /// Create a new `StorageConfig` with explicit values
+    #[must_use]
     pub fn new(
         max_retries: usize,
         retry_min_delay: Duration,
@@ -173,9 +177,9 @@ impl StorageConfig {
             max_retries,
             retry_min_delay,
             retry_max_delay,
-            max_concurrent,
             timeout,
             io_timeout,
+            max_concurrent,
             bandwidth_limit,
             atomic_file_writes,
         }
@@ -192,12 +196,12 @@ pub struct OpendalStore {
     root_path: Option<PathBuf>,
     /// Whether this backend supports writes
     writable: bool,
-    /// Whether to use atomic file writes (OpenDAL with fsync) vs direct writes (tokio::fs bypass)
+    /// Whether to use atomic file writes (`OpenDAL` with fsync) vs direct writes (`tokio::fs` bypass)
     atomic_file_writes: bool,
 }
 
 impl OpendalStore {
-    /// Create a new OpendalStore from a configured operator
+    /// Create a new `OpendalStore` from a configured operator
     fn from_operator(
         operator: Operator,
         prefix: impl Into<String>,
@@ -223,7 +227,7 @@ impl OpendalStore {
     }
 
     /// Apply standard layers to an operator builder with optional custom HTTP client.
-    /// Note: No RetryLayer - retries are handled at the pipeline level to avoid
+    /// Note: No `RetryLayer` - retries are handled at the pipeline level to avoid
     /// file corruption from partial writes during streaming operations.
     fn apply_layers_with_http_client<B: opendal::Builder>(
         builder: B,
@@ -237,7 +241,7 @@ impl OpendalStore {
         // Note: No RetryLayer - retries are handled at the pipeline level with proper error
         //       classification (see from_opendal_error)
         let op = Operator::new(builder)
-            .map_err(|e| Error::fatal(format!("Failed to create operator: {}", e)))?
+            .map_err(|e| Error::fatal(format!("Failed to create operator: {e}")))?
             .layer(
                 layers::TimeoutLayer::default()
                     .with_timeout(config.timeout)
@@ -275,13 +279,13 @@ impl OpendalStore {
             object.to_string()
         } else {
             let prefix = self.prefix.trim_end_matches('/');
-            format!("{}/{}", prefix, object)
+            format!("{prefix}/{object}")
         }
     }
 
-    /// Direct file write that bypasses OpenDAL's writer layer.
-    /// This avoids the WriteGenerator buffering and the fsync in close().
-    /// Used when fsync_file_writes is false for filesystem backends.
+    /// Direct file write that bypasses `OpenDAL`'s writer layer.
+    /// This avoids the `WriteGenerator` buffering and the fsync in `close()`.
+    /// Used when `fsync_file_writes` is false for filesystem backends.
     async fn copy_from_reader_direct(
         &self,
         root_path: &Path,
@@ -291,36 +295,36 @@ impl OpendalStore {
         let object = object.trim_start_matches('/');
         let file_path = root_path.join(object);
 
-        // Ensure parent directory exists
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
-                from_io_error(e, &format!("Failed to create directory {:?}", parent))
+                from_io_error(
+                    e,
+                    &format!("Failed to create directory {}", parent.display()),
+                )
             })?;
         }
 
-        // Open file directly with tokio::fs
-        let mut file = tokio::fs::File::create(&file_path)
-            .await
-            .map_err(|e| from_io_error(e, &format!("Failed to create file {:?}", file_path)))?;
-
-        // Stream data from reader to file
-        let mut stream = reader.into_stream(..).await.map_err(|e| {
-            from_opendal_error(e, &format!("Failed to create stream for {}", object))
+        let mut file = tokio::fs::File::create(&file_path).await.map_err(|e| {
+            from_io_error(e, &format!("Failed to create file {}", file_path.display()))
         })?;
+
+        let mut stream = reader
+            .into_stream(..)
+            .await
+            .map_err(|e| from_opendal_error(e, &format!("Failed to create stream for {object}")))?;
 
         while let Some(result) = stream.next().await {
             let buffer = result.map_err(|e| from_opendal_error(e, "Failed to read from source"))?;
             for bytes in buffer {
                 file.write_all(&bytes).await.map_err(|e| {
-                    from_io_error(e, &format!("Failed to write to {:?}", file_path))
+                    from_io_error(e, &format!("Failed to write to {}", file_path.display()))
                 })?;
             }
         }
 
-        // Flush to OS buffers (but no fsync)
         file.flush()
             .await
-            .map_err(|e| from_io_error(e, &format!("Failed to flush {:?}", file_path)))?;
+            .map_err(|e| from_io_error(e, &format!("Failed to flush {}", file_path.display())))?;
 
         Ok(())
     }
@@ -329,7 +333,7 @@ impl OpendalStore {
 
     /// Create a filesystem storage backend
     ///
-    /// When atomic_file_writes is enabled, uses OpenDAL's atomic_write_dir feature
+    /// When `atomic_file_writes` is enabled, uses `OpenDAL`'s `atomic_write_dir` feature
     /// to ensure writes are atomic (temp file + rename).
     pub fn filesystem(root: impl Into<PathBuf>, config: &StorageConfig) -> Result<Self, Error> {
         use opendal::services::Fs;
@@ -365,7 +369,7 @@ impl OpendalStore {
             .user_agent(Self::USER_AGENT)
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()
-            .map_err(|e| Error::fatal(format!("Failed to create HTTP client: {}", e)))?;
+            .map_err(|e| Error::fatal(format!("Failed to create HTTP client: {e}")))?;
 
         Ok(opendal::raw::HttpClient::with(reqwest_client))
     }
@@ -383,7 +387,7 @@ impl OpendalStore {
         // - endpoint: scheme + host[:port] (e.g., https://history.stellar.org)
         // - root: path portion (e.g., /prd/core-live/core_live_001)
         let url = url::Url::parse(base_url)
-            .map_err(|e| Error::fatal(format!("Invalid URL {}: {}", base_url, e)))?;
+            .map_err(|e| Error::fatal(format!("Invalid URL {base_url}: {e}")))?;
 
         // Build endpoint with optional port
         let endpoint = if let Some(port) = url.port() {
@@ -542,7 +546,7 @@ impl OpendalStore {
         Ok(Self::from_operator(operator, prefix, None, false, false))
     }
 
-    /// Create an OpenStack Swift storage backend
+    /// Create an `OpenStack` Swift storage backend
     #[cfg(feature = "opendal-swift")]
     pub fn swift(
         container: &str,
@@ -573,14 +577,14 @@ fn classify_http_status_in_error(err_string: &str) -> Option<ErrorClass> {
         .iter()
         .chain(NON_STANDARD_RETRYABLE_HTTP_ERRORS.iter())
     {
-        if err_string.contains(&format!("status: {}", code)) {
+        if err_string.contains(&format!("status: {code}")) {
             return Some(ErrorClass::Retry);
         }
     }
 
     // Check for 4xx client errors (fatal, should not retry)
     for code in 400..500u16 {
-        if err_string.contains(&format!("status: {}", code)) {
+        if err_string.contains(&format!("status: {code}")) {
             return Some(ErrorClass::Fatal);
         }
     }
@@ -588,7 +592,7 @@ fn classify_http_status_in_error(err_string: &str) -> Option<ErrorClass> {
     None
 }
 
-/// Classify an OpenDAL error into our ErrorClass
+/// Classify an `OpenDAL` error into our `ErrorClass`
 fn classify_opendal_error(err: &opendal::Error) -> ErrorClass {
     match err.kind() {
         ErrorKind::NotFound => ErrorClass::NotFound,
@@ -611,16 +615,18 @@ fn classify_opendal_error(err: &opendal::Error) -> ErrorClass {
     }
 }
 
-/// Convert an OpenDAL error to our Error type with proper classification
+/// Convert an `OpenDAL` error to our Error type with proper classification
+#[must_use]
 pub fn from_opendal_error(err: opendal::Error, context: &str) -> Error {
     let class = classify_opendal_error(&err);
     Error {
         class,
-        message: format!("{}: {}", context, err),
+        message: format!("{context}: {err}"),
     }
 }
 
-/// Convert a std::io::Error to our Error type with proper classification
+/// Convert a `std::io::Error` to our Error type with proper classification
+#[must_use]
 pub fn from_io_error(err: std::io::Error, context: &str) -> Error {
     let class = match err.kind() {
         std::io::ErrorKind::NotFound => ErrorClass::NotFound,
@@ -632,7 +638,7 @@ pub fn from_io_error(err: std::io::Error, context: &str) -> Error {
     };
     Error {
         class,
-        message: format!("{}: {}", context, err),
+        message: format!("{context}: {err}"),
     }
 }
 
@@ -651,7 +657,7 @@ impl Storage for OpendalStore {
             let class = classify_opendal_error(&e);
             Error {
                 class,
-                message: format!("Failed to open reader for {}: {}", key, e),
+                message: format!("Failed to open reader for {key}: {e}"),
             }
         })?;
 
@@ -676,7 +682,7 @@ impl Storage for OpendalStore {
                 let class = classify_opendal_error(&e);
                 Err(Error {
                     class,
-                    message: format!("Failed to check existence of {}: {}", key, e),
+                    message: format!("Failed to check existence of {key}: {e}"),
                 })
             }
         }
@@ -696,7 +702,7 @@ impl Storage for OpendalStore {
             let class = classify_opendal_error(&e);
             Error {
                 class,
-                message: format!("Failed to open writer for {}: {}", key, e),
+                message: format!("Failed to open writer for {key}: {e}"),
             }
         })?;
 
@@ -718,19 +724,20 @@ impl Storage for OpendalStore {
         let writer = self.open_writer(object).await?;
         // Convert reader to a stream of Buffer chunks (zero-copy)
         // The range `..` means read all data
-        let mut stream = reader.into_stream(..).await.map_err(|e| {
-            from_opendal_error(e, &format!("Failed to create stream for {}", object))
-        })?;
+        let mut stream = reader
+            .into_stream(..)
+            .await
+            .map_err(|e| from_opendal_error(e, &format!("Failed to create stream for {object}")))?;
 
         let mut sink = writer.into_sink();
         sink.send_all(&mut stream)
             .await
-            .map_err(|e| from_opendal_error(e, &format!("Failed to write data to {}", object)))?;
+            .map_err(|e| from_opendal_error(e, &format!("Failed to write data to {object}")))?;
 
         // Always call close() when using OpenDAL writer - it's required to flush internal buffers
-        sink.close().await.map_err(|e| {
-            from_opendal_error(e, &format!("Failed to close writer for {}", object))
-        })?;
+        sink.close()
+            .await
+            .map_err(|e| from_opendal_error(e, &format!("Failed to close writer for {object}")))?;
         Ok(())
     }
 
@@ -753,14 +760,14 @@ impl Storage for OpendalStore {
 /// Supports file://, http://, https://, and cloud storage schemes when features are enabled.
 ///
 /// Cloud storage URL formats (requires corresponding opendal-* feature):
-/// - `s3://bucket/prefix` - AWS S3 (uses AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_ENDPOINT env vars)
-/// - `gcs://bucket/prefix` - Google Cloud Storage (uses GOOGLE_APPLICATION_CREDENTIALS env var)
-/// - `azblob://container/prefix` - Azure Blob Storage (uses AZURE_STORAGE_ACCOUNT, AZURE_STORAGE_KEY env vars)
-/// - `b2://bucket/prefix` - Backblaze B2 (uses B2_APPLICATION_KEY_ID, B2_APPLICATION_KEY, B2_BUCKET_ID env vars)
-/// - `swift://container/prefix` - OpenStack Swift (uses SWIFT_ENDPOINT, SWIFT_TOKEN env vars)
-/// - `sftp://[user@]host[:port]/path` - SFTP (uses SFTP_USER, SFTP_KEY env vars)
-
-/// Create a backend from a URL string with configuration
+/// - `s3://bucket/prefix` - AWS S3 (uses `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_REGION`, `S3_ENDPOINT` env vars)
+/// - `gcs://bucket/prefix` - Google Cloud Storage (uses `GOOGLE_APPLICATION_CREDENTIALS` env var)
+/// - `azblob://container/prefix` - Azure Blob Storage (uses `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY` env vars)
+/// - `b2://bucket/prefix` - Backblaze B2 (uses `B2_APPLICATION_KEY_ID`, `B2_APPLICATION_KEY`, `B2_BUCKET_ID` env vars)
+/// - `swift://container/prefix` - `OpenStack` Swift (uses `SWIFT_ENDPOINT`, `SWIFT_TOKEN` env vars)
+/// - `sftp://[user@]host[:port]/path` - SFTP (uses `SFTP_USER`, `SFTP_KEY` env vars)
+///
+/// Creates a backend from a URL string with configuration.
 pub async fn from_url_with_config(
     url_str: &str,
     config: &StorageConfig,
@@ -768,7 +775,7 @@ pub async fn from_url_with_config(
     use url::Url;
 
     let url = Url::parse(url_str)
-        .map_err(|e| Error::fatal(format!("Failed to parse URL '{}': {}", url_str, e)))?;
+        .map_err(|e| Error::fatal(format!("Failed to parse URL '{url_str}': {e}")))?;
 
     match url.scheme() {
         "file" => {
@@ -789,7 +796,7 @@ pub async fn from_url_with_config(
         #[cfg(feature = "opendal-s3")]
         "s3" => {
             let bucket = url.host_str().ok_or_else(|| {
-                Error::fatal(format!("S3 URL must have a bucket name: {}", url_str))
+                Error::fatal(format!("S3 URL must have a bucket name: {url_str}"))
             })?;
             let prefix = url.path().trim_start_matches('/').to_string();
 
@@ -824,7 +831,7 @@ pub async fn from_url_with_config(
         #[cfg(feature = "opendal-gcs")]
         "gcs" | "gs" => {
             let bucket = url.host_str().ok_or_else(|| {
-                Error::fatal(format!("GCS URL must have a bucket name: {}", url_str))
+                Error::fatal(format!("GCS URL must have a bucket name: {url_str}"))
             })?;
             let prefix = url.path().trim_start_matches('/').to_string();
 
@@ -849,8 +856,7 @@ pub async fn from_url_with_config(
         "azblob" | "azure" => {
             let container = url.host_str().ok_or_else(|| {
                 Error::fatal(format!(
-                    "Azure Blob URL must have a container name: {}",
-                    url_str
+                    "Azure Blob URL must have a container name: {url_str}"
                 ))
             })?;
             let prefix = url.path().trim_start_matches('/').to_string();
@@ -883,7 +889,7 @@ pub async fn from_url_with_config(
         #[cfg(feature = "opendal-b2")]
         "b2" => {
             let bucket = url.host_str().ok_or_else(|| {
-                Error::fatal(format!("B2 URL must have a bucket name: {}", url_str))
+                Error::fatal(format!("B2 URL must have a bucket name: {url_str}"))
             })?;
             let prefix = url.path().trim_start_matches('/').to_string();
 
@@ -908,7 +914,7 @@ pub async fn from_url_with_config(
         #[cfg(feature = "opendal-swift")]
         "swift" => {
             let container = url.host_str().ok_or_else(|| {
-                Error::fatal(format!("Swift URL must have a container name: {}", url_str))
+                Error::fatal(format!("Swift URL must have a container name: {url_str}"))
             })?;
             let prefix = url.path().trim_start_matches('/').to_string();
 
@@ -935,7 +941,7 @@ pub async fn from_url_with_config(
         "sftp" => {
             let host = url
                 .host_str()
-                .ok_or_else(|| Error::fatal(format!("SFTP URL must have a host: {}", url_str)))?;
+                .ok_or_else(|| Error::fatal(format!("SFTP URL must have a host: {url_str}")))?;
             let port = url.port().unwrap_or(22);
             let user = if url.username().is_empty() {
                 std::env::var("SFTP_USER").ok()
@@ -952,7 +958,7 @@ pub async fn from_url_with_config(
             let key_path = std::env::var("SFTP_KEY").ok();
 
             // Build endpoint as host:port
-            let endpoint = format!("{}:{}", host, port);
+            let endpoint = format!("{host}:{port}");
 
             tracing::debug!(
                 "Creating SFTP store: endpoint={}, user={:?}, root={:?}, key={:?}",
@@ -976,6 +982,6 @@ pub async fn from_url_with_config(
         "sftp" => Err(Error::fatal(
             "SFTP support not compiled in. Enable the 'opendal-sftp' feature to use SFTP URLs.",
         )),
-        scheme => Err(Error::fatal(format!("Unsupported URL scheme: {}", scheme))),
+        scheme => Err(Error::fatal(format!("Unsupported URL scheme: {scheme}"))),
     }
 }

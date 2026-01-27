@@ -186,7 +186,7 @@ async fn test_scan_detects_missing_bucket(#[case] source: BucketSource, #[case] 
     remove_bucket_and_verify_scan_fails(
         archive_path,
         &bucket_to_remove,
-        &format!("Scan should fail with missing {}", description),
+        &format!("Scan should fail with missing {description}"),
     )
     .await;
 }
@@ -237,8 +237,7 @@ async fn test_scan_detects_corrupt_files(
                 .collect();
             assert!(
                 !files.is_empty(),
-                "Test archive must have files matching pattern '{}'",
-                pattern
+                "Test archive must have files matching pattern '{pattern}'"
             );
             remove_random_file(&files);
         }
@@ -249,8 +248,7 @@ async fn test_scan_detects_corrupt_files(
                 .collect();
             assert!(
                 !files.is_empty(),
-                "Test archive must have files matching pattern '{}'",
-                pattern
+                "Test archive must have files matching pattern '{pattern}'"
             );
             let mut rng = StdRng::from_entropy();
             let idx = rng.gen_range(0..files.len());
@@ -272,7 +270,7 @@ async fn test_scan_detects_corrupt_files(
 
     run_scan(scan_config)
         .await
-        .expect_err(&format!("Scan should fail with {}", description));
+        .expect_err(&format!("Scan should fail with {description}"));
 }
 
 #[tokio::test]
@@ -358,7 +356,7 @@ async fn test_scan_http_archive() {
 
     run_scan(scan_config).await.unwrap_or_else(|e| {
         server_handle.abort();
-        panic!("HTTP scan failed: {}", e);
+        panic!("HTTP scan failed: {e}");
     });
 
     server_handle.abort();
@@ -367,7 +365,7 @@ async fn test_scan_http_archive() {
 /// Smoke test against live Stellar archive infrastructure.
 /// Tests HTTP/HTTPS connections and trailing slash URL handling.
 #[tokio::test]
-#[ignore]
+#[ignore = "requires network access to live Stellar archive"]
 async fn smoke_live_stellar_archive_connection() {
     use std::time::Duration;
 

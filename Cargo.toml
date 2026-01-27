@@ -21,11 +21,14 @@ opendal-s3 = ["opendal/services-s3"]
 opendal-gcs = ["opendal/services-gcs"]
 opendal-azblob = ["opendal/services-azblob"]
 opendal-b2 = ["opendal/services-b2"]
-opendal-sftp = ["opendal/services-sftp"]
+opendal-sftp = ["opendal/services-sftp"] # Unix-only (uses openssh)
 opendal-swift = ["opendal/services-swift"]
 
-# Convenience feature to enable all cloud storage backends
-opendal-all = ["opendal-s3", "opendal-gcs", "opendal-azblob", "opendal-b2", "opendal-sftp", "opendal-swift"]
+# Convenience feature to enable all cross-platform cloud storage backends
+opendal-all = ["opendal-s3", "opendal-gcs", "opendal-azblob", "opendal-b2", "opendal-swift"]
+
+# Unix-only backends (includes SFTP)
+opendal-unix = ["opendal-sftp"]
 
 [[bin]]
 name = "stellar-archivist"

@@ -69,7 +69,7 @@ impl MirrorOperation {
         if !dst_store.supports_writes() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
-                format!("Destination storage backend does not support write operations. Only filesystem destinations (file://) are currently supported: {}", dst),
+                format!("Destination storage backend does not support write operations. Only filesystem destinations (file://) are currently supported: {dst}"),
             ).into());
         }
 
@@ -89,7 +89,8 @@ impl MirrorOperation {
     /// Get the destination's initial checkpoint from .well-known file, caching the result
     /// Returns None if destination doesn't have a .well-known file
     async fn get_initial_dest_well_known_checkpoint(&self) -> Option<u32> {
-        self.initial_dest_checkpoint
+        *self
+            .initial_dest_checkpoint
             .get_or_init(|| async {
                 // Try to read the destination's .well-known file
                 match fetch_well_known_history_file(
@@ -104,7 +105,6 @@ impl MirrorOperation {
                 }
             })
             .await
-            .clone()
     }
 
     async fn maybe_update_well_known(&self, highest_checkpoint: u32) -> Result<(), Error> {
@@ -113,35 +113,33 @@ impl MirrorOperation {
         // 1. There's no existing .well-known file, or
         // 2. The new checkpoint is higher than the existing .well-known file
 
-        let should_update = match self.get_initial_dest_well_known_checkpoint().await {
-            Some(existing_ledger) => {
-                let existing_checkpoint =
-                    history_format::round_to_lower_checkpoint(existing_ledger);
-                if highest_checkpoint > existing_checkpoint {
-                    info!(
-                        "Updating .well-known from checkpoint {} (0x{:08x}) to {} (0x{:08x})",
-                        existing_checkpoint,
-                        existing_checkpoint,
-                        highest_checkpoint,
-                        highest_checkpoint
-                    );
-                    true
-                } else {
-                    info!(
-                        "Keeping existing .well-known at checkpoint {} (0x{:08x}) (mirrored up to {} (0x{:08x}))",
-                        existing_checkpoint, existing_checkpoint, highest_checkpoint, highest_checkpoint
-                    );
-                    false
-                }
-            }
-            None => {
-                // No existing .well-known file - create a new one
+        let should_update = if let Some(existing_ledger) =
+            self.get_initial_dest_well_known_checkpoint().await
+        {
+            let existing_checkpoint = history_format::round_to_lower_checkpoint(existing_ledger);
+            if highest_checkpoint > existing_checkpoint {
                 info!(
-                    "No existing .well-known, creating new one at checkpoint {} (0x{:08x})",
-                    highest_checkpoint, highest_checkpoint
+                    "Updating .well-known from checkpoint {} (0x{:08x}) to {} (0x{:08x})",
+                    existing_checkpoint,
+                    existing_checkpoint,
+                    highest_checkpoint,
+                    highest_checkpoint
                 );
                 true
+            } else {
+                info!(
+                    "Keeping existing .well-known at checkpoint {} (0x{:08x}) (mirrored up to {} (0x{:08x}))",
+                    existing_checkpoint, existing_checkpoint, highest_checkpoint, highest_checkpoint
+                );
+                false
             }
+        } else {
+            // No existing .well-known file - create a new one
+            info!(
+                "No existing .well-known, creating new one at checkpoint {} (0x{:08x})",
+                highest_checkpoint, highest_checkpoint
+            );
+            true
         };
 
         if should_update {
@@ -290,7 +288,12 @@ impl Operation for MirrorOperation {
 
                 // Check for gaps between highest destination checkpoint and requested low
                 if dest_checkpoint < requested_checkpoint {
-                    if !self.allow_mirror_gaps {
+                    if self.allow_mirror_gaps {
+                        warn!(
+                            "WARNING: Creating gap in archive! Destination ends at ledger {} (checkpoint {} (0x{:08x})) but mirroring from {} (checkpoint {} (0x{:08x}))",
+                            dest_ledger, dest_checkpoint, dest_checkpoint, requested_low, requested_checkpoint, requested_checkpoint
+                        );
+                    } else {
                         return Err(Error::MirrorGapDetected {
                             dest_ledger,
                             dest_checkpoint,
@@ -298,11 +301,6 @@ impl Operation for MirrorOperation {
                             low_checkpoint: requested_checkpoint,
                         }
                         .into());
-                    } else {
-                        warn!(
-                            "WARNING: Creating gap in archive! Destination ends at ledger {} (checkpoint {} (0x{:08x})) but mirroring from {} (checkpoint {} (0x{:08x}))",
-                            dest_ledger, dest_checkpoint, dest_checkpoint, requested_low, requested_checkpoint, requested_checkpoint
-                        );
                     }
 
                     // Start at --low value
@@ -378,8 +376,7 @@ impl Operation for MirrorOperation {
             Err(e) => {
                 // Failed to check existence on destination
                 Some(Err(StorageError::fatal(format!(
-                    "Failed to check existence of destination {}: {}",
-                    path, e
+                    "Failed to check existence of destination {path}: {e}"
                 ))))
             }
         }
@@ -387,7 +384,7 @@ impl Operation for MirrorOperation {
 
     async fn process_object(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
         match self.dst_store.copy_from_reader(path, reader).await {
-            Ok(_) => Ok(()),
+            Ok(()) => Ok(()),
             Err(e) => {
                 self.cleanup_partial_file(path).await?;
                 Err(e)
@@ -397,7 +394,7 @@ impl Operation for MirrorOperation {
 
     async fn process_buffer(&self, path: &str, buffer: Buffer) {
         match self.dst_store.write(path, buffer).await {
-            Ok(_) => {
+            Ok(()) => {
                 self.stats.record_success(path);
             }
             Err(e) => {
