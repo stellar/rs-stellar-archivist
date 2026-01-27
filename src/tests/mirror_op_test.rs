@@ -6,7 +6,8 @@
 //! - Resume and --overwrite behavior
 
 use super::utils::{
-    copy_test_archive, start_http_server, start_http_server_with_app, test_archive_path,
+    copy_test_archive, file_url_from_path, path_to_slash_string, start_http_server,
+    start_http_server_with_app, test_archive_path,
 };
 use crate::{
     history_format,
@@ -75,7 +76,7 @@ fn verify_checkpoint_files(source_path: &Path, dest_path: &Path, max_checkpoint:
     {
         let src_file = entry.path();
         let relative_path = src_file.strip_prefix(source_path).unwrap();
-        let path_str = relative_path.to_string_lossy();
+        let path_str = path_to_slash_string(relative_path);
 
         // Skip .well-known and bucket files
         if path_str == ".well-known/stellar-history.json" || path_str.starts_with("bucket/") {
@@ -121,7 +122,7 @@ fn verify_destination_files(
     {
         let dst_file = entry.path();
         let relative_path = dst_file.strip_prefix(dest_path).unwrap();
-        let path_str = relative_path.to_string_lossy();
+        let path_str = path_to_slash_string(relative_path);
 
         if path_str == ".well-known/stellar-history.json" {
             continue;
@@ -186,11 +187,12 @@ async fn test_mirror_full_archive() {
         .join("testnet-archive-small");
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let mirror_dest = temp_dir.path().to_str().unwrap();
+    let mirror_dest_url = file_url_from_path(temp_dir.path());
+    let src_url = file_url_from_path(&test_archive_path);
 
     let mirror_config = MirrorConfig {
-        src: format!("file://{}", test_archive_path.to_str().unwrap()),
-        dst: format!("file://{mirror_dest}"),
+        src: src_url,
+        dst: mirror_dest_url.clone(),
         concurrency: 20,
         skip_optional: false,
         high: None,
@@ -204,7 +206,7 @@ async fn test_mirror_full_archive() {
 
     // Verify with scan
     run_scan(ScanConfig {
-        archive: format!("file://{mirror_dest}"),
+        archive: mirror_dest_url,
         concurrency: 4,
         skip_optional: false,
         low: None,
@@ -234,11 +236,12 @@ async fn test_mirror_bounded() {
         .join("testnet-archive-small");
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let mirror_dest = temp_dir.path().to_str().unwrap();
+    let mirror_dest_url = file_url_from_path(temp_dir.path());
+    let src_url = file_url_from_path(&test_archive_path);
 
     let mirror_config = MirrorConfig {
-        src: format!("file://{}", test_archive_path.to_str().unwrap()),
-        dst: format!("file://{mirror_dest}"),
+        src: src_url,
+        dst: mirror_dest_url.clone(),
         concurrency: 20,
         skip_optional: false,
         high: Some(4991),
@@ -254,7 +257,7 @@ async fn test_mirror_bounded() {
 
     // Verify with scan
     run_scan(ScanConfig {
-        archive: format!("file://{mirror_dest}"),
+        archive: mirror_dest_url,
         concurrency: 4,
         skip_optional: false,
         low: None,
@@ -283,11 +286,12 @@ async fn test_mirror_skip_optional() {
         .join("testnet-archive-small");
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let mirror_dest = temp_dir.path().to_str().unwrap();
+    let mirror_dest_url = file_url_from_path(temp_dir.path());
+    let src_url = file_url_from_path(&test_archive_path);
 
     let mirror_config = MirrorConfig {
-        src: format!("file://{}", test_archive_path.to_str().unwrap()),
-        dst: format!("file://{mirror_dest}"),
+        src: src_url,
+        dst: mirror_dest_url.clone(),
         concurrency: 4,
         skip_optional: true,
         high: None,
@@ -306,7 +310,7 @@ async fn test_mirror_skip_optional() {
 
     // Verify with scan (must also skip optional)
     run_scan(ScanConfig {
-        archive: format!("file://{mirror_dest}"),
+        archive: mirror_dest_url,
         concurrency: 4,
         skip_optional: true,
         low: None,
@@ -324,10 +328,10 @@ async fn test_mirror_skip_optional() {
 /// Tests that resuming a mirror without creating a gap succeeds
 #[tokio::test]
 async fn test_mirror_resume_without_gap() {
-    let src = format!("file://{}", test_archive_path().display());
+    let src = file_url_from_path(&test_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
-    let dst = format!("file://{}", dest_path.display());
+    let dst = file_url_from_path(&dest_path);
 
     // Mirror up to ledger 500
     run_mirror(MirrorConfig::new(&src, &dst).skip_optional().high(500))
@@ -355,10 +359,10 @@ async fn test_mirror_resume_without_gap() {
 /// Tests that creating a gap without --allow-mirror-gaps flag is rejected
 #[tokio::test]
 async fn test_mirror_rejects_gap_creation() {
-    let src = format!("file://{}", test_archive_path().display());
+    let src = file_url_from_path(&test_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
-    let dst = format!("file://{}", dest_path.display());
+    let dst = file_url_from_path(&dest_path);
 
     // Mirror up to ledger 1000 to establish destination state
     run_mirror(MirrorConfig::new(&src, &dst).skip_optional().high(1000))
@@ -399,10 +403,10 @@ async fn test_mirror_rejects_gap_creation() {
 /// Tests that --allow-mirror-gaps flag permits creating gaps
 #[tokio::test]
 async fn test_mirror_allows_gap_with_flag() {
-    let src = format!("file://{}", test_archive_path().display());
+    let src = file_url_from_path(&test_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
-    let dst = format!("file://{}", dest_path.display());
+    let dst = file_url_from_path(&dest_path);
 
     // Mirror up to ledger 1000 to establish destination state
     run_mirror(MirrorConfig::new(&src, &dst).skip_optional().high(1000))
@@ -431,10 +435,10 @@ async fn test_mirror_allows_gap_with_flag() {
 
 #[tokio::test]
 async fn test_mirror_allows_gaps_for_empty_destination() {
-    let src = format!("file://{}", test_archive_path().display());
+    let src = file_url_from_path(&test_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("empty_dest");
-    let dst = format!("file://{}", dest_path.display());
+    let dst = file_url_from_path(&dest_path);
 
     // Mirror with --low to an empty destination
     // Should succeed without gap check since there's no existing archive
@@ -474,10 +478,10 @@ async fn test_mirror_allows_gaps_for_empty_destination() {
 /// Tests that resume without --overwrite skips existing files (ignores --low)
 #[tokio::test]
 async fn test_mirror_resume_skips_existing_files() {
-    let src = format!("file://{}", test_archive_path().display());
+    let src = file_url_from_path(&test_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
-    let dst = format!("file://{}", dest_path.display());
+    let dst = file_url_from_path(&dest_path);
 
     // Mirror up to ledger 2000 to establish destination state
     run_mirror(MirrorConfig::new(&src, &dst).skip_optional().high(2000))
@@ -518,10 +522,10 @@ async fn test_mirror_resume_skips_existing_files() {
 /// Tests that --overwrite re-downloads files in range but not before --low
 #[tokio::test]
 async fn test_mirror_overwrite_redownloads_in_range() {
-    let src = format!("file://{}", test_archive_path().display());
+    let src = file_url_from_path(&test_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
-    let dst = format!("file://{}", dest_path.display());
+    let dst = file_url_from_path(&dest_path);
 
     // Mirror up to ledger 2000 to establish destination state
     run_mirror(MirrorConfig::new(&src, &dst).skip_optional().high(2000))
@@ -581,10 +585,10 @@ async fn test_mirror_overwrite_redownloads_in_range() {
 /// Tests that empty files (0 bytes) are treated as non-existent and get re-downloaded when encountered.
 #[tokio::test]
 async fn test_mirror_replaces_empty_files() {
-    let src = format!("file://{}", test_archive_path().display());
+    let src = file_url_from_path(&test_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
-    let dst = format!("file://{}", dest_path.display());
+    let dst = file_url_from_path(&dest_path);
 
     // Create destination directory structure with an empty file before mirroring
     // This simulates a partial/failed previous mirror that left an empty file
@@ -618,10 +622,10 @@ async fn test_mirror_replaces_empty_files() {
 /// Tests that mirroring with --high lower than dest succeeds gracefully (destination already up to date).
 #[tokio::test]
 async fn test_mirror_lower_high_than_dest_succeeds() {
-    let src = format!("file://{}", test_archive_path().display());
+    let src = file_url_from_path(&test_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
-    let dst = format!("file://{}", dest_path.display());
+    let dst = file_url_from_path(&dest_path);
 
     // First mirror to checkpoint 2000 (rounds to 0x7ff = 2047)
     run_mirror(MirrorConfig::new(&src, &dst).skip_optional().high(2000))
@@ -640,10 +644,10 @@ async fn test_mirror_lower_high_than_dest_succeeds() {
 /// Tests that mirroring to same checkpoint succeeds but .well-known is preserved.
 #[tokio::test]
 async fn test_mirror_preserves_wellknown_when_dest_is_equal() {
-    let src = format!("file://{}", test_archive_path().display());
+    let src = file_url_from_path(&test_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
-    let dst = format!("file://{}", dest_path.display());
+    let dst = file_url_from_path(&dest_path);
 
     // First mirror to checkpoint 2000 (rounds to 0x7ff = 2047)
     run_mirror(MirrorConfig::new(&src, &dst).skip_optional().high(2000))
@@ -677,10 +681,10 @@ async fn test_mirror_preserves_wellknown_when_dest_is_equal() {
 /// Tests that .well-known is created when destination has data but missing .well-known.
 #[tokio::test]
 async fn test_mirror_creates_wellknown_when_missing() {
-    let src = format!("file://{}", test_archive_path().display());
+    let src = file_url_from_path(&test_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
-    let dst = format!("file://{}", dest_path.display());
+    let dst = file_url_from_path(&dest_path);
 
     // Mirror to checkpoint 1000 (rounds to 0x3ff = 1023)
     run_mirror(MirrorConfig::new(&src, &dst).skip_optional().high(1000))
@@ -730,12 +734,12 @@ async fn test_mirror_http_to_filesystem() {
     let (server_url, server_handle) = start_http_server(&archive_path).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
-    let mirror_dest = temp_dir.path().to_str().unwrap();
+    let mirror_dest_url = file_url_from_path(temp_dir.path());
 
     // Mirror from HTTP to filesystem
     let mirror_config = MirrorConfig {
         src: server_url.clone(),
-        dst: format!("file://{mirror_dest}"),
+        dst: mirror_dest_url.clone(),
         concurrency: 4,
         high: None,
         low: None,
@@ -752,7 +756,7 @@ async fn test_mirror_http_to_filesystem() {
 
     // Verify the mirrored archive
     let scan_config = ScanConfig {
-        archive: format!("file://{mirror_dest}"),
+        archive: mirror_dest_url,
         concurrency: 4,
         skip_optional: false,
         low: None,
@@ -825,11 +829,11 @@ async fn test_mirror_race_condition_with_advancing_archive() {
 
     // Mirror the archive - it will get initial .well-known first, then advanced .well-known at the end
     let temp_dest = TempDir::new().expect("Failed to create temp dir");
-    let mirror_dest = temp_dest.path().to_str().unwrap();
+    let mirror_dest_url = file_url_from_path(temp_dest.path());
 
     let mirror_config = MirrorConfig {
         src: server_url.clone(),
-        dst: format!("file://{mirror_dest}"),
+        dst: mirror_dest_url,
         concurrency: 4,
         high: None, // Unbounded mirror
         low: None,
@@ -845,8 +849,7 @@ async fn test_mirror_race_condition_with_advancing_archive() {
     });
 
     // Check what .well-known was written with the original destination .well-known file (127)
-    let dest_well_known_path =
-        std::path::Path::new(mirror_dest).join(".well-known/stellar-history.json");
+    let dest_well_known_path = temp_dest.path().join(".well-known/stellar-history.json");
     let dest_well_known_content = std::fs::read_to_string(&dest_well_known_path)
         .expect("Failed to read destination .well-known");
     let dest_well_known: serde_json::Value = serde_json::from_str(&dest_well_known_content)
@@ -856,7 +859,7 @@ async fn test_mirror_race_condition_with_advancing_archive() {
     assert_eq!(dest_well_known_ledger, 127);
 
     // Verify checkpoint 191 files were not downloaded (mirror used initial .well-known at 127)
-    let dest = std::path::Path::new(mirror_dest);
+    let dest = temp_dest.path();
     assert!(
         !dest.join("history/00/00/00/history-000000bf.json").exists(),
         "checkpoint 191 should not exist"

@@ -320,7 +320,7 @@ impl HistoryFileState {
 // Check if ledger is a checkpoint (63, 127, 191, ...)
 #[must_use]
 pub fn is_checkpoint(ledger: u32) -> bool {
-    ledger > 0 && (ledger + 1) % CHECKPOINT_FREQUENCY == 0
+    ledger > 0 && (ledger + 1).is_multiple_of(CHECKPOINT_FREQUENCY)
 }
 
 // Validate bucket hash format (64 hex chars)

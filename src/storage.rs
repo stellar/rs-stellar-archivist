@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use futures_util::SinkExt;
 use futures_util::StreamExt;
+use normalize_path::NormalizePath;
 use opendal::{layers, Buffer, ErrorKind, Operator, Reader, Writer};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -338,7 +339,7 @@ impl OpendalStore {
     pub fn filesystem(root: impl Into<PathBuf>, config: &StorageConfig) -> Result<Self, Error> {
         use opendal::services::Fs;
 
-        let root_path: PathBuf = root.into();
+        let root_path: PathBuf = root.into().normalize();
         let root_str = root_path.to_string_lossy().to_string();
 
         let builder = if config.atomic_file_writes {
@@ -774,15 +775,21 @@ pub async fn from_url_with_config(
 ) -> Result<StorageRef, Error> {
     use url::Url;
 
-    let url = Url::parse(url_str)
+    let normalized_url_str = if url_str.starts_with("file://") {
+        url_str.replace('\\', "/")
+    } else {
+        url_str.to_string()
+    };
+
+    let url = Url::parse(&normalized_url_str)
         .map_err(|e| Error::fatal(format!("Failed to parse URL '{url_str}': {e}")))?;
 
     match url.scheme() {
         "file" => {
-            let path = url.path().to_string();
+            let path = file_url_to_path(&url, url_str)?;
             tracing::debug!(
                 "Creating filesystem store with path: {} (from URL: {})",
-                path,
+                path.display(),
                 url_str
             );
             let store = OpendalStore::filesystem(path, config)?;
@@ -984,4 +991,32 @@ pub async fn from_url_with_config(
         )),
         scheme => Err(Error::fatal(format!("Unsupported URL scheme: {scheme}"))),
     }
+}
+
+fn file_url_to_path(url: &url::Url, url_str: &str) -> Result<PathBuf, Error> {
+    if let Ok(path) = url.to_file_path() {
+        return Ok(path);
+    }
+
+    if cfg!(windows) {
+        if let Some(host) = url.host_str() {
+            if host.len() == 1 {
+                let fixed = format!("file:///{}:{}", host, url.path());
+                if let Ok(fixed_url) = url::Url::parse(&fixed) {
+                    if let Ok(path) = fixed_url.to_file_path() {
+                        return Ok(path);
+                    }
+                }
+                let mut path = String::with_capacity(host.len() + 1 + url.path().len());
+                path.push_str(host);
+                path.push(':');
+                path.push_str(url.path());
+                return Ok(PathBuf::from(path));
+            }
+        }
+    }
+
+    Err(Error::fatal(format!(
+        "Invalid file URL '{url_str}': unable to convert to filesystem path"
+    )))
 }

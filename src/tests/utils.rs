@@ -10,6 +10,8 @@
 
 use crate::utils::{NON_STANDARD_RETRYABLE_HTTP_ERRORS, STANDARD_RETRYABLE_HTTP_ERRORS};
 use axum::{routing::get_service, Router};
+use normalize_path::NormalizePath;
+use path_slash::PathExt;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -17,6 +19,7 @@ use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
+use url::Url;
 use walkdir::WalkDir;
 
 //=============================================================================
@@ -28,6 +31,17 @@ pub fn test_archive_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("testdata")
         .join("testnet-archive-small")
+}
+
+pub fn file_url_from_path(path: &Path) -> String {
+    let normalized = path.normalize();
+    Url::from_file_path(&normalized)
+        .unwrap_or_else(|()| panic!("Failed to build file URL for {}", normalized.display()))
+        .to_string()
+}
+
+pub fn path_to_slash_string(path: &Path) -> String {
+    path.normalize().to_slash_lossy().into_owned()
 }
 
 /// Copy the test archive to a destination directory
@@ -60,7 +74,7 @@ pub fn get_files_by_pattern(archive_path: &Path, pattern: &str) -> Vec<PathBuf> 
     {
         if entry.file_type().is_file() {
             let path = entry.path();
-            let path_str = path.to_string_lossy();
+            let path_str = path_to_slash_string(path);
             if path_str.contains(pattern) {
                 files.push(path.to_path_buf());
             }

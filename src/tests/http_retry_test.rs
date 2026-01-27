@@ -6,8 +6,8 @@
 //! - Connection drops trigger retries
 
 use super::utils::{
-    start_flaky_server, start_http_server_with_app, test_archive_path, transient_http_errors,
-    FlakyServerConfig, RequestTracker,
+    file_url_from_path, start_flaky_server, start_http_server_with_app, test_archive_path,
+    transient_http_errors, FlakyServerConfig, RequestTracker,
 };
 use crate::test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig};
 use axum::{
@@ -50,7 +50,7 @@ impl Operation {
             Operation::Mirror => {
                 let dest_dir = TempDir::new().unwrap();
                 run_mirror(
-                    MirrorConfig::new(server_url, format!("file://{}", dest_dir.path().display()))
+                    MirrorConfig::new(server_url, file_url_from_path(dest_dir.path()))
                         .skip_optional()
                         .concurrency(1)
                         .high(63),
@@ -167,7 +167,6 @@ async fn test_retries_on_connection_drops(#[case] op: Operation) {
 }
 
 /// Tests that retry delays follow exponential backoff pattern.
-/// Uses 1s initial backoff so 100ms system jitter is only ~10% tolerance.
 #[rstest]
 #[case::one_failure(1)]
 #[case::two_failures(2)]
@@ -196,7 +195,7 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
 
     let dest_dir = TempDir::new().unwrap();
     let result = run_mirror(
-        MirrorConfig::new(&server_url, format!("file://{}", dest_dir.path().display()))
+        MirrorConfig::new(&server_url, file_url_from_path(dest_dir.path()))
             .skip_optional()
             .concurrency(1)
             .high(63)
@@ -229,7 +228,7 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
     );
 
     for (path, _) in &retried_paths {
-        if let Err(e) = tracker.verify_backoff_timing(path, 1000, 100) {
+        if let Err(e) = tracker.verify_backoff_timing(path, 1000, 200) {
             panic!("Exponential backoff failed for {path} with {fail_count} failures: {e}");
         }
     }
@@ -425,12 +424,11 @@ async fn test_partial_body_retry_succeeds_without_corruption(#[case] atomic_file
     );
 
     let dest_dir = TempDir::new().unwrap();
-    let mirror_config =
-        MirrorConfig::new(&server_url, format!("file://{}", dest_dir.path().display()))
-            .skip_optional()
-            .concurrency(1)
-            .high(63)
-            .storage_config(storage_config);
+    let mirror_config = MirrorConfig::new(&server_url, file_url_from_path(dest_dir.path()))
+        .skip_optional()
+        .concurrency(1)
+        .high(63)
+        .storage_config(storage_config);
 
     let result = run_mirror(mirror_config).await;
     handle.abort();

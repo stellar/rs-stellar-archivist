@@ -1,6 +1,9 @@
 //! Tests for scan command operations
 
-use super::utils::{copy_test_archive, get_files_by_pattern, start_http_server, test_archive_path};
+use super::utils::{
+    copy_test_archive, file_url_from_path, get_files_by_pattern, start_http_server,
+    test_archive_path,
+};
 use crate::storage::{OpendalStore, Storage, StorageConfig};
 use crate::test_helpers::{run_scan, test_storage_config, ScanConfig};
 use rand::rngs::StdRng;
@@ -94,7 +97,7 @@ async fn remove_bucket_and_verify_scan_fails(
             std::fs::remove_file(bucket_file).expect("Failed to remove bucket file");
 
             let scan_config = ScanConfig {
-                archive: format!("file://{}", archive_path.to_str().unwrap()),
+                archive: file_url_from_path(archive_path),
                 concurrency: 8,
                 skip_optional: false,
                 low: None,
@@ -114,7 +117,7 @@ async fn remove_bucket_and_verify_scan_fails(
 
 #[tokio::test]
 async fn test_scan_low_beyond_current() {
-    let archive = format!("file://{}", test_archive_path().display());
+    let archive = file_url_from_path(&test_archive_path());
 
     // Test with low beyond the archive's current ledger - should fail
     let result = run_scan(ScanConfig::new(&archive).skip_optional().low(20000)).await;
@@ -126,7 +129,7 @@ async fn test_scan_low_beyond_current() {
 
 #[tokio::test]
 async fn test_scan_high_beyond_current() {
-    let archive = format!("file://{}", test_archive_path().display());
+    let archive = file_url_from_path(&test_archive_path());
 
     // Test with high beyond the archive's current ledger - should warn but not fail
     let result = run_scan(ScanConfig::new(&archive).skip_optional().high(20000)).await;
@@ -260,7 +263,7 @@ async fn test_scan_detects_corrupt_files(
     }
 
     let scan_config = ScanConfig {
-        archive: format!("file://{}", archive_path.to_str().unwrap()),
+        archive: file_url_from_path(archive_path),
         concurrency: 8,
         skip_optional: false,
         low: None,
@@ -287,7 +290,7 @@ async fn test_scan_missing_scp_with_optional_flag() {
 
     // First scan with skip_optional: false - should fail
     let scan_required = ScanConfig {
-        archive: format!("file://{}", archive_path.to_str().unwrap()),
+        archive: file_url_from_path(archive_path),
         concurrency: 8,
         skip_optional: false, // SCP files are required
         low: None,
@@ -301,7 +304,7 @@ async fn test_scan_missing_scp_with_optional_flag() {
 
     // Second scan with skip_optional: true - should succeed
     let scan_optional = ScanConfig {
-        archive: format!("file://{}", archive_path.to_str().unwrap()),
+        archive: file_url_from_path(archive_path),
         concurrency: 8,
         skip_optional: true, // SCP files are optional
         low: None,
@@ -321,7 +324,7 @@ async fn test_scan_complete_archive() {
     let test_archive_path = test_archive_path();
 
     let scan_config = ScanConfig {
-        archive: format!("file://{}", test_archive_path.display()),
+        archive: file_url_from_path(&test_archive_path),
         concurrency: 8,
         skip_optional: false,
         low: None,

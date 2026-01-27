@@ -177,7 +177,9 @@ impl<Op: Operation> Pipeline<Op> {
             .for_each_concurrent(self.config.concurrency, |fut| async {
                 fut.await;
                 let completed = self.progress_tracker.fetch_add(1, Ordering::Relaxed) + 1;
-                if completed % PROGRESS_REPORTING_FREQUENCY == 0 || completed == total_count {
+                if completed.is_multiple_of(PROGRESS_REPORTING_FREQUENCY)
+                    || completed == total_count
+                {
                     info!(
                         "Progress: {}/{} checkpoints processed",
                         completed, total_count

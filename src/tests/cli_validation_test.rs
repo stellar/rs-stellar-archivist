@@ -1,5 +1,6 @@
 //! Tests for command-line interface validation and error handling
 
+use super::utils::file_url_from_path;
 use crate::test_helpers::{run_mirror as cmd_mirror_run, MirrorConfig};
 use rstest::rstest;
 
@@ -70,8 +71,8 @@ async fn test_mirror_creates_destination_if_not_exists() {
     let temp_base = TempDir::new().expect("Failed to create temp base");
     let dest_path = temp_base.path().join("new-dest-directory");
 
-    let src = format!("file://{}", test_archive_path().display());
-    let dst = format!("file://{}", dest_path.display());
+    let src = file_url_from_path(&test_archive_path());
+    let dst = file_url_from_path(&dest_path);
     let config = MirrorConfig::new(&src, &dst).skip_optional().high(63);
 
     let result = cmd_mirror_run(config).await;
@@ -96,13 +97,13 @@ async fn test_rejects_low_greater_than_high(#[case] operation: &str) {
     use crate::test_helpers::{run_scan, ScanConfig};
     use tempfile::TempDir;
 
-    let src = format!("file://{}", test_archive_path().display());
+    let src = file_url_from_path(&test_archive_path());
 
     let result = match operation {
         "scan" => run_scan(ScanConfig::new(&src).low(2000).high(1000)).await,
         "mirror" => {
             let temp_dir = TempDir::new().unwrap();
-            let dst = format!("file://{}", temp_dir.path().join("dest").display());
+            let dst = file_url_from_path(&temp_dir.path().join("dest"));
             cmd_mirror_run(MirrorConfig::new(&src, &dst).low(2000).high(1000)).await
         }
         _ => unreachable!(),
