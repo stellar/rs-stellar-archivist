@@ -54,6 +54,10 @@ bytes = { version = "1" }
 futures-io = { version = "0.3" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 normalize-path = { version = "0.2.1" }
+sha2 = "0.10"
+async-compression = { version = "0.4", features = ["tokio", "gzip"] }
+hex = "0.4"
+tokio-stream = "0.1"
 
 [dev-dependencies]
 tempfile = { version = "3.5.0" }
@@ -65,3 +69,4 @@ tower-http = { version = "0.6", features = ["fs"] }
 walkdir = { version = "2" }
 wiremock = { version = "0.6" }
 path-slash = { version = "0.2" }
+flate2 = { version = "1" }

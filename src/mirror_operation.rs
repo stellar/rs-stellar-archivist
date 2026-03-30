@@ -52,6 +52,9 @@ pub struct MirrorOperation {
 
     // Cached destination checkpoint at start of operation (or None if destination doesn't exist)
     initial_dest_checkpoint: OnceCell<Option<u32>>,
+
+    // Whether to verify bucket hashes
+    verify: bool,
 }
 
 impl MirrorOperation {
@@ -62,6 +65,7 @@ impl MirrorOperation {
         high: Option<u32>,
         allow_mirror_gaps: bool,
         storage_config: &StorageConfig,
+        verify: bool,
     ) -> Result<Self, Error> {
         let dst_store = crate::storage::from_url_with_config(dst, storage_config).await?;
 
@@ -83,6 +87,7 @@ impl MirrorOperation {
             max_retries: storage_config.max_retries as u32,
             retry_min_delay_ms: storage_config.retry_min_delay.as_millis() as u64,
             initial_dest_checkpoint: OnceCell::new(),
+            verify,
         })
     }
 
@@ -383,11 +388,23 @@ impl Operation for MirrorOperation {
     }
 
     async fn process_object(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
-        match self.dst_store.copy_from_reader(path, reader).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                self.cleanup_partial_file(path).await?;
-                Err(e)
+        if self.verify && crate::history_format::is_bucket_file(path) {
+            match crate::verify::verify_and_write_bucket(path, reader, &self.dst_store).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    // Clean up corrupted/partial file on hash mismatch or decode failure
+                    self.cleanup_partial_file(path).await?;
+                    Err(e)
+                }
+            }
+        } else {
+            // Standard copy for non-bucket files or when verification is disabled
+            match self.dst_store.copy_from_reader(path, reader).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    self.cleanup_partial_file(path).await?;
+                    Err(e)
+                }
             }
         }
     }
