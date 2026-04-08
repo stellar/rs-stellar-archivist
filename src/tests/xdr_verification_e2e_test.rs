@@ -609,8 +609,8 @@ fn corrupt_result_hash_in_ledger(archive_path: &Path, archive_type: ArchiveType)
 
     let mut corrupted = decompressed;
     if corrupted.len() > 200 {
-        for i in 150..182 {
-            corrupted[i] = 0xff;
+        for byte in corrupted.iter_mut().take(182).skip(150) {
+            *byte = 0xff;
         }
     }
 
@@ -659,9 +659,10 @@ async fn test_scan_verify_detects_result_hash_mismatch(#[case] archive_type: Arc
 fn corrupt_prev_ledger_hash(archive_path: &Path, archive_type: ArchiveType) {
     let ledger_files = get_files_in_checkpoint_range(archive_path, archive_type, "/ledger-");
 
-    if ledger_files.len() < 2 {
-        panic!("Need at least 2 ledger files for hash chain test");
-    }
+    assert!(
+        ledger_files.len() >= 2,
+        "Need at least 2 ledger files for hash chain test"
+    );
 
     let second_file = &ledger_files[1];
 
@@ -677,8 +678,8 @@ fn corrupt_prev_ledger_hash(archive_path: &Path, archive_type: ArchiveType) {
 
     let mut corrupted = decompressed;
     if corrupted.len() > 100 {
-        for i in 50..82 {
-            corrupted[i] = 0xaa;
+        for byte in corrupted.iter_mut().take(82).skip(50) {
+            *byte = 0xaa;
         }
     }
 

@@ -406,7 +406,7 @@ impl XdrVerificationManager {
         let mut chain_errors = Vec::new();
 
         let mut checkpoints: Vec<_> = boundaries.keys().copied().collect();
-        checkpoints.sort();
+        checkpoints.sort_unstable();
 
         for window in checkpoints.windows(2) {
             let prev_checkpoint = window[0];
@@ -911,7 +911,7 @@ pub async fn verify_and_write_xdr(
         )
         .map(XdrParseResult::Transactions)
     } else if crate::history_format::is_scp_file(path) {
-        parse_scp_entries(&decompressed).map(|_| XdrParseResult::None)
+        parse_scp_entries(&decompressed).map(|()| XdrParseResult::None)
     } else {
         Ok(XdrParseResult::None)
     };

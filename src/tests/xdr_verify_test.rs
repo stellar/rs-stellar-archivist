@@ -1,10 +1,9 @@
 use crate::xdr_verify::{
     compute_empty_v0_tx_set_hash, compute_empty_v1_tx_set_hash, compute_v0_tx_set_hash,
     compute_v1_tx_set_hash, expected_ledger_range, is_empty_tx_set_hash, parse_ledger_entries,
-    parse_ledger_entries_for_checkpoint, parse_result_entries,
-    parse_result_entries_for_checkpoint, parse_scp_entries, parse_transaction_entries,
-    parse_transaction_entries_for_checkpoint, LedgerVerificationData, XdrVerificationManager,
-    EMPTY_XDR_ARRAY_HASH,
+    parse_ledger_entries_for_checkpoint, parse_result_entries, parse_result_entries_for_checkpoint,
+    parse_scp_entries, parse_transaction_entries, parse_transaction_entries_for_checkpoint,
+    LedgerVerificationData, XdrVerificationManager, EMPTY_XDR_ARRAY_HASH,
 };
 use rstest::rstest;
 use sha2::{Digest, Sha256};
@@ -57,7 +56,7 @@ fn tx_v0_envelope(id: u8) -> TransactionEnvelope {
         tx: TransactionV0 {
             source_account_ed25519: ed25519(id),
             fee: 100,
-            seq_num: SequenceNumber(id as i64 + 1),
+            seq_num: SequenceNumber(i64::from(id) + 1),
             time_bounds: None,
             memo: Memo::None,
             operations: vec![create_account_operation(id)].try_into().unwrap(),
@@ -72,7 +71,7 @@ fn tx_v1_envelope(id: u8) -> TransactionEnvelope {
         tx: Transaction {
             source_account: muxed_account(id),
             fee: 100,
-            seq_num: SequenceNumber(id as i64 + 1),
+            seq_num: SequenceNumber(i64::from(id) + 1),
             cond: Preconditions::None,
             memo: Memo::None,
             operations: vec![create_account_operation(id)].try_into().unwrap(),
@@ -319,7 +318,7 @@ fn test_parse_result_entries_single_entry() {
     let data = frame_xdr(&entry);
     let parsed = parse_result_entries(&data).unwrap();
     let expected: [u8; 32] =
-        Sha256::digest(&entry.tx_result_set.to_xdr(Limits::none()).unwrap()).into();
+        Sha256::digest(entry.tx_result_set.to_xdr(Limits::none()).unwrap()).into();
 
     assert_eq!(parsed, HashMap::from([(100, expected)]));
 }
@@ -426,7 +425,7 @@ fn test_compute_v1_tx_set_hash_matches_manual_hash() {
         .try_into()
         .unwrap(),
     });
-    let expected: [u8; 32] = Sha256::digest(&generalized.to_xdr(Limits::none()).unwrap()).into();
+    let expected: [u8; 32] = Sha256::digest(generalized.to_xdr(Limits::none()).unwrap()).into();
 
     assert_eq!(compute_v1_tx_set_hash(&generalized).unwrap(), expected);
 }
@@ -441,7 +440,7 @@ fn test_is_empty_tx_set_hash_direct_hashes() {
         previous_ledger_hash: Hash(prev_hash),
         phases: VecM::default(),
     });
-    let expected_v1: [u8; 32] = Sha256::digest(&empty_v1.to_xdr(Limits::none()).unwrap()).into();
+    let expected_v1: [u8; 32] = Sha256::digest(empty_v1.to_xdr(Limits::none()).unwrap()).into();
     assert_eq!(compute_empty_v1_tx_set_hash(&prev_hash), expected_v1);
 
     assert!(is_empty_tx_set_hash(

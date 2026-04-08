@@ -908,9 +908,13 @@ async fn test_mirror_verify_does_not_advance_well_known_on_verification_failure(
     let dst_url = file_url_from_path(&dest_path);
 
     // Mirror up to checkpoint 127 (0x7f) to establish baseline .well-known
-    run_mirror(MirrorConfig::new(&src_url, &dst_url).skip_optional().high(127))
-        .await
-        .expect("Baseline mirror should succeed");
+    run_mirror(
+        MirrorConfig::new(&src_url, &dst_url)
+            .skip_optional()
+            .high(127),
+    )
+    .await
+    .expect("Baseline mirror should succeed");
 
     let wellknown_path = dest_path.join(".well-known/stellar-history.json");
     let baseline_content = std::fs::read_to_string(&wellknown_path)
@@ -925,10 +929,9 @@ async fn test_mirror_verify_does_not_advance_well_known_on_verification_failure(
 
     // Corrupt a transactions file at a later checkpoint (191 = 0xbf) with
     // invalid gzip content so the XDR parse fails during process_object
-    let corrupt_tx_file =
-        corrupt_src
-            .path()
-            .join("transactions/00/00/00/transactions-000000bf.xdr.gz");
+    let corrupt_tx_file = corrupt_src
+        .path()
+        .join("transactions/00/00/00/transactions-000000bf.xdr.gz");
     std::fs::write(&corrupt_tx_file, b"not valid gzip data at all")
         .expect("Failed to corrupt transactions file");
 

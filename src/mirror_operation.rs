@@ -212,7 +212,7 @@ impl MirrorOperation {
 
     async fn copy_file(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
         match self.dst_store.copy_from_reader(path, reader).await {
-            Ok(_) => Ok(()),
+            Ok(()) => Ok(()),
             Err(e) => {
                 self.cleanup_partial_file(path).await?;
                 Err(e)
@@ -408,7 +408,7 @@ impl Operation for MirrorOperation {
         if let Some(ref manager) = self.verification_manager {
             if crate::history_format::is_bucket_file(path) {
                 match crate::verify::verify_and_write_bucket(path, reader, &self.dst_store).await {
-                    Ok(_) => Ok(()),
+                    Ok(()) => Ok(()),
                     Err(e) => {
                         self.cleanup_partial_file(path).await?;
                         Err(e)
