@@ -55,9 +55,11 @@ futures-io = { version = "0.3" }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 normalize-path = { version = "0.2.1" }
 sha2 = "0.10"
-stellar-xdr = { version = "22", default-features = false, features = ["std", "curr"] }
+# NB: the stellar-xdr needs to keep up-to-date with the latest major (protocol)
+# version or it may fail to parse the latest ledger format
+stellar-xdr = { version = "26.0.0", default-features = true, features = [] }
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
-flate2 = "1"
+flate2 = "1.1.9"
 hex = "0.4"
 tokio-stream = "0.1"
 
@@ -71,4 +73,3 @@ tower-http = { version = "0.6", features = ["fs"] }
 walkdir = { version = "2" }
 wiremock = { version = "0.6" }
 path-slash = { version = "0.2" }
-flate2 = { version = "1" }
