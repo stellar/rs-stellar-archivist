@@ -26,6 +26,8 @@ enum Operation {
     Mirror,
 }
 
+// NB: these constants matches available ledger numbers available in
+// "pubnet-archive-old-txset" if we change the dataset, we need to update these.
 const PUBNET_CHECKPOINT_LOW: u32 = 11999999;
 const PUBNET_CHECKPOINT_HIGH: u32 = 12001023;
 

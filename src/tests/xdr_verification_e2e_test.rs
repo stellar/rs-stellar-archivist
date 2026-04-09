@@ -6,7 +6,7 @@
 //! Uses pubnet-archive-old-txset which contains V0 TransactionSet format.
 
 use super::utils::get_files_by_pattern;
-use crate::test_helpers::{run_mirror, run_scan, MirrorConfig, ScanConfig};
+use crate::test_helpers::{run_mirror, run_scan, test_storage_config, MirrorConfig, ScanConfig};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use rstest::rstest;
@@ -1154,5 +1154,58 @@ async fn test_verify_detects_true_cross_checkpoint_chain_break_in_scan_and_mirro
         "{:?} --verify should fail on {} cross-checkpoint chain break",
         op,
         archive_type.name()
+    );
+}
+
+//=============================================================================
+// Atomic Write Safety Tests
+//
+// Verify that corrupt XDR files are never committed to the destination,
+// for both atomic and non-atomic write backends.
+//=============================================================================
+
+#[rstest]
+#[case::non_atomic(false)]
+#[case::atomic(true)]
+#[tokio::test]
+async fn test_mirror_verify_no_corrupt_file_written(#[case] atomic: bool) {
+    let (_temp_src, archive_path) = setup_corrupted_xdr_archive(
+        ArchiveType::PubnetOldTxset,
+        XdrFileType::Transactions,
+        CorruptionMethod::WrongContent,
+    );
+    let corrupt_file = get_first_file_in_range(
+        &archive_path,
+        ArchiveType::PubnetOldTxset,
+        XdrFileType::Transactions.pattern(),
+    );
+    let relative = corrupt_file.strip_prefix(&archive_path).unwrap();
+
+    let temp_dest = TempDir::new().expect("Failed to create temp dir");
+    let src_url = format!("file://{}", archive_path.display());
+    let dest_url = format!("file://{}", temp_dest.path().display());
+
+    let mut storage_cfg = test_storage_config();
+    storage_cfg.atomic_file_writes = atomic;
+
+    let (low, high) = ArchiveType::PubnetOldTxset.checkpoint_bounds();
+    let mut config = MirrorConfig::new(&src_url, &dest_url)
+        .skip_optional()
+        .verify()
+        .storage_config(storage_cfg);
+    if let Some(l) = low {
+        config = config.low(l);
+    }
+    if let Some(h) = high {
+        config = config.high(h);
+    }
+
+    let result = run_mirror(config).await;
+    assert!(result.is_err(), "mirror should fail on corrupt XDR");
+
+    assert!(
+        !temp_dest.path().join(relative).exists(),
+        "corrupt xdr file should not exist at destination (atomic={})",
+        atomic,
     );
 }

@@ -679,7 +679,10 @@ pub(crate) fn parse_result_entries_for_checkpoint(
 
 /// Decompress gzip data from a reader into an in-memory buffer.
 pub async fn decompress_to_buffer(path: &str, reader: Reader) -> Result<Vec<u8>, StorageError> {
-    decompress_and_write_internal(path, reader, None).await
+    // the writer is None, thus the return sink is also None, which is safe to
+    // be discarded
+    let (decompressed, _) = decompress_and_write_internal(path, reader, None).await?;
+    Ok(decompressed)
 }
 
 pub async fn parse_ledger_stream(
@@ -795,7 +798,7 @@ async fn decompress_and_write_internal(
     path: &str,
     reader: Reader,
     writer: Option<Writer>,
-) -> Result<Vec<u8>, StorageError> {
+) -> Result<(Vec<u8>, Option<opendal::BufferSink>), StorageError> {
     use futures_util::SinkExt;
 
     let stream = reader
@@ -875,13 +878,10 @@ async fn decompress_and_write_internal(
         .map_err(|e| StorageError::fatal(format!("decompress task panicked for {}: {}", path, e)))?
         .map_err(|e| StorageError::retry(format!("failed to decompress {}: {}", path, e)))?;
 
-    if let Some(mut s) = sink {
-        s.close()
-            .await
-            .map_err(|e| from_opendal_error(e, &format!("failed to close {}", path)))?;
-    }
-
-    Ok(decompressed)
+    // Return the unclosed sink — caller is responsible for closing it only after
+    // verification succeeds, preventing corrupt data from being committed on
+    // atomic backends.
+    Ok((decompressed, sink))
 }
 
 pub async fn verify_and_write_xdr(
@@ -889,8 +889,10 @@ pub async fn verify_and_write_xdr(
     reader: Reader,
     dst_store: &StorageRef,
 ) -> Result<XdrParseResult, StorageError> {
+    use futures_util::SinkExt;
+
     let writer = dst_store.open_writer(path).await?;
-    let decompressed = decompress_and_write_internal(path, reader, Some(writer)).await?;
+    let (decompressed, sink) = decompress_and_write_internal(path, reader, Some(writer)).await?;
 
     let parse_result = if crate::history_format::is_ledger_file(path) {
         parse_ledger_entries_for_checkpoint(
@@ -917,8 +919,19 @@ pub async fn verify_and_write_xdr(
     };
 
     match parse_result {
-        Ok(result) => Ok(result),
+        Ok(result) => {
+            // Verification passed — close sink to commit the write
+            if let Some(mut s) = sink {
+                s.close()
+                    .await
+                    .map_err(|e| from_opendal_error(e, &format!("failed to close {}", path)))?;
+            }
+            Ok(result)
+        }
         Err(err) => {
+            // Verification failed — don't close sink, prevents committing corrupt data
+            // on atomic backends. For non-atomic backends, data is already on disk via
+            // send() so clean up the partial file.
             if !dst_store.uses_atomic_writes() {
                 if let Some(base_path) = dst_store.get_base_path() {
                     let file_path = base_path.join(path);
