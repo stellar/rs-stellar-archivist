@@ -231,6 +231,8 @@ async fn test_retries_on_connection_drops(
 }
 
 /// Tests that retry delays follow exponential backoff pattern.
+/// Skipped in CI — wall-clock timing assertions are flaky under CPU contention.
+/// See docs/backoff-timing-test-flakiness.md for details.
 #[rstest]
 #[case::one_failure(1)]
 #[case::two_failures(2)]

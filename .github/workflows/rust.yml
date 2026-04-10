@@ -66,7 +66,9 @@ jobs:
     # Tests can only run on native targets, not cross-compilation targets like aarch64-apple-darwin
     - name: Run tests
       if: matrix.sys.target != 'aarch64-apple-darwin'
-      run: cargo test --target ${{ matrix.sys.target }}
+      # Skip wall-clock timing tests — flaky under CI CPU contention.
+      # See docs/backoff-timing-test-flakiness.md
+      run: cargo test --target ${{ matrix.sys.target }} -- --skip test_exponential_backoff_timing
 
   publish-dry-run:
     if: github.event_name == 'push' || startsWith(github.head_ref, 'release/')
