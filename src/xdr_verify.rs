@@ -341,9 +341,9 @@ impl XdrVerificationManager {
         let (first_expected, _) = expected_ledger_range(checkpoint);
 
         for (&seq, data) in ledger_data {
-            let prev_seq = seq - 1;
+            let prev_seq = seq.saturating_sub(1);
 
-            if prev_seq < first_expected {
+            if prev_seq <= first_expected {
                 continue;
             }
 

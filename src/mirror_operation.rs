@@ -420,19 +420,16 @@ impl Operation for MirrorOperation {
                 || crate::history_format::is_scp_file(path)
             {
                 use crate::xdr_verify::XdrParseResult;
-                let result = match crate::xdr_verify::verify_and_write_xdr(
-                    path,
-                    reader,
-                    &self.dst_store,
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(e) => {
-                        self.cleanup_partial_file(path).await?;
-                        return Err(e);
-                    }
-                };
+                let result =
+                    match crate::xdr_verify::verify_and_write_xdr(path, reader, &self.dst_store)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            self.cleanup_partial_file(path).await?;
+                            return Err(e);
+                        }
+                    };
 
                 let checkpoint = if matches!(result, XdrParseResult::None) {
                     None
