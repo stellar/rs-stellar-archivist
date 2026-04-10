@@ -884,6 +884,28 @@ async fn decompress_and_write_internal(
     Ok((decompressed, sink))
 }
 
+/// On non-atomic backends, data sent via `sink.send()` is written directly to
+/// the target path. If the write is abandoned (sink dropped without close),
+/// the partial file must be removed. On atomic backends the sink drop alone
+/// prevents the temp-to-target rename, so no file cleanup is needed.
+async fn cleanup_non_atomic_partial_write(path: &str, dst_store: &StorageRef) {
+    if dst_store.uses_atomic_writes() {
+        return;
+    }
+    if let Some(base_path) = dst_store.get_base_path() {
+        let file_path = base_path.join(path);
+        if let Err(remove_err) = tokio::fs::remove_file(&file_path).await {
+            if remove_err.kind() != std::io::ErrorKind::NotFound {
+                warn!(
+                    "failed to remove partially written file {} after error: {}",
+                    file_path.display(),
+                    remove_err
+                );
+            }
+        }
+    }
+}
+
 pub async fn verify_and_write_xdr(
     path: &str,
     reader: Reader,
@@ -892,7 +914,17 @@ pub async fn verify_and_write_xdr(
     use futures_util::SinkExt;
 
     let writer = dst_store.open_writer(path).await?;
-    let (decompressed, sink) = decompress_and_write_internal(path, reader, Some(writer)).await?;
+    let (decompressed, sink) = match decompress_and_write_internal(path, reader, Some(writer)).await
+    {
+        Ok(result) => result,
+        Err(e) => {
+            // Decompression or I/O error — sink was dropped inside
+            // decompress_and_write_internal without close. Clean up any
+            // partial data on non-atomic backends.
+            cleanup_non_atomic_partial_write(path, dst_store).await;
+            return Err(e);
+        }
+    };
 
     let parse_result = if crate::history_format::is_ledger_file(path) {
         parse_ledger_entries_for_checkpoint(
@@ -932,20 +964,7 @@ pub async fn verify_and_write_xdr(
             // Verification failed — don't close sink, prevents committing corrupt data
             // on atomic backends. For non-atomic backends, data is already on disk via
             // send() so clean up the partial file.
-            if !dst_store.uses_atomic_writes() {
-                if let Some(base_path) = dst_store.get_base_path() {
-                    let file_path = base_path.join(path);
-                    if let Err(remove_err) = tokio::fs::remove_file(&file_path).await {
-                        if remove_err.kind() != std::io::ErrorKind::NotFound {
-                            warn!(
-                                "failed to remove partially written file {} after verification error: {}",
-                                file_path.display(),
-                                remove_err
-                            );
-                        }
-                    }
-                }
-            }
+            cleanup_non_atomic_partial_write(path, dst_store).await;
             Err(err)
         }
     }
