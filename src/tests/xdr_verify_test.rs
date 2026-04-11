@@ -7,7 +7,7 @@ use crate::xdr_verify::{
 };
 use rstest::rstest;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use stellar_xdr::curr::{
     AccountId, CreateAccountOp, GeneralizedTransactionSet, Hash, LedgerHeader, LedgerHeaderExt,
     LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerScpMessages, Limits, Memo,
@@ -206,9 +206,9 @@ fn create_valid_ledger_entry(
 fn create_complete_checkpoint_data(
     checkpoint: u32,
     initial_prev_hash: [u8; 32],
-) -> HashMap<u32, LedgerVerificationData> {
+) -> BTreeMap<u32, LedgerVerificationData> {
     let (first_ledger, last_ledger) = expected_ledger_range(checkpoint);
-    let mut ledger_data = HashMap::new();
+    let mut ledger_data = BTreeMap::new();
     let mut prev_hash = initial_prev_hash;
 
     for seq in first_ledger..=last_ledger {
@@ -231,7 +231,7 @@ fn create_complete_checkpoint_data(
 fn create_checkpoint_data_missing(
     checkpoint: u32,
     missing: &[u32],
-) -> HashMap<u32, LedgerVerificationData> {
+) -> BTreeMap<u32, LedgerVerificationData> {
     let mut data = create_complete_checkpoint_data(checkpoint, [0; 32]);
     for seq in missing {
         data.remove(seq);
@@ -243,8 +243,8 @@ fn single_ledger_data(
     seq: u32,
     computed_hash: [u8; 32],
     prev_hash: [u8; 32],
-) -> HashMap<u32, LedgerVerificationData> {
-    HashMap::from([(
+) -> BTreeMap<u32, LedgerVerificationData> {
+    BTreeMap::from([(
         seq,
         LedgerVerificationData {
             computed_hash,
@@ -574,7 +574,7 @@ fn test_missing_ledger_entries(#[case] checkpoint: u32, #[case] missing: Vec<u32
 #[test]
 fn test_manager_empty_checkpoint_data() {
     let manager = XdrVerificationManager::new();
-    manager.record_ledger_data(127, HashMap::new());
+    manager.record_ledger_data(127, BTreeMap::new());
     manager.verify_and_release(127);
     assert!(!manager.get_errors().is_empty());
 }
@@ -635,7 +635,7 @@ fn test_consecutive_checkpoints_full(#[case] break_chain: bool) {
     let ledger_data_63 = create_complete_checkpoint_data(63, [0; 32]);
     let last_hash_of_63 = ledger_data_63.get(&63).unwrap().computed_hash;
 
-    let mut ledger_data_127 = HashMap::new();
+    let mut ledger_data_127 = BTreeMap::new();
     let mut prev_hash = if break_chain {
         [0xff; 32]
     } else {

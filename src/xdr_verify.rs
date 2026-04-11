@@ -56,7 +56,7 @@ pub struct LedgerVerificationData {
 
 #[derive(Default)]
 struct PendingCheckpoint {
-    ledger_data: Option<HashMap<u32, LedgerVerificationData>>,
+    ledger_data: Option<BTreeMap<u32, LedgerVerificationData>>,
     tx_set_hashes: Option<HashMap<u32, [u8; 32]>>,
     result_hashes: Option<HashMap<u32, [u8; 32]>>,
 }
@@ -89,7 +89,7 @@ impl XdrVerificationManager {
         }
     }
 
-    pub fn record_ledger_data(&self, checkpoint: u32, data: HashMap<u32, LedgerVerificationData>) {
+    pub fn record_ledger_data(&self, checkpoint: u32, data: BTreeMap<u32, LedgerVerificationData>) {
         let mut pending = self.pending.lock().unwrap();
         let entry = pending.entry(checkpoint).or_default();
         entry.ledger_data = Some(data);
@@ -147,7 +147,7 @@ impl XdrVerificationManager {
     fn verify_checkpoint_completeness(
         &self,
         checkpoint: u32,
-        ledger_data: &HashMap<u32, LedgerVerificationData>,
+        ledger_data: &BTreeMap<u32, LedgerVerificationData>,
     ) {
         let (first_ledger, last_ledger) = expected_ledger_range(checkpoint);
         let range = first_ledger..=last_ledger;
@@ -204,7 +204,7 @@ impl XdrVerificationManager {
     fn verify_tx_set_hashes_internal(
         &self,
         checkpoint: u32,
-        ledger_data: &HashMap<u32, LedgerVerificationData>,
+        ledger_data: &BTreeMap<u32, LedgerVerificationData>,
         tx_set_hashes: &HashMap<u32, [u8; 32]>,
     ) {
         for (&seq, data) in ledger_data {
@@ -245,7 +245,7 @@ impl XdrVerificationManager {
     fn verify_result_hashes_internal(
         &self,
         checkpoint: u32,
-        ledger_data: &HashMap<u32, LedgerVerificationData>,
+        ledger_data: &BTreeMap<u32, LedgerVerificationData>,
         result_hashes: &HashMap<u32, [u8; 32]>,
     ) {
         for (&seq, data) in ledger_data {
@@ -284,57 +284,53 @@ impl XdrVerificationManager {
     fn verify_internal_chain(
         &self,
         checkpoint: u32,
-        ledger_data: &HashMap<u32, LedgerVerificationData>,
+        ledger_data: &BTreeMap<u32, LedgerVerificationData>,
     ) {
-        if ledger_data.is_empty() {
-            return;
-        }
+        let entries: Vec<_> = ledger_data.iter().collect();
 
-        let (first_expected, _) = expected_ledger_range(checkpoint);
+        for pair in entries.windows(2) {
+            let mut err_msg: Option<String> = None;
+            let mut ledger_seq: Option<u32> = None;
 
-        for (&seq, data) in ledger_data {
-            let prev_seq = seq.saturating_sub(1);
-
-            if prev_seq < first_expected {
-                continue;
-            }
-
-            let err_msg = if let Some(prev_data) = ledger_data.get(&prev_seq) {
-                if prev_data.computed_hash != data.prev_hash {
-                    Some(format!(
+            if let [(&prev_seq, prev_data), (&seq, data)] = pair {
+                if prev_seq.saturating_add(1) != seq {
+                    err_msg = Some(format!(
+                        "missing predecessor ledger {}",
+                        seq.saturating_sub(1),
+                    ));
+                    ledger_seq = Some(seq);
+                } else if prev_data.computed_hash != data.prev_hash {
+                    err_msg = Some(format!(
                         "hash chain break: previous_ledger_hash {} != computed hash of ledger {} ({})",
                         hex::encode(data.prev_hash),
                         prev_seq,
                         hex::encode(prev_data.computed_hash),
-                    ))
-                } else {
-                    None
+                    ));
+                    ledger_seq = Some(seq);
                 }
             } else {
-                Some(format!("missing predecessor ledger {prev_seq}"))
-            };
+                err_msg = Some(
+                    "internal error: unexpected window size in chain verification".to_string(),
+                );
+            }
 
             if let Some(err_msg) = err_msg {
-                error!("Ledger {seq}: {err_msg}");
+                error!("Checkpoint {checkpoint}: {err_msg}");
                 self.errors.lock().unwrap().push(VerificationError {
                     checkpoint,
-                    ledger_seq: Some(seq),
+                    ledger_seq,
                     message: err_msg,
                 });
             }
         }
     }
 
-    fn store_boundary(&self, checkpoint: u32, ledger_data: &HashMap<u32, LedgerVerificationData>) {
-        if ledger_data.is_empty() {
+    fn store_boundary(&self, checkpoint: u32, ledger_data: &BTreeMap<u32, LedgerVerificationData>) {
+        let (Some((_, first_data)), Some((_, last_data))) =
+            (ledger_data.first_key_value(), ledger_data.last_key_value())
+        else {
             return;
-        }
-
-        let min_seq = *ledger_data.keys().min().unwrap();
-        let max_seq = *ledger_data.keys().max().unwrap();
-
-        let first_data = &ledger_data[&min_seq];
-        let last_data = &ledger_data[&max_seq];
+        };
 
         self.boundaries.lock().unwrap().insert(
             checkpoint,
@@ -396,17 +392,17 @@ impl Default for XdrVerificationManager {
 
 pub fn parse_ledger_entries(
     decompressed_data: &[u8],
-) -> Result<HashMap<u32, LedgerVerificationData>, StorageError> {
+) -> Result<BTreeMap<u32, LedgerVerificationData>, StorageError> {
     parse_ledger_entries_for_checkpoint(decompressed_data, None)
 }
 
 pub(crate) fn parse_ledger_entries_for_checkpoint(
     decompressed_data: &[u8],
     checkpoint: Option<u32>,
-) -> Result<HashMap<u32, LedgerVerificationData>, StorageError> {
+) -> Result<BTreeMap<u32, LedgerVerificationData>, StorageError> {
     let cursor = Cursor::new(decompressed_data);
     let mut limited = Limited::new(cursor, Limits::none());
-    let mut data = HashMap::new();
+    let mut data = BTreeMap::new();
 
     let expected_range = checkpoint.map(expected_ledger_range);
 
@@ -627,7 +623,7 @@ pub async fn decompress_to_buffer(path: &str, reader: Reader) -> Result<Vec<u8>,
 pub async fn parse_ledger_stream(
     path: &str,
     reader: Reader,
-) -> Result<HashMap<u32, LedgerVerificationData>, StorageError> {
+) -> Result<BTreeMap<u32, LedgerVerificationData>, StorageError> {
     let decompressed = decompress_to_buffer(path, reader).await?;
     parse_ledger_entries_for_checkpoint(&decompressed, history_format::checkpoint_from_path(path))
 }
@@ -727,7 +723,7 @@ pub async fn parse_scp_stream(path: &str, reader: Reader) -> Result<(), StorageE
 }
 
 pub enum XdrParseResult {
-    Ledger(HashMap<u32, LedgerVerificationData>),
+    Ledger(BTreeMap<u32, LedgerVerificationData>),
     Transactions(HashMap<u32, [u8; 32]>),
     Results(HashMap<u32, [u8; 32]>),
     None,
