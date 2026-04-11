@@ -118,14 +118,12 @@ impl XdrVerificationManager {
         };
 
         let Some(ledger_data) = data.ledger_data else {
-            warn!(
-                "Checkpoint {}: skipping cross-verification because ledger verification data is missing",
-                checkpoint
-            );
+            let err_msg = "missing ledger verification data for checkpoint";
+            warn!("Checkpoint {checkpoint}: skipping cross-verification because {err_msg}");
             self.errors.lock().unwrap().push(VerificationError {
                 checkpoint,
                 ledger_seq: None,
-                message: "missing ledger verification data for checkpoint".to_string(),
+                message: err_msg.to_string(),
             });
             return;
         };
@@ -144,95 +142,61 @@ impl XdrVerificationManager {
         self.store_boundary(checkpoint, &ledger_data);
     }
 
+    // verifies entries in the `ledger_data` matches exactly to the ledgers in
+    // this `checkpoint`
     fn verify_checkpoint_completeness(
         &self,
         checkpoint: u32,
         ledger_data: &HashMap<u32, LedgerVerificationData>,
     ) {
         let (first_ledger, last_ledger) = expected_ledger_range(checkpoint);
-        let expected_count = (last_ledger - first_ledger + 1) as usize;
+        let range = first_ledger..=last_ledger;
+        let fmt_list = |seqs: &[u32]| {
+            seqs.iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
 
         let unexpected: Vec<u32> = ledger_data
             .keys()
             .copied()
-            .filter(|seq| !(first_ledger..=last_ledger).contains(seq))
+            .filter(|seq| !range.contains(seq))
             .collect();
 
         if !unexpected.is_empty() {
-            error!(
-                "Checkpoint {}: found ledger entries outside expected range {}-{}: {}",
-                checkpoint,
-                first_ledger,
-                last_ledger,
-                unexpected
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+            let err_msg = format!(
+                "unexpected ledger entries outside range {first_ledger}-{last_ledger}: {}",
+                fmt_list(&unexpected),
             );
-
+            error!("Checkpoint {checkpoint}: {err_msg}");
             self.errors.lock().unwrap().push(VerificationError {
                 checkpoint,
                 ledger_seq: unexpected.first().copied(),
-                message: format!(
-                    "unexpected ledger entries outside range {}-{}: {}",
-                    first_ledger,
-                    last_ledger,
-                    unexpected
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                ),
+                message: err_msg,
             });
         }
 
-        let mut missing: Vec<u32> = Vec::new();
-        for seq in first_ledger..=last_ledger {
-            if !ledger_data.contains_key(&seq) {
-                missing.push(seq);
-            }
-        }
+        let missing: Vec<u32> = range
+            .filter(|seq| !ledger_data.contains_key(seq))
+            .collect();
 
         if !missing.is_empty() {
-            let missing_str = if missing.len() <= 10 {
-                missing
-                    .iter()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<_>>()
-                    .join(", ")
+            let list_str = if missing.len() <= 10 {
+                fmt_list(&missing)
             } else {
-                format!(
-                    "{}, ... ({} more)",
-                    missing[..5]
-                        .iter()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<_>>()
-                        .join(", "),
-                    missing.len() - 5
-                )
+                format!("{}, ... ({} more)", fmt_list(&missing[..5]), missing.len() - 5)
             };
-
-            error!(
-                "Checkpoint {}: missing {} ledger entries (expected {} entries for ledgers {}-{}): {}",
-                checkpoint,
+            let err_msg = format!(
+                "missing {} of {} ledger entries (ledgers {first_ledger}-{last_ledger}): {list_str}",
                 missing.len(),
-                expected_count,
-                first_ledger,
-                last_ledger,
-                missing_str
+                last_ledger - first_ledger + 1,
             );
-
+            error!("Checkpoint {checkpoint}: {err_msg}");
             self.errors.lock().unwrap().push(VerificationError {
                 checkpoint,
                 ledger_seq: missing.first().copied(),
-                message: format!(
-                    "missing {} ledger entries (expected ledgers {}-{}): {}",
-                    missing.len(),
-                    first_ledger,
-                    last_ledger,
-                    missing_str
-                ),
+                message: err_msg,
             });
         }
     }
@@ -246,39 +210,33 @@ impl XdrVerificationManager {
         for (&seq, data) in ledger_data {
             let expected = data.expected_tx_set_hash;
 
-            if let Some(&actual) = tx_set_hashes.get(&seq) {
+            let err_msg = if let Some(&actual) = tx_set_hashes.get(&seq) {
                 if actual != expected {
-                    error!(
-                        "Ledger {}: tx set hash mismatch: expected {}, got {}",
-                        seq,
+                    Some(format!(
+                        "tx set hash mismatch: expected {}, got {}",
                         hex::encode(expected),
-                        hex::encode(actual)
-                    );
-                    self.errors.lock().unwrap().push(VerificationError {
-                        checkpoint,
-                        ledger_seq: Some(seq),
-                        message: format!(
-                            "tx set hash mismatch: expected {}, got {}",
-                            hex::encode(expected),
-                            hex::encode(actual)
-                        ),
-                    });
+                        hex::encode(actual),
+                    ))
+                } else {
+                    None
                 }
             } else if data.expected_result_hash != EMPTY_XDR_ARRAY_HASH
                 && !is_empty_tx_set_hash(&expected, &data.prev_hash)
             {
-                error!(
-                    "Ledger {}: missing tx set entry, expected hash {}",
-                    seq,
-                    hex::encode(expected)
-                );
+                Some(format!(
+                    "missing tx set entry, expected hash {}",
+                    hex::encode(expected),
+                ))
+            } else {
+                None
+            };
+
+            if let Some(err_msg) = err_msg {
+                error!("Ledger {seq}: {err_msg}");
                 self.errors.lock().unwrap().push(VerificationError {
                     checkpoint,
                     ledger_seq: Some(seq),
-                    message: format!(
-                        "missing tx set entry, expected hash {}",
-                        hex::encode(expected)
-                    ),
+                    message: err_msg,
                 });
             }
         }
@@ -293,37 +251,31 @@ impl XdrVerificationManager {
         for (&seq, data) in ledger_data {
             let expected = data.expected_result_hash;
 
-            if let Some(&actual) = result_hashes.get(&seq) {
+            let err_msg = if let Some(&actual) = result_hashes.get(&seq) {
                 if actual != expected {
-                    error!(
-                        "Ledger {}: result set hash mismatch: expected {}, got {}",
-                        seq,
+                    Some(format!(
+                        "result set hash mismatch: expected {}, got {}",
                         hex::encode(expected),
-                        hex::encode(actual)
-                    );
-                    self.errors.lock().unwrap().push(VerificationError {
-                        checkpoint,
-                        ledger_seq: Some(seq),
-                        message: format!(
-                            "result set hash mismatch: expected {}, got {}",
-                            hex::encode(expected),
-                            hex::encode(actual)
-                        ),
-                    });
+                        hex::encode(actual),
+                    ))
+                } else {
+                    None
                 }
             } else if expected != EMPTY_XDR_ARRAY_HASH && expected != [0; 32] {
-                error!(
-                    "Ledger {}: missing result entry, expected hash {}",
-                    seq,
-                    hex::encode(expected)
-                );
+                Some(format!(
+                    "missing result entry, expected hash {}",
+                    hex::encode(expected),
+                ))
+            } else {
+                None
+            };
+
+            if let Some(err_msg) = err_msg {
+                error!("Ledger {seq}: {err_msg}");
                 self.errors.lock().unwrap().push(VerificationError {
                     checkpoint,
                     ledger_seq: Some(seq),
-                    message: format!(
-                        "missing result entry, expected hash {}",
-                        hex::encode(expected)
-                    ),
+                    message: err_msg,
                 });
             }
         }
@@ -347,35 +299,27 @@ impl XdrVerificationManager {
                 continue;
             }
 
-            if let Some(prev_data) = ledger_data.get(&prev_seq) {
+            let err_msg = if let Some(prev_data) = ledger_data.get(&prev_seq) {
                 if prev_data.computed_hash != data.prev_hash {
-                    error!(
-                        "Ledger {}: hash chain break: previous_ledger_hash {} != computed hash of ledger {} ({})",
-                        seq,
+                    Some(format!(
+                        "hash chain break: previous_ledger_hash {} != computed hash of ledger {} ({})",
                         hex::encode(data.prev_hash),
                         prev_seq,
-                        hex::encode(prev_data.computed_hash)
-                    );
-                    self.errors.lock().unwrap().push(VerificationError {
-                        checkpoint,
-                        ledger_seq: Some(seq),
-                        message: format!(
-                            "hash chain break: previous_ledger_hash {} != computed hash of ledger {} ({})",
-                            hex::encode(data.prev_hash),
-                            prev_seq,
-                            hex::encode(prev_data.computed_hash)
-                        ),
-                    });
+                        hex::encode(prev_data.computed_hash),
+                    ))
+                } else {
+                    None
                 }
             } else {
-                error!(
-                    "Ledger {}: missing predecessor ledger {} in checkpoint file",
-                    seq, prev_seq
-                );
+                Some(format!("missing predecessor ledger {prev_seq}"))
+            };
+
+            if let Some(err_msg) = err_msg {
+                error!("Ledger {seq}: {err_msg}");
                 self.errors.lock().unwrap().push(VerificationError {
                     checkpoint,
                     ledger_seq: Some(seq),
-                    message: format!("missing predecessor ledger {}", prev_seq),
+                    message: err_msg,
                 });
             }
         }
@@ -421,22 +365,17 @@ impl XdrVerificationManager {
 
             if curr_boundary.first_prev_hash != prev_boundary.last_computed_hash {
                 let first_ledger = curr_checkpoint.saturating_sub(63);
-                error!(
-                    "Hash chain break between checkpoints {} and {}: ledger {} prev_hash {} != checkpoint {} last hash {}",
-                    prev_checkpoint,
-                    curr_checkpoint,
-                    first_ledger,
+                let err_msg = format!(
+                    "hash chain break between checkpoints {prev_checkpoint} and {curr_checkpoint}: \
+                     ledger {first_ledger} prev_hash {} != checkpoint {prev_checkpoint} last hash {}",
                     hex::encode(curr_boundary.first_prev_hash),
-                    prev_checkpoint,
-                    hex::encode(prev_boundary.last_computed_hash)
+                    hex::encode(prev_boundary.last_computed_hash),
                 );
+                error!("{err_msg}");
                 chain_errors.push(VerificationError {
                     checkpoint: curr_checkpoint,
                     ledger_seq: Some(first_ledger),
-                    message: format!(
-                        "hash chain break between checkpoints {} and {}",
-                        prev_checkpoint, curr_checkpoint
-                    ),
+                    message: err_msg,
                 });
             }
         }
