@@ -102,7 +102,7 @@ pub trait Operation: Send + Sync + 'static {
     /// Called when all files for a checkpoint have been processed.
     /// This is the hook for per-checkpoint verification to trigger
     /// and release memory for the completed checkpoint.
-    fn checkpoint_complete(&self, _checkpoint: u32) {
+    fn finalize_checkpoint(&self, _checkpoint: u32) {
         // No-op by default
     }
 }
@@ -213,7 +213,7 @@ impl<Op: Operation> Pipeline<Op> {
         }
 
         // Notify operation that all files for this checkpoint are processed
-        self.operation.checkpoint_complete(checkpoint);
+        self.operation.finalize_checkpoint(checkpoint);
     }
 
     /// Process a history file for a checkpoint.

@@ -181,7 +181,7 @@ impl Operation for ScanOperation {
         self.verification_manager.is_none()
     }
 
-    fn checkpoint_complete(&self, checkpoint: u32) {
+    fn finalize_checkpoint(&self, checkpoint: u32) {
         if let Some(ref manager) = self.verification_manager {
             manager.verify_and_release(checkpoint);
         }
