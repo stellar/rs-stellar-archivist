@@ -26,11 +26,37 @@ use walkdir::WalkDir;
 // Test Archive Helpers
 //=============================================================================
 
-/// Get the path to the test archive
-pub fn test_archive_path() -> PathBuf {
+fn archive_path(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("testdata")
-        .join("testnet-archive-small")
+        .join(name)
+}
+
+pub fn test_archive_path() -> PathBuf {
+    archive_path("pubnet-archive-old-txset")
+}
+
+pub fn testnet_small_archive_path() -> PathBuf {
+    archive_path("testnet-archive-small")
+}
+
+fn copy_archive(src: &Path, dst: &Path) -> Result<(), std::io::Error> {
+    for entry in WalkDir::new(src)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+    {
+        let src_path = entry.path();
+        let relative = src_path.strip_prefix(src).unwrap();
+        let dst_path = dst.join(relative);
+
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&dst_path)?;
+        } else {
+            std::fs::copy(src_path, &dst_path)?;
+        }
+    }
+
+    Ok(())
 }
 
 pub fn file_url_from_path(path: &Path) -> String {
@@ -47,22 +73,13 @@ pub fn path_to_slash_string(path: &Path) -> String {
 /// Copy the test archive to a destination directory
 pub fn copy_test_archive(dst: &Path) -> Result<(), std::io::Error> {
     let src = test_archive_path();
+    copy_archive(&src, dst)
+}
 
-    for entry in WalkDir::new(&src)
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-    {
-        let src_path = entry.path();
-        let relative = src_path.strip_prefix(&src).unwrap();
-        let dst_path = dst.join(relative);
-
-        if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&dst_path)?;
-        } else {
-            std::fs::copy(src_path, &dst_path)?;
-        }
-    }
-    Ok(())
+/// Copy the small testnet archive to a destination directory
+pub fn copy_testnet_small_archive(dst: &Path) -> Result<(), std::io::Error> {
+    let src = testnet_small_archive_path();
+    copy_archive(&src, dst)
 }
 
 /// Get all files of a specific type from the archive
@@ -240,13 +257,15 @@ impl RequestTracker {
     /// Verify that retry delays follow exponential backoff pattern.
     /// Returns Ok if delays are within tolerance, Err with details otherwise.
     ///
-    /// Expected backoff sequence: 100ms, 200ms, 400ms, 800ms, 1600ms, 3200ms, 5000ms (capped)
-    /// Tolerance specifies the allowed deviation
+    /// Expected backoff starts at `initial_backoff_ms`, doubles after each retry, and caps at
+    /// 5000ms. Separate lower and upper tolerances let tests keep a strict minimum delay while
+    /// tolerating scheduler and request overhead on busy machines.
     pub fn verify_backoff_timing(
         &self,
         path: &str,
         initial_backoff_ms: u64,
-        tolerance_ms: u64,
+        lower_tolerance_ms: u64,
+        upper_tolerance_ms: u64,
     ) -> Result<(), String> {
         let timestamps = self.get_timestamps(path);
         if timestamps.len() < 2 {
@@ -257,30 +276,32 @@ impl RequestTracker {
         for i in 1..timestamps.len() {
             let actual_delay = timestamps[i].duration_since(timestamps[i - 1]);
             let actual_ms = actual_delay.as_millis() as u64;
-            let min_expected = expected_backoff_ms.saturating_sub(tolerance_ms);
-            let max_expected = expected_backoff_ms + tolerance_ms;
+            let min_expected = expected_backoff_ms.saturating_sub(lower_tolerance_ms);
+            let max_expected = expected_backoff_ms + upper_tolerance_ms;
 
             if actual_ms < min_expected {
                 return Err(format!(
-                    "Retry {} -> {}: delay {}ms is below minimum {}ms (expected ~{}ms ±{}ms)",
+                    "Retry {} -> {}: delay {}ms is below minimum {}ms (expected ~{}ms -{}ms/+{}ms)",
                     i,
                     i + 1,
                     actual_ms,
                     min_expected,
                     expected_backoff_ms,
-                    tolerance_ms
+                    lower_tolerance_ms,
+                    upper_tolerance_ms
                 ));
             }
 
             if actual_ms > max_expected {
                 return Err(format!(
-                    "Retry {} -> {}: delay {}ms exceeds maximum {}ms (expected ~{}ms ±{}ms)",
+                    "Retry {} -> {}: delay {}ms exceeds maximum {}ms (expected ~{}ms -{}ms/+{}ms)",
                     i,
                     i + 1,
                     actual_ms,
                     max_expected,
                     expected_backoff_ms,
-                    tolerance_ms
+                    lower_tolerance_ms,
+                    upper_tolerance_ms
                 ));
             }
 

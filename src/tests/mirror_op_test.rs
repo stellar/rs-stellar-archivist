@@ -6,8 +6,8 @@
 //! - Resume and --overwrite behavior
 
 use super::utils::{
-    copy_test_archive, file_url_from_path, path_to_slash_string, start_http_server,
-    start_http_server_with_app, test_archive_path,
+    copy_testnet_small_archive, file_url_from_path, path_to_slash_string, start_http_server,
+    start_http_server_with_app, testnet_small_archive_path,
 };
 use crate::{
     history_format,
@@ -334,7 +334,7 @@ async fn test_mirror_skip_optional() {
 /// Tests that resuming a mirror without creating a gap succeeds
 #[tokio::test]
 async fn test_mirror_resume_without_gap() {
-    let src = file_url_from_path(&test_archive_path());
+    let src = file_url_from_path(&testnet_small_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
     let dst = file_url_from_path(&dest_path);
@@ -365,7 +365,7 @@ async fn test_mirror_resume_without_gap() {
 /// Tests that creating a gap without --allow-mirror-gaps flag is rejected
 #[tokio::test]
 async fn test_mirror_rejects_gap_creation() {
-    let src = file_url_from_path(&test_archive_path());
+    let src = file_url_from_path(&testnet_small_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
     let dst = file_url_from_path(&dest_path);
@@ -409,7 +409,7 @@ async fn test_mirror_rejects_gap_creation() {
 /// Tests that --allow-mirror-gaps flag permits creating gaps
 #[tokio::test]
 async fn test_mirror_allows_gap_with_flag() {
-    let src = file_url_from_path(&test_archive_path());
+    let src = file_url_from_path(&testnet_small_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
     let dst = file_url_from_path(&dest_path);
@@ -441,7 +441,7 @@ async fn test_mirror_allows_gap_with_flag() {
 
 #[tokio::test]
 async fn test_mirror_allows_gaps_for_empty_destination() {
-    let src = file_url_from_path(&test_archive_path());
+    let src = file_url_from_path(&testnet_small_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("empty_dest");
     let dst = file_url_from_path(&dest_path);
@@ -484,7 +484,7 @@ async fn test_mirror_allows_gaps_for_empty_destination() {
 /// Tests that resume without --overwrite skips existing files (ignores --low)
 #[tokio::test]
 async fn test_mirror_resume_skips_existing_files() {
-    let src = file_url_from_path(&test_archive_path());
+    let src = file_url_from_path(&testnet_small_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
     let dst = file_url_from_path(&dest_path);
@@ -528,7 +528,7 @@ async fn test_mirror_resume_skips_existing_files() {
 /// Tests that --overwrite re-downloads files in range but not before --low
 #[tokio::test]
 async fn test_mirror_overwrite_redownloads_in_range() {
-    let src = file_url_from_path(&test_archive_path());
+    let src = file_url_from_path(&testnet_small_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
     let dst = file_url_from_path(&dest_path);
@@ -591,7 +591,7 @@ async fn test_mirror_overwrite_redownloads_in_range() {
 /// Tests that empty files (0 bytes) are treated as non-existent and get re-downloaded when encountered.
 #[tokio::test]
 async fn test_mirror_replaces_empty_files() {
-    let src = file_url_from_path(&test_archive_path());
+    let src = file_url_from_path(&testnet_small_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
     let dst = file_url_from_path(&dest_path);
@@ -628,7 +628,7 @@ async fn test_mirror_replaces_empty_files() {
 /// Tests that mirroring with --high lower than dest succeeds gracefully (destination already up to date).
 #[tokio::test]
 async fn test_mirror_lower_high_than_dest_succeeds() {
-    let src = file_url_from_path(&test_archive_path());
+    let src = file_url_from_path(&testnet_small_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
     let dst = file_url_from_path(&dest_path);
@@ -650,7 +650,7 @@ async fn test_mirror_lower_high_than_dest_succeeds() {
 /// Tests that mirroring to same checkpoint succeeds but .well-known is preserved.
 #[tokio::test]
 async fn test_mirror_preserves_wellknown_when_dest_is_equal() {
-    let src = file_url_from_path(&test_archive_path());
+    let src = file_url_from_path(&testnet_small_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
     let dst = file_url_from_path(&dest_path);
@@ -687,7 +687,7 @@ async fn test_mirror_preserves_wellknown_when_dest_is_equal() {
 /// Tests that .well-known is created when destination has data but missing .well-known.
 #[tokio::test]
 async fn test_mirror_creates_wellknown_when_missing() {
-    let src = file_url_from_path(&test_archive_path());
+    let src = file_url_from_path(&testnet_small_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
     let dst = file_url_from_path(&dest_path);
@@ -736,7 +736,7 @@ async fn test_mirror_creates_wellknown_when_missing() {
 /// Tests basic HTTP mirror to filesystem.
 #[tokio::test]
 async fn test_mirror_http_to_filesystem() {
-    let archive_path = test_archive_path();
+    let archive_path = testnet_small_archive_path();
     let (server_url, server_handle) = start_http_server(&archive_path).await;
 
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
@@ -789,7 +789,7 @@ async fn test_mirror_race_condition_with_advancing_archive() {
     let temp_archive = TempDir::new().expect("Failed to create temp dir");
     let archive_path = temp_archive.path();
 
-    copy_test_archive(archive_path).expect("Failed to copy test archive");
+    copy_testnet_small_archive(archive_path).expect("Failed to copy test archive");
 
     // Read the history files for checkpoint 127 and 191 to use as our .well-known files
     let history_7f_path = archive_path.join("history/00/00/00/history-0000007f.json");
@@ -889,4 +889,74 @@ async fn test_mirror_race_condition_with_advancing_archive() {
     );
 
     server_handle.abort();
+}
+
+//=============================================================================
+// Verification + .well-known interaction tests
+//=============================================================================
+
+/// Tests that .well-known/stellar-history.json is NOT updated when mirror
+/// verification fails. This prevents the archive from advertising a checkpoint
+/// range whose data failed integrity checks.
+#[tokio::test]
+async fn test_mirror_verify_does_not_advance_well_known_on_verification_failure() {
+    let src_archive = testnet_small_archive_path();
+    let src_url = file_url_from_path(&src_archive);
+
+    let temp_dir = TempDir::new().unwrap();
+    let dest_path = temp_dir.path().join("mirror_dest");
+    let dst_url = file_url_from_path(&dest_path);
+
+    // Mirror up to checkpoint 127 (0x7f) to establish baseline .well-known
+    run_mirror(
+        MirrorConfig::new(&src_url, &dst_url)
+            .skip_optional()
+            .high(127),
+    )
+    .await
+    .expect("Baseline mirror should succeed");
+
+    let wellknown_path = dest_path.join(".well-known/stellar-history.json");
+    let baseline_content = std::fs::read_to_string(&wellknown_path)
+        .expect(".well-known should exist after baseline mirror");
+    let baseline: serde_json::Value = serde_json::from_str(&baseline_content).unwrap();
+    let baseline_ledger = baseline["currentLedger"].as_u64().unwrap() as u32;
+    assert_eq!(baseline_ledger, 127, "Baseline should be at checkpoint 127");
+
+    // Create a corrupted copy of the source archive for the second mirror
+    let corrupt_src = TempDir::new().unwrap();
+    copy_testnet_small_archive(corrupt_src.path()).expect("Failed to copy archive");
+
+    // Corrupt a transactions file at a later checkpoint (191 = 0xbf) with
+    // invalid gzip content so the XDR parse fails during process_object
+    let corrupt_tx_file = corrupt_src
+        .path()
+        .join("transactions/00/00/00/transactions-000000bf.xdr.gz");
+    std::fs::write(&corrupt_tx_file, b"not valid gzip data at all")
+        .expect("Failed to corrupt transactions file");
+
+    let corrupt_src_url = file_url_from_path(corrupt_src.path());
+
+    // Mirror from corrupted source with --verify; should fail
+    let result = run_mirror(
+        MirrorConfig::new(&corrupt_src_url, &dst_url)
+            .skip_optional()
+            .high(255)
+            .verify(),
+    )
+    .await;
+
+    assert!(result.is_err(), "Mirror with corrupt data should fail");
+
+    // .well-known must NOT have been advanced past baseline checkpoint
+    let after_content =
+        std::fs::read_to_string(&wellknown_path).expect(".well-known should still exist");
+    let after: serde_json::Value = serde_json::from_str(&after_content).unwrap();
+    let after_ledger = after["currentLedger"].as_u64().unwrap() as u32;
+
+    assert_eq!(
+        after_ledger, baseline_ledger,
+        ".well-known should still be at checkpoint {} after verification failure, but was at {}",
+        baseline_ledger, after_ledger
+    );
 }

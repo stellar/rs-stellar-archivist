@@ -1,8 +1,8 @@
 //! Tests for scan command operations
 
 use super::utils::{
-    copy_test_archive, file_url_from_path, get_files_by_pattern, start_http_server,
-    test_archive_path,
+    copy_testnet_small_archive, file_url_from_path, get_files_by_pattern, start_http_server,
+    testnet_small_archive_path,
 };
 use crate::storage::{OpendalStore, Storage, StorageConfig};
 use crate::test_helpers::{run_scan, test_storage_config, ScanConfig};
@@ -118,7 +118,7 @@ async fn remove_bucket_and_verify_scan_fails(
 
 #[tokio::test]
 async fn test_scan_low_beyond_current() {
-    let archive = file_url_from_path(&test_archive_path());
+    let archive = file_url_from_path(&testnet_small_archive_path());
 
     // Test with low beyond the archive's current ledger - should fail
     let result = run_scan(ScanConfig::new(&archive).skip_optional().low(20000)).await;
@@ -130,7 +130,7 @@ async fn test_scan_low_beyond_current() {
 
 #[tokio::test]
 async fn test_scan_high_beyond_current() {
-    let archive = file_url_from_path(&test_archive_path());
+    let archive = file_url_from_path(&testnet_small_archive_path());
 
     // Test with high beyond the archive's current ledger - should warn but not fail
     let result = run_scan(ScanConfig::new(&archive).skip_optional().high(20000)).await;
@@ -155,7 +155,7 @@ enum BucketSource {
 async fn test_scan_detects_missing_bucket(#[case] source: BucketSource, #[case] description: &str) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let archive_path = temp_dir.path();
-    copy_test_archive(archive_path).expect("Failed to copy test archive");
+    copy_testnet_small_archive(archive_path).expect("Failed to copy test archive");
 
     let (well_known_buckets, historical_buckets) = analyze_archive_buckets(archive_path);
 
@@ -231,7 +231,7 @@ async fn test_scan_detects_corrupt_files(
 ) {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let archive_path = temp_dir.path();
-    copy_test_archive(archive_path).expect("Failed to copy test archive");
+    copy_testnet_small_archive(archive_path).expect("Failed to copy test archive");
 
     match corruption {
         Corruption::Remove(pattern) => {
@@ -284,7 +284,7 @@ async fn test_scan_missing_scp_with_optional_flag() {
     let temp_dir = TempDir::new().expect("Failed to create temp dir");
     let archive_path = temp_dir.path();
 
-    copy_test_archive(archive_path).expect("Failed to copy test archive");
+    copy_testnet_small_archive(archive_path).expect("Failed to copy test archive");
 
     // Remove a random SCP file to corrupt the archive
     let scp_files = get_files_by_pattern(archive_path, "/scp-");
@@ -325,7 +325,7 @@ async fn test_scan_missing_scp_with_optional_flag() {
 
 #[tokio::test]
 async fn test_scan_complete_archive() {
-    let test_archive_path = test_archive_path();
+    let test_archive_path = testnet_small_archive_path();
 
     let scan_config = ScanConfig {
         archive: file_url_from_path(&test_archive_path),
@@ -350,7 +350,7 @@ async fn test_scan_complete_archive() {
 /// Tests basic HTTP scan of a valid archive (happy path).
 #[tokio::test]
 async fn test_scan_http_archive() {
-    let archive_path = test_archive_path();
+    let archive_path = testnet_small_archive_path();
     let (server_url, server_handle) = start_http_server(&archive_path).await;
 
     let scan_config = ScanConfig {

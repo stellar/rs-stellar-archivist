@@ -28,6 +28,7 @@ pub mod scan_operation;
 pub mod storage;
 pub mod utils;
 pub mod verify;
+pub mod xdr_verify;
 
 #[cfg(feature = "cli")]
 pub mod cli;

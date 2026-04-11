@@ -4,12 +4,13 @@ use crate::history_format;
 use crate::pipeline::{async_trait, Operation};
 use crate::storage::{Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
+use crate::xdr_verify::XdrVerificationManager;
 use opendal::{Buffer, Reader};
+use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
 
-/// Mirror operation errors
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Cannot mirror: destination archive ends at ledger {dest_ledger} (checkpoint {dest_checkpoint} (0x{dest_checkpoint:08x})) but --low is {low_ledger} (checkpoint {low_checkpoint} (0x{low_checkpoint:08x})). This would create a gap in the archive. Use --allow-mirror-gaps to proceed anyway.")]
@@ -53,8 +54,8 @@ pub struct MirrorOperation {
     // Cached destination checkpoint at start of operation (or None if destination doesn't exist)
     initial_dest_checkpoint: OnceCell<Option<u32>>,
 
-    // Whether to verify bucket hashes
-    verify: bool,
+    // Populated if we should verify files, otherwise None
+    verification_manager: Option<Arc<XdrVerificationManager>>,
 }
 
 impl MirrorOperation {
@@ -69,7 +70,6 @@ impl MirrorOperation {
     ) -> Result<Self, Error> {
         let dst_store = crate::storage::from_url_with_config(dst, storage_config).await?;
 
-        // Destination must support write operations
         if !dst_store.supports_writes() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -87,7 +87,11 @@ impl MirrorOperation {
             max_retries: storage_config.max_retries as u32,
             retry_min_delay_ms: storage_config.retry_min_delay.as_millis() as u64,
             initial_dest_checkpoint: OnceCell::new(),
-            verify,
+            verification_manager: if verify {
+                Some(Arc::new(XdrVerificationManager::new()))
+            } else {
+                None
+            },
         })
     }
 
@@ -206,8 +210,16 @@ impl MirrorOperation {
         Ok(())
     }
 
-    /// Clean up a partial file at the destination path before retrying.
-    /// Only needed when atomic writes are disabled
+    async fn copy_file(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
+        match self.dst_store.copy_from_reader(path, reader).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                self.cleanup_partial_file(path).await?;
+                Err(e)
+            }
+        }
+    }
+
     async fn cleanup_partial_file(&self, path: &str) -> Result<(), StorageError> {
         if self.dst_store.uses_atomic_writes() {
             return Ok(());
@@ -227,6 +239,11 @@ impl MirrorOperation {
         }
 
         Ok(())
+    }
+
+    fn checkpoint_from_verified_path(path: &str) -> Result<u32, StorageError> {
+        crate::history_format::checkpoint_from_path(path)
+            .ok_or_else(|| StorageError::fatal(format!("invalid checkpoint path: {}", path)))
     }
 }
 
@@ -388,24 +405,55 @@ impl Operation for MirrorOperation {
     }
 
     async fn process_object(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
-        if self.verify && crate::history_format::is_bucket_file(path) {
-            match crate::verify::verify_and_write_bucket(path, reader, &self.dst_store).await {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    // Clean up corrupted/partial file on hash mismatch or decode failure
-                    self.cleanup_partial_file(path).await?;
-                    Err(e)
+        if let Some(ref manager) = self.verification_manager {
+            if crate::history_format::is_bucket_file(path) {
+                match crate::verify::verify_and_write_bucket(path, reader, &self.dst_store).await {
+                    Ok(()) => Ok(()),
+                    Err(e) => {
+                        self.cleanup_partial_file(path).await?;
+                        Err(e)
+                    }
                 }
+            } else if crate::history_format::is_ledger_file(path)
+                || crate::history_format::is_transactions_file(path)
+                || crate::history_format::is_results_file(path)
+                || crate::history_format::is_scp_file(path)
+            {
+                use crate::xdr_verify::XdrParseResult;
+                let result =
+                    match crate::xdr_verify::verify_and_write_xdr(path, reader, &self.dst_store)
+                        .await
+                    {
+                        Ok(result) => result,
+                        Err(e) => {
+                            self.cleanup_partial_file(path).await?;
+                            return Err(e);
+                        }
+                    };
+
+                let checkpoint = if matches!(result, XdrParseResult::None) {
+                    None
+                } else {
+                    Some(Self::checkpoint_from_verified_path(path)?)
+                };
+                match result {
+                    XdrParseResult::Ledger(data) => {
+                        manager.record_ledger_data(checkpoint.unwrap(), data);
+                    }
+                    XdrParseResult::Transactions(hashes) => {
+                        manager.record_tx_set_hashes(checkpoint.unwrap(), hashes);
+                    }
+                    XdrParseResult::Results(hashes) => {
+                        manager.record_result_hashes(checkpoint.unwrap(), hashes);
+                    }
+                    XdrParseResult::None => {}
+                }
+                Ok(())
+            } else {
+                self.copy_file(path, reader).await
             }
         } else {
-            // Standard copy for non-bucket files or when verification is disabled
-            match self.dst_store.copy_from_reader(path, reader).await {
-                Ok(()) => Ok(()),
-                Err(e) => {
-                    self.cleanup_partial_file(path).await?;
-                    Err(e)
-                }
-            }
+            self.copy_file(path, reader).await
         }
     }
 
@@ -437,19 +485,44 @@ impl Operation for MirrorOperation {
     }
 
     async fn finalize(&self, highest_checkpoint: u32) -> Result<(), crate::pipeline::Error> {
+        if let Some(ref manager) = self.verification_manager {
+            let chain_errors = manager.verify_checkpoint_chain();
+            for err in &chain_errors {
+                error!("Checkpoint {}: {}", err.checkpoint, err.message);
+                self.stats.record_failure("xdr-chain-verification").await;
+            }
+
+            let accumulated_errors = manager.get_errors();
+            for _ in &accumulated_errors {
+                self.stats.record_failure("xdr-cross-verification").await;
+            }
+
+            let total_errors = chain_errors.len() + accumulated_errors.len();
+            if total_errors > 0 {
+                error!(
+                    "XDR verification found {} cross-file hash mismatches",
+                    total_errors
+                );
+            }
+        }
+
         self.stats.report("mirror").await;
 
-        // Update .well-known file with the highest checkpoint we processed
+        if self.stats.has_failures() {
+            return Err(Error::MirrorFailed.into());
+        }
+
         if let Err(e) = self.maybe_update_well_known(highest_checkpoint).await {
             error!("Failed to update .well-known file: {}", e);
             return Err(e.into());
         }
 
-        // Report failure if there were any failed files
-        if self.stats.has_failures() {
-            return Err(Error::MirrorFailed.into());
-        }
-
         Ok(())
+    }
+
+    fn checkpoint_complete(&self, checkpoint: u32) {
+        if let Some(ref manager) = self.verification_manager {
+            manager.verify_and_release(checkpoint);
+        }
     }
 }

@@ -429,6 +429,13 @@ pub fn checkpoint_from_filename(filename: &str) -> Option<u32> {
     u32::from_str_radix(hex_part, 16).ok()
 }
 
+pub fn checkpoint_from_path(path: &str) -> Option<u32> {
+    let filename = std::path::Path::new(path)
+        .file_name()
+        .and_then(|f| f.to_str())?;
+    checkpoint_from_filename(filename)
+}
+
 /// Extract bucket hash from a bucket filename like "bucket-b5c7cd74192aa750429bfaa8cde27a41a729643a194fb474be765da982ece22a.xdr.gz"
 /// Returns lowercase hash for consistent comparison with hex::encode output.
 #[must_use]
@@ -460,6 +467,26 @@ pub fn is_bucket_file(path: &str) -> bool {
     path.starts_with("bucket/")
         && path.ends_with(".xdr.gz")
         && bucket_hash_from_path(path).is_some()
+}
+
+/// Check if a path is a ledger file.
+pub fn is_ledger_file(path: &str) -> bool {
+    path.starts_with("ledger/") && path.ends_with(".xdr.gz")
+}
+
+/// Check if a path is a transactions file.
+pub fn is_transactions_file(path: &str) -> bool {
+    path.starts_with("transactions/") && path.ends_with(".xdr.gz")
+}
+
+/// Check if a path is a results file.
+pub fn is_results_file(path: &str) -> bool {
+    path.starts_with("results/") && path.ends_with(".xdr.gz")
+}
+
+/// Check if a path is an SCP file.
+pub fn is_scp_file(path: &str) -> bool {
+    path.starts_with("scp/") && path.ends_with(".xdr.gz")
 }
 
 // Generate archive path for checkpoint file using string category (for backwards compatibility)
