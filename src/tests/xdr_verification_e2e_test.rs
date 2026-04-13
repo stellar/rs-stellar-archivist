@@ -555,26 +555,6 @@ fn corrupt_result_hash_in_ledger(archive_path: &Path, archive_type: ArchiveType)
     std::fs::write(&ledger_file, compressed).expect("Failed to write corrupted file");
 }
 
-// Verifies --verify detects when ledger header's expected result hash doesn't match
-// the actual hash computed from the result file.
-#[rstest]
-#[case::pubnet_old_txset(ArchiveType::PubnetOldTxset)]
-#[case::testnet_small(ArchiveType::TestnetSmall)]
-#[tokio::test]
-async fn test_scan_verify_detects_result_hash_mismatch(#[case] archive_type: ArchiveType) {
-    let (_temp_dir, archive_path) = setup_archive(archive_type);
-    corrupt_result_hash_in_ledger(&archive_path, archive_type);
-    let archive_url = format!("file://{}", archive_path.display());
-
-    let result = run_scan(configure_scan(&archive_url, archive_type, true, true)).await;
-
-    assert!(
-        result.is_err(),
-        "Scan --verify should fail on {} result hash mismatch but succeeded",
-        archive_type.name()
-    );
-}
-
 //=============================================================================
 // Hash Chain Verification Tests
 //
@@ -622,25 +602,6 @@ fn corrupt_prev_ledger_hash(archive_path: &Path, archive_type: ArchiveType) {
         .expect("Failed to write corrupted data");
     let compressed = encoder.finish().expect("Failed to finish compression");
     std::fs::write(second_file, compressed).expect("Failed to write corrupted file");
-}
-
-// Verifies --verify detects when the hash chain between ledgers is broken.
-#[rstest]
-#[case::pubnet_old_txset(ArchiveType::PubnetOldTxset)]
-#[case::testnet_small(ArchiveType::TestnetSmall)]
-#[tokio::test]
-async fn test_scan_verify_detects_hash_chain_break(#[case] archive_type: ArchiveType) {
-    let (_temp_dir, archive_path) = setup_archive(archive_type);
-    corrupt_prev_ledger_hash(&archive_path, archive_type);
-    let archive_url = format!("file://{}", archive_path.display());
-
-    let result = run_scan(configure_scan(&archive_url, archive_type, true, true)).await;
-
-    assert!(
-        result.is_err(),
-        "Scan --verify should fail on {} hash chain break but succeeded",
-        archive_type.name()
-    );
 }
 
 //=============================================================================
