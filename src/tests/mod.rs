@@ -11,7 +11,7 @@ mod path_normalization_test;
 #[cfg(test)]
 mod scan_op_test;
 #[cfg(test)]
-mod utils;
+pub(crate) mod utils;
 #[cfg(test)]
 mod verify_test;
 #[cfg(test)]

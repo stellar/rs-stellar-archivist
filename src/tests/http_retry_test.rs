@@ -230,16 +230,20 @@ async fn test_retries_on_connection_drops(
     );
 }
 
-/// Tests that retry delays follow exponential backoff pattern.
-/// Skipped in CI — wall-clock timing assertions are flaky under CPU contention.
-/// See docs/backoff-timing-test-flakiness.md for details.
+/// Tests that retry delays follow the exponential backoff pattern.
+///
+/// Uses a virtual clock (task-local override) to record intended sleep durations
+/// deterministically, avoiding the wall-clock flakiness caused by OS scheduler
+/// latency under CI CPU contention. See docs/backoff-timing-test-flakiness.md.
 #[rstest]
 #[case::one_failure(1)]
 #[case::two_failures(2)]
 #[case::three_failures(3)]
 #[tokio::test]
 async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
+    use super::utils::{VirtualClock, CLOCK_OVERRIDE};
     use crate::storage::StorageConfig;
+    use std::sync::Arc;
     use std::time::Duration;
 
     let archive_path = test_archive_path();
@@ -248,9 +252,11 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
     let config = FlakyServerConfig::archive_status_error(archive_path, 503, fail_count, "bucket/");
     let (server_url, tracker, handle) = start_flaky_server(config).await;
 
+    let virtual_clock = Arc::new(VirtualClock::new());
+
     let storage_config = StorageConfig::new(
         3,
-        Duration::from_secs(1), // Use large timeout values so jitter doesn't affect unit tests.
+        Duration::from_secs(1), // initial backoff = 1000ms
         Duration::from_secs(30),
         64,
         Duration::from_secs(30),
@@ -260,15 +266,18 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
     );
 
     let dest_dir = TempDir::new().unwrap();
-    let result = run_mirror(
-        MirrorConfig::new(&server_url, file_url_from_path(dest_dir.path()))
-            .skip_optional()
-            .concurrency(1)
-            .low(PUBNET_CHECKPOINT_LOW)
-            .high(PUBNET_CHECKPOINT_HIGH)
-            .storage_config(storage_config),
-    )
-    .await;
+    let mirror_config = MirrorConfig::new(&server_url, file_url_from_path(dest_dir.path()))
+        .skip_optional()
+        .concurrency(1)
+        .low(PUBNET_CHECKPOINT_LOW)
+        .high(PUBNET_CHECKPOINT_HIGH)
+        .storage_config(storage_config);
+
+    // Run mirror inside a virtual clock scope — RetryState::backoff() will
+    // record intended durations instead of sleeping.
+    let result = CLOCK_OVERRIDE
+        .scope(virtual_clock.clone(), run_mirror(mirror_config))
+        .await;
     handle.abort();
 
     assert!(
@@ -278,14 +287,15 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
         result.err()
     );
 
+    // Verify retries occurred at the server level
     let counts = tracker.get_counts();
-    let retried_paths: Vec<_> = counts
+    let num_retried_paths = counts
         .iter()
         .filter(|(path, count)| path.starts_with("bucket/") && **count == fail_count + 1)
-        .collect();
+        .count();
 
     assert!(
-        !retried_paths.is_empty(),
+        num_retried_paths > 0,
         "Expected at least one bucket file to be retried {} times, got counts: {:?}",
         fail_count,
         counts
@@ -294,11 +304,20 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
             .collect::<Vec<_>>()
     );
 
-    for (path, _) in &retried_paths {
-        if let Err(e) = tracker.verify_backoff_timing(path, 1000, 200, 700) {
-            panic!("Exponential backoff failed for {path} with {fail_count} failures: {e}");
-        }
+    // Verify backoff durations recorded by the virtual clock.
+    // Each retried path independently sleeps [1s, 2s, 4s, ...] (capped at 5s).
+    // Sorted, that's num_retried_paths copies of each level in ascending order.
+    let mut sorted_sleeps = virtual_clock.recorded_sleeps();
+    sorted_sleeps.sort();
+
+    let mut expected = vec![];
+    let mut ms = 1000u64;
+    for _ in 0..fail_count {
+        expected.extend(std::iter::repeat_n(Duration::from_millis(ms), num_retried_paths));
+        ms = (ms * 2).min(5000);
     }
+
+    assert_eq!(sorted_sleeps, expected, "backoff sleeps should follow exponential pattern");
 }
 
 //=============================================================================

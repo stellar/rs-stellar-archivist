@@ -245,72 +245,6 @@ impl RequestTracker {
         self.counts.lock().unwrap().clone()
     }
 
-    pub fn get_timestamps(&self, path: &str) -> Vec<Instant> {
-        self.timestamps
-            .lock()
-            .unwrap()
-            .get(path)
-            .cloned()
-            .unwrap_or_default()
-    }
-
-    /// Verify that retry delays follow exponential backoff pattern.
-    /// Returns Ok if delays are within tolerance, Err with details otherwise.
-    ///
-    /// Expected backoff starts at `initial_backoff_ms`, doubles after each retry, and caps at
-    /// 5000ms. Separate lower and upper tolerances let tests keep a strict minimum delay while
-    /// tolerating scheduler and request overhead on busy machines.
-    pub fn verify_backoff_timing(
-        &self,
-        path: &str,
-        initial_backoff_ms: u64,
-        lower_tolerance_ms: u64,
-        upper_tolerance_ms: u64,
-    ) -> Result<(), String> {
-        let timestamps = self.get_timestamps(path);
-        if timestamps.len() < 2 {
-            return Ok(()); // No retries, nothing to verify
-        }
-
-        let mut expected_backoff_ms = initial_backoff_ms;
-        for i in 1..timestamps.len() {
-            let actual_delay = timestamps[i].duration_since(timestamps[i - 1]);
-            let actual_ms = actual_delay.as_millis() as u64;
-            let min_expected = expected_backoff_ms.saturating_sub(lower_tolerance_ms);
-            let max_expected = expected_backoff_ms + upper_tolerance_ms;
-
-            if actual_ms < min_expected {
-                return Err(format!(
-                    "Retry {} -> {}: delay {}ms is below minimum {}ms (expected ~{}ms -{}ms/+{}ms)",
-                    i,
-                    i + 1,
-                    actual_ms,
-                    min_expected,
-                    expected_backoff_ms,
-                    lower_tolerance_ms,
-                    upper_tolerance_ms
-                ));
-            }
-
-            if actual_ms > max_expected {
-                return Err(format!(
-                    "Retry {} -> {}: delay {}ms exceeds maximum {}ms (expected ~{}ms -{}ms/+{}ms)",
-                    i,
-                    i + 1,
-                    actual_ms,
-                    max_expected,
-                    expected_backoff_ms,
-                    lower_tolerance_ms,
-                    upper_tolerance_ms
-                ));
-            }
-
-            // Advance expected backoff (doubles, capped at 5000ms)
-            expected_backoff_ms = (expected_backoff_ms * 2).min(5000);
-        }
-
-        Ok(())
-    }
 }
 
 impl Default for RequestTracker {
@@ -318,6 +252,44 @@ impl Default for RequestTracker {
         Self::new()
     }
 }
+
+//=============================================================================
+// Virtual Clock
+//=============================================================================
+
+/// Records intended sleep durations without real delays.
+/// Used with the `CLOCK_OVERRIDE` task-local to make backoff timing tests
+/// deterministic regardless of CPU contention.
+pub struct VirtualClock {
+    sleeps: Mutex<Vec<std::time::Duration>>,
+}
+
+impl VirtualClock {
+    pub fn new() -> Self {
+        Self {
+            sleeps: Mutex::new(Vec::new()),
+        }
+    }
+
+    pub fn recorded_sleeps(&self) -> Vec<std::time::Duration> {
+        self.sleeps.lock().unwrap().clone()
+    }
+
+    pub async fn sleep(&self, duration: std::time::Duration) {
+        self.sleeps.lock().unwrap().push(duration);
+        tokio::task::yield_now().await;
+    }
+}
+
+tokio::task_local! {
+    /// Task-local virtual clock override for `RetryState::backoff()`.
+    /// Set via `CLOCK_OVERRIDE.scope(virtual_clock, future)` in tests.
+    pub static CLOCK_OVERRIDE: Arc<VirtualClock>;
+}
+
+//=============================================================================
+// Flaky Server
+//=============================================================================
 
 /// Start a flaky HTTP server with configurable failure modes
 pub async fn start_flaky_server(
