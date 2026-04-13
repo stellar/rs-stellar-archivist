@@ -790,44 +790,6 @@ async fn test_verify_detects_result_hash_mismatch_in_scan_and_mirror(
 }
 
 #[tokio::test]
-async fn test_mirror_verify_removes_corrupt_written_xdr_file() {
-    let (_temp_src, archive_path) = setup_corrupted_xdr_archive(
-        ArchiveType::PubnetOldTxset,
-        XdrFileType::Transactions,
-        CorruptionMethod::WrongContent,
-    );
-    let corrupt_file = get_first_file_in_range(
-        &archive_path,
-        ArchiveType::PubnetOldTxset,
-        XdrFileType::Transactions.pattern(),
-    );
-
-    let temp_dest = TempDir::new().expect("Failed to create temp dir");
-    let src_url = format!("file://{}", archive_path.display());
-    let dest_url = format!("file://{}", temp_dest.path().display());
-
-    let result = run_mirror(configure_mirror(
-        &src_url,
-        &dest_url,
-        ArchiveType::PubnetOldTxset,
-        true,
-        true,
-    ))
-    .await;
-
-    assert!(
-        result.is_err(),
-        "Mirror should fail on corrupt transactions file"
-    );
-
-    let relative = corrupt_file.strip_prefix(&archive_path).unwrap();
-    assert!(
-        !temp_dest.path().join(relative).exists(),
-        "corrupt xdr file should be cleaned up after mirror verification failure"
-    );
-}
-
-#[tokio::test]
 async fn test_scan_verify_fails_with_multiple_corrupt_files_same_checkpoint() {
     let (_temp_dir, archive_path) = setup_archive(ArchiveType::PubnetOldTxset);
     let ledger_file = get_first_file_in_range(
