@@ -259,6 +259,27 @@ fn hash_of(value: &str) -> [u8; 32] {
     Sha256::digest(value.as_bytes()).into()
 }
 
+fn assert_has_error(manager: &XdrVerificationManager, substring: &str) {
+    assert!(
+        manager.get_errors().iter().any(|e| e.message.contains(substring)),
+        "expected an error containing {substring:?}, got: {:?}",
+        manager.get_errors().iter().map(|e| &e.message).collect::<Vec<_>>(),
+    );
+}
+
+fn assert_no_errors_matching(manager: &XdrVerificationManager, substring: &str) {
+    let matching: Vec<_> = manager
+        .get_errors()
+        .iter()
+        .filter(|e| e.message.contains(substring))
+        .cloned()
+        .collect();
+    assert!(
+        matching.is_empty(),
+        "expected no errors containing {substring:?}, got: {matching:?}",
+    );
+}
+
 #[test]
 fn test_parse_ledger_entries_empty_input() {
     let parsed = parse_ledger_entries(&[]).unwrap();
@@ -524,7 +545,8 @@ fn test_chain_break_within_ledger_file(#[case] checkpoint: u32, #[case] corrupte
     assert!(manager
         .get_errors()
         .iter()
-        .any(|e| e.ledger_seq == Some(corrupted_ledger) && e.message.contains("hash chain break")));
+        .any(|e| e.ledger_seq == Some(corrupted_ledger) && e.message.contains("hash chain break")),
+    );
 }
 
 #[rstest]
@@ -556,13 +578,7 @@ fn test_missing_ledger_entries(#[case] checkpoint: u32, #[case] missing: Vec<u32
     );
     manager.verify_and_release(checkpoint);
 
-    let combined = manager
-        .get_errors()
-        .iter()
-        .map(|e| e.message.clone())
-        .collect::<Vec<_>>()
-        .join(" ");
-    assert!(combined.contains("missing"));
+    assert_has_error(&manager, "missing");
 }
 
 #[test]
@@ -582,9 +598,7 @@ fn test_ledger_outside_expected_checkpoint_range() {
     manager.record_ledger_data(127, ledger_data);
     manager.verify_and_release(127);
 
-    assert!(manager.get_errors().iter().any(|e| e
-        .message
-        .contains("unexpected ledger entries outside range")));
+    assert_has_error(&manager, "unexpected ledger entries outside range");
 }
 
 #[rstest]
@@ -707,9 +721,7 @@ fn test_verify_and_release_with_only_tx_hashes_records_error_and_is_idempotent()
 
     assert_eq!(first_errors.len(), 1);
     assert_eq!(second_errors.len(), 1);
-    assert!(first_errors[0]
-        .message
-        .contains("missing ledger verification data"));
+    assert_has_error(&manager, "missing ledger verification data");
 }
 
 #[test]
@@ -718,10 +730,7 @@ fn test_verify_and_release_with_only_result_hashes_records_error() {
     manager.record_result_hashes(127, HashMap::from([(100, [1; 32])]));
     manager.verify_and_release(127);
 
-    assert_eq!(manager.get_errors().len(), 1);
-    assert!(manager.get_errors()[0]
-        .message
-        .contains("missing ledger verification data"));
+    assert_has_error(&manager, "missing ledger verification data");
 }
 
 #[test]
@@ -786,10 +795,7 @@ fn test_manager_detects_hash_mismatch(#[case] hash_type: &str) {
     }
     manager.verify_and_release(checkpoint);
 
-    assert!(manager
-        .get_errors()
-        .iter()
-        .any(|e| e.message.contains(&format!("{hash_type} hash mismatch"))));
+    assert_has_error(&manager, &format!("{hash_type} hash mismatch"));
 }
 
 #[rstest]
@@ -816,10 +822,7 @@ fn test_manager_detects_missing_entry_for_non_empty_hash(#[case] hash_type: &str
     }
     manager.verify_and_release(checkpoint);
 
-    assert!(manager
-        .get_errors()
-        .iter()
-        .any(|e| e.message.contains(&format!("missing {hash_type} entry"))));
+    assert_has_error(&manager, &format!("missing {hash_type} entry"));
 }
 
 /// Missing entries should not be flagged when the expected hash indicates an empty
@@ -866,16 +869,7 @@ fn test_manager_allows_missing_entry_for_empty_hash(
     }
     manager.verify_and_release(checkpoint);
 
-    let errors: Vec<_> = manager
-        .get_errors()
-        .iter()
-        .filter(|e| e.message.contains(hash_type))
-        .cloned()
-        .collect();
-    assert!(
-        errors.is_empty(),
-        "Should allow missing {hash_type} entry for {empty_variant} hash, got: {errors:?}",
-    );
+    assert_no_errors_matching(&manager, hash_type);
 }
 
 #[test]
@@ -901,17 +895,7 @@ fn test_manager_still_flags_missing_tx_set_when_result_hash_is_empty_array_hash(
 
     // The EMPTY_XDR_ARRAY_HASH result hash suppresses the missing tx set error
     // because no results implies no transactions, regardless of tx_set_hash format
-    let tx_errors: Vec<_> = manager
-        .get_errors()
-        .iter()
-        .filter(|e| e.message.contains("missing tx set entry"))
-        .cloned()
-        .collect();
-    assert!(
-        tx_errors.is_empty(),
-        "EMPTY_XDR_ARRAY_HASH result hash should suppress missing tx set error, got: {:?}",
-        tx_errors
-    );
+    assert_no_errors_matching(&manager, "missing tx set entry");
 }
 
 
