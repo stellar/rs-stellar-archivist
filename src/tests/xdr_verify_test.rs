@@ -261,9 +261,16 @@ fn hash_of(value: &str) -> [u8; 32] {
 
 fn assert_has_error(manager: &XdrVerificationManager, substring: &str) {
     assert!(
-        manager.get_errors().iter().any(|e| e.message.contains(substring)),
+        manager
+            .get_errors()
+            .iter()
+            .any(|e| e.message.contains(substring)),
         "expected an error containing {substring:?}, got: {:?}",
-        manager.get_errors().iter().map(|e| &e.message).collect::<Vec<_>>(),
+        manager
+            .get_errors()
+            .iter()
+            .map(|e| &e.message)
+            .collect::<Vec<_>>(),
     );
 }
 
@@ -370,7 +377,6 @@ fn test_parse_result_entries_single_entry() {
     assert_eq!(parsed, HashMap::from([(100, expected)]));
 }
 
-
 #[test]
 fn test_parse_transaction_entries_v0_non_empty() {
     let prev_hash = [0x42; 32];
@@ -396,7 +402,6 @@ fn test_parse_transaction_entries_v1_non_empty() {
     assert_eq!(parsed[&100], compute_v1_tx_set_hash(generalized).unwrap());
     assert!(!is_empty_tx_set_hash(&parsed[&100], &prev_hash));
 }
-
 
 #[test]
 fn test_compute_v0_tx_set_hash_matches_manual_hash() {
@@ -545,8 +550,7 @@ fn test_chain_break_within_ledger_file(#[case] checkpoint: u32, #[case] corrupte
     assert!(manager
         .get_errors()
         .iter()
-        .any(|e| e.ledger_seq == Some(corrupted_ledger) && e.message.contains("hash chain break")),
-    );
+        .any(|e| e.ledger_seq == Some(corrupted_ledger) && e.message.contains("hash chain break")),);
 }
 
 #[rstest]
@@ -897,7 +901,6 @@ fn test_manager_still_flags_missing_tx_set_when_result_hash_is_empty_array_hash(
     // because no results implies no transactions, regardless of tx_set_hash format
     assert_no_errors_matching(&manager, "missing tx set entry");
 }
-
 
 #[rstest]
 #[case::ledger("ledger")]

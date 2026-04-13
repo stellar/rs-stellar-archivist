@@ -442,24 +442,96 @@ async fn test_mirror_verify_valid_archive(#[case] archive_type: ArchiveType) {
 //=============================================================================
 
 #[rstest]
-#[case::pubnet_ledger_invalid_gzip(ArchiveType::PubnetOldTxset, XdrFileType::Ledger, CorruptionMethod::InvalidGzip)]
-#[case::pubnet_ledger_wrong_content(ArchiveType::PubnetOldTxset, XdrFileType::Ledger, CorruptionMethod::WrongContent)]
-#[case::pubnet_ledger_flipped_bytes(ArchiveType::PubnetOldTxset, XdrFileType::Ledger, CorruptionMethod::FlippedBytes)]
-#[case::pubnet_transactions_invalid_gzip(ArchiveType::PubnetOldTxset, XdrFileType::Transactions, CorruptionMethod::InvalidGzip)]
-#[case::pubnet_transactions_wrong_content(ArchiveType::PubnetOldTxset, XdrFileType::Transactions, CorruptionMethod::WrongContent)]
-#[case::pubnet_transactions_flipped_bytes(ArchiveType::PubnetOldTxset, XdrFileType::Transactions, CorruptionMethod::FlippedBytes)]
-#[case::pubnet_results_invalid_gzip(ArchiveType::PubnetOldTxset, XdrFileType::Results, CorruptionMethod::InvalidGzip)]
-#[case::pubnet_results_wrong_content(ArchiveType::PubnetOldTxset, XdrFileType::Results, CorruptionMethod::WrongContent)]
-#[case::pubnet_results_flipped_bytes(ArchiveType::PubnetOldTxset, XdrFileType::Results, CorruptionMethod::FlippedBytes)]
-#[case::testnet_ledger_invalid_gzip(ArchiveType::TestnetSmall, XdrFileType::Ledger, CorruptionMethod::InvalidGzip)]
-#[case::testnet_ledger_wrong_content(ArchiveType::TestnetSmall, XdrFileType::Ledger, CorruptionMethod::WrongContent)]
-#[case::testnet_ledger_flipped_bytes(ArchiveType::TestnetSmall, XdrFileType::Ledger, CorruptionMethod::FlippedBytes)]
-#[case::testnet_transactions_invalid_gzip(ArchiveType::TestnetSmall, XdrFileType::Transactions, CorruptionMethod::InvalidGzip)]
-#[case::testnet_transactions_wrong_content(ArchiveType::TestnetSmall, XdrFileType::Transactions, CorruptionMethod::WrongContent)]
-#[case::testnet_transactions_flipped_bytes(ArchiveType::TestnetSmall, XdrFileType::Transactions, CorruptionMethod::FlippedBytes)]
-#[case::testnet_results_invalid_gzip(ArchiveType::TestnetSmall, XdrFileType::Results, CorruptionMethod::InvalidGzip)]
-#[case::testnet_results_wrong_content(ArchiveType::TestnetSmall, XdrFileType::Results, CorruptionMethod::WrongContent)]
-#[case::testnet_results_flipped_bytes(ArchiveType::TestnetSmall, XdrFileType::Results, CorruptionMethod::FlippedBytes)]
+#[case::pubnet_ledger_invalid_gzip(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Ledger,
+    CorruptionMethod::InvalidGzip
+)]
+#[case::pubnet_ledger_wrong_content(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Ledger,
+    CorruptionMethod::WrongContent
+)]
+#[case::pubnet_ledger_flipped_bytes(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Ledger,
+    CorruptionMethod::FlippedBytes
+)]
+#[case::pubnet_transactions_invalid_gzip(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Transactions,
+    CorruptionMethod::InvalidGzip
+)]
+#[case::pubnet_transactions_wrong_content(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Transactions,
+    CorruptionMethod::WrongContent
+)]
+#[case::pubnet_transactions_flipped_bytes(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Transactions,
+    CorruptionMethod::FlippedBytes
+)]
+#[case::pubnet_results_invalid_gzip(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Results,
+    CorruptionMethod::InvalidGzip
+)]
+#[case::pubnet_results_wrong_content(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Results,
+    CorruptionMethod::WrongContent
+)]
+#[case::pubnet_results_flipped_bytes(
+    ArchiveType::PubnetOldTxset,
+    XdrFileType::Results,
+    CorruptionMethod::FlippedBytes
+)]
+#[case::testnet_ledger_invalid_gzip(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Ledger,
+    CorruptionMethod::InvalidGzip
+)]
+#[case::testnet_ledger_wrong_content(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Ledger,
+    CorruptionMethod::WrongContent
+)]
+#[case::testnet_ledger_flipped_bytes(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Ledger,
+    CorruptionMethod::FlippedBytes
+)]
+#[case::testnet_transactions_invalid_gzip(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Transactions,
+    CorruptionMethod::InvalidGzip
+)]
+#[case::testnet_transactions_wrong_content(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Transactions,
+    CorruptionMethod::WrongContent
+)]
+#[case::testnet_transactions_flipped_bytes(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Transactions,
+    CorruptionMethod::FlippedBytes
+)]
+#[case::testnet_results_invalid_gzip(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Results,
+    CorruptionMethod::InvalidGzip
+)]
+#[case::testnet_results_wrong_content(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Results,
+    CorruptionMethod::WrongContent
+)]
+#[case::testnet_results_flipped_bytes(
+    ArchiveType::TestnetSmall,
+    XdrFileType::Results,
+    CorruptionMethod::FlippedBytes
+)]
 #[tokio::test]
 async fn test_scan_verify_detects_corrupt_xdr(
     #[case] archive_type: ArchiveType,
@@ -957,9 +1029,11 @@ async fn test_verify_detects_true_cross_file_mismatch(
 ) {
     let (_temp_dir, archive_path) = setup_archive(archive_type);
     match corruption_type {
-        "tx_set" | "result" => {
-            corrupt_ledger_hash_field_preserving_entry_hash(&archive_path, archive_type, corruption_type)
-        }
+        "tx_set" | "result" => corrupt_ledger_hash_field_preserving_entry_hash(
+            &archive_path,
+            archive_type,
+            corruption_type,
+        ),
         "chain" => corrupt_cross_checkpoint_boundary(&archive_path, archive_type),
         _ => unreachable!(),
     }

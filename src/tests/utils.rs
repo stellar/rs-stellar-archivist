@@ -244,7 +244,6 @@ impl RequestTracker {
     pub fn get_counts(&self) -> HashMap<String, usize> {
         self.counts.lock().unwrap().clone()
     }
-
 }
 
 impl Default for RequestTracker {

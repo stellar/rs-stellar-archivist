@@ -225,15 +225,17 @@ impl XdrVerificationManager {
             });
         }
 
-        let missing: Vec<u32> = range
-            .filter(|seq| !ledger_data.contains_key(seq))
-            .collect();
+        let missing: Vec<u32> = range.filter(|seq| !ledger_data.contains_key(seq)).collect();
 
         if !missing.is_empty() {
             let list_str = if missing.len() <= 10 {
                 fmt_list(&missing)
             } else {
-                format!("{}, ... ({} more)", fmt_list(&missing[..5]), missing.len() - 5)
+                format!(
+                    "{}, ... ({} more)",
+                    fmt_list(&missing[..5]),
+                    missing.len() - 5
+                )
             };
             let err_msg = format!(
                 "missing {} of {} ledger entries (ledgers {first_ledger}-{last_ledger}): {list_str}",
@@ -672,7 +674,10 @@ pub(crate) fn parse_result_entries_for_checkpoint(
 }
 
 /// Decompress gzip data from a reader into an in-memory buffer.
-pub(crate) async fn decompress_to_buffer(path: &str, reader: Reader) -> Result<Vec<u8>, StorageError> {
+pub(crate) async fn decompress_to_buffer(
+    path: &str,
+    reader: Reader,
+) -> Result<Vec<u8>, StorageError> {
     // the writer is None, thus the return sink is also None, which is safe to
     // be discarded
     let (decompressed, _) = decompress_and_write_internal(path, reader, None).await?;

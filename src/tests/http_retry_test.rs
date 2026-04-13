@@ -313,11 +313,17 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
     let mut expected = vec![];
     let mut ms = 1000u64;
     for _ in 0..fail_count {
-        expected.extend(std::iter::repeat_n(Duration::from_millis(ms), num_retried_paths));
+        expected.extend(std::iter::repeat_n(
+            Duration::from_millis(ms),
+            num_retried_paths,
+        ));
         ms = (ms * 2).min(5000);
     }
 
-    assert_eq!(sorted_sleeps, expected, "backoff sleeps should follow exponential pattern");
+    assert_eq!(
+        sorted_sleeps, expected,
+        "backoff sleeps should follow exponential pattern"
+    );
 }
 
 //=============================================================================
