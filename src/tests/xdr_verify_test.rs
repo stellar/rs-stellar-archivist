@@ -547,6 +547,7 @@ fn test_complete_checkpoint_passes(#[case] checkpoint: u32, #[case] expected_cou
 #[case::middle_ledger(127, vec![100])]
 #[case::multiple_ledgers(127, vec![66, 67])]
 #[case::genesis_first(63, vec![1])]
+#[case::all_missing(127, (64..=127).collect())]
 fn test_missing_ledger_entries(#[case] checkpoint: u32, #[case] missing: Vec<u32>) {
     let manager = XdrVerificationManager::new();
     manager.record_ledger_data(
@@ -562,14 +563,6 @@ fn test_missing_ledger_entries(#[case] checkpoint: u32, #[case] missing: Vec<u32
         .collect::<Vec<_>>()
         .join(" ");
     assert!(combined.contains("missing"));
-}
-
-#[test]
-fn test_manager_empty_checkpoint_data() {
-    let manager = XdrVerificationManager::new();
-    manager.record_ledger_data(127, BTreeMap::new());
-    manager.verify_and_release(127);
-    assert!(!manager.get_errors().is_empty());
 }
 
 #[test]
