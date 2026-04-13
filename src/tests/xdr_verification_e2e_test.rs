@@ -434,116 +434,49 @@ async fn test_mirror_verify_valid_archive(#[case] archive_type: ArchiveType) {
 }
 
 //=============================================================================
-// Ledger File Corruption Tests
+// XDR File Corruption Tests (Scan)
 //
-// Ledger files (ledger-*.xdr.gz) are the foundation of archive verification:
-//   - Contain LedgerHeaderHistoryEntry records with hash chain
-//   - Store expected hashes for transaction and result files
-//   - Must be parseable for any verification to proceed
-//
-// Corruption methods tested:
-//   - InvalidGzip: File isn't valid gzip (download truncation, storage error)
-//   - WrongContent: Valid gzip but wrong XDR content (file swap, mismatch)
-//   - FlippedBytes: Valid structure but corrupted bytes (bit rot, tampering)
+// Tests that --verify detects corruption across all XDR file types (ledger,
+// transactions, results) and all corruption methods (InvalidGzip, WrongContent,
+// FlippedBytes) for both archive formats.
 //=============================================================================
 
-// Verifies --verify detects various types of ledger file corruption.
 #[rstest]
-#[case::pubnet_invalid_gzip(ArchiveType::PubnetOldTxset, CorruptionMethod::InvalidGzip)]
-#[case::pubnet_wrong_content(ArchiveType::PubnetOldTxset, CorruptionMethod::WrongContent)]
-#[case::pubnet_flipped_bytes(ArchiveType::PubnetOldTxset, CorruptionMethod::FlippedBytes)]
-#[case::testnet_invalid_gzip(ArchiveType::TestnetSmall, CorruptionMethod::InvalidGzip)]
-#[case::testnet_wrong_content(ArchiveType::TestnetSmall, CorruptionMethod::WrongContent)]
-#[case::testnet_flipped_bytes(ArchiveType::TestnetSmall, CorruptionMethod::FlippedBytes)]
+#[case::pubnet_ledger_invalid_gzip(ArchiveType::PubnetOldTxset, XdrFileType::Ledger, CorruptionMethod::InvalidGzip)]
+#[case::pubnet_ledger_wrong_content(ArchiveType::PubnetOldTxset, XdrFileType::Ledger, CorruptionMethod::WrongContent)]
+#[case::pubnet_ledger_flipped_bytes(ArchiveType::PubnetOldTxset, XdrFileType::Ledger, CorruptionMethod::FlippedBytes)]
+#[case::pubnet_transactions_invalid_gzip(ArchiveType::PubnetOldTxset, XdrFileType::Transactions, CorruptionMethod::InvalidGzip)]
+#[case::pubnet_transactions_wrong_content(ArchiveType::PubnetOldTxset, XdrFileType::Transactions, CorruptionMethod::WrongContent)]
+#[case::pubnet_transactions_flipped_bytes(ArchiveType::PubnetOldTxset, XdrFileType::Transactions, CorruptionMethod::FlippedBytes)]
+#[case::pubnet_results_invalid_gzip(ArchiveType::PubnetOldTxset, XdrFileType::Results, CorruptionMethod::InvalidGzip)]
+#[case::pubnet_results_wrong_content(ArchiveType::PubnetOldTxset, XdrFileType::Results, CorruptionMethod::WrongContent)]
+#[case::pubnet_results_flipped_bytes(ArchiveType::PubnetOldTxset, XdrFileType::Results, CorruptionMethod::FlippedBytes)]
+#[case::testnet_ledger_invalid_gzip(ArchiveType::TestnetSmall, XdrFileType::Ledger, CorruptionMethod::InvalidGzip)]
+#[case::testnet_ledger_wrong_content(ArchiveType::TestnetSmall, XdrFileType::Ledger, CorruptionMethod::WrongContent)]
+#[case::testnet_ledger_flipped_bytes(ArchiveType::TestnetSmall, XdrFileType::Ledger, CorruptionMethod::FlippedBytes)]
+#[case::testnet_transactions_invalid_gzip(ArchiveType::TestnetSmall, XdrFileType::Transactions, CorruptionMethod::InvalidGzip)]
+#[case::testnet_transactions_wrong_content(ArchiveType::TestnetSmall, XdrFileType::Transactions, CorruptionMethod::WrongContent)]
+#[case::testnet_transactions_flipped_bytes(ArchiveType::TestnetSmall, XdrFileType::Transactions, CorruptionMethod::FlippedBytes)]
+#[case::testnet_results_invalid_gzip(ArchiveType::TestnetSmall, XdrFileType::Results, CorruptionMethod::InvalidGzip)]
+#[case::testnet_results_wrong_content(ArchiveType::TestnetSmall, XdrFileType::Results, CorruptionMethod::WrongContent)]
+#[case::testnet_results_flipped_bytes(ArchiveType::TestnetSmall, XdrFileType::Results, CorruptionMethod::FlippedBytes)]
 #[tokio::test]
-async fn test_scan_verify_detects_corrupt_ledger(
+async fn test_scan_verify_detects_corrupt_xdr(
     #[case] archive_type: ArchiveType,
+    #[case] file_type: XdrFileType,
     #[case] corruption: CorruptionMethod,
 ) {
     let (_temp_dir, archive_path) =
-        setup_corrupted_xdr_archive(archive_type, XdrFileType::Ledger, corruption);
+        setup_corrupted_xdr_archive(archive_type, file_type, corruption);
     let archive_url = format!("file://{}", archive_path.display());
 
     let result = run_scan(configure_scan(&archive_url, archive_type, true, true)).await;
 
     assert!(
         result.is_err(),
-        "Scan --verify should fail on {} ledger corruption ({}) but succeeded",
+        "Scan --verify should fail on {} {} corruption ({}) but succeeded",
         archive_type.name(),
-        corruption.name()
-    );
-}
-
-//=============================================================================
-// Transactions File Corruption Tests
-//
-// Transaction files (transactions-*.xdr.gz) contain TransactionHistoryEntry records.
-// Each entry has a transaction set whose hash must match the ledger header's tx_set_hash.
-// Corruption here is detected via:
-//   - Parse failure (InvalidGzip, WrongContent)
-//   - Hash mismatch (FlippedBytes changes computed hash, won't match ledger header)
-//=============================================================================
-
-// Verifies --verify detects various types of transaction file corruption.
-#[rstest]
-#[case::pubnet_invalid_gzip(ArchiveType::PubnetOldTxset, CorruptionMethod::InvalidGzip)]
-#[case::pubnet_wrong_content(ArchiveType::PubnetOldTxset, CorruptionMethod::WrongContent)]
-#[case::pubnet_flipped_bytes(ArchiveType::PubnetOldTxset, CorruptionMethod::FlippedBytes)]
-#[case::testnet_invalid_gzip(ArchiveType::TestnetSmall, CorruptionMethod::InvalidGzip)]
-#[case::testnet_wrong_content(ArchiveType::TestnetSmall, CorruptionMethod::WrongContent)]
-#[case::testnet_flipped_bytes(ArchiveType::TestnetSmall, CorruptionMethod::FlippedBytes)]
-#[tokio::test]
-async fn test_scan_verify_detects_corrupt_transactions(
-    #[case] archive_type: ArchiveType,
-    #[case] corruption: CorruptionMethod,
-) {
-    let (_temp_dir, archive_path) =
-        setup_corrupted_xdr_archive(archive_type, XdrFileType::Transactions, corruption);
-    let archive_url = format!("file://{}", archive_path.display());
-
-    let result = run_scan(configure_scan(&archive_url, archive_type, true, true)).await;
-
-    assert!(
-        result.is_err(),
-        "Scan --verify should fail on {} transactions corruption ({}) but succeeded",
-        archive_type.name(),
-        corruption.name()
-    );
-}
-
-//=============================================================================
-// Results File Corruption Tests
-//
-// Result files (results-*.xdr.gz) contain TransactionHistoryResultEntry records.
-// Each entry has a result set whose hash must match the ledger header's tx_set_result_hash.
-// Same corruption detection mechanisms as transaction files:
-//   - Parse failure catches structural corruption
-//   - Hash mismatch catches content corruption
-//=============================================================================
-
-// Verifies --verify detects various types of result file corruption.
-#[rstest]
-#[case::pubnet_invalid_gzip(ArchiveType::PubnetOldTxset, CorruptionMethod::InvalidGzip)]
-#[case::pubnet_wrong_content(ArchiveType::PubnetOldTxset, CorruptionMethod::WrongContent)]
-#[case::pubnet_flipped_bytes(ArchiveType::PubnetOldTxset, CorruptionMethod::FlippedBytes)]
-#[case::testnet_invalid_gzip(ArchiveType::TestnetSmall, CorruptionMethod::InvalidGzip)]
-#[case::testnet_wrong_content(ArchiveType::TestnetSmall, CorruptionMethod::WrongContent)]
-#[case::testnet_flipped_bytes(ArchiveType::TestnetSmall, CorruptionMethod::FlippedBytes)]
-#[tokio::test]
-async fn test_scan_verify_detects_corrupt_results(
-    #[case] archive_type: ArchiveType,
-    #[case] corruption: CorruptionMethod,
-) {
-    let (_temp_dir, archive_path) =
-        setup_corrupted_xdr_archive(archive_type, XdrFileType::Results, corruption);
-    let archive_url = format!("file://{}", archive_path.display());
-
-    let result = run_scan(configure_scan(&archive_url, archive_type, true, true)).await;
-
-    assert!(
-        result.is_err(),
-        "Scan --verify should fail on {} results corruption ({}) but succeeded",
-        archive_type.name(),
+        file_type.name(),
         corruption.name()
     );
 }
