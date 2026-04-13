@@ -874,32 +874,24 @@ fn write_ledger_entries_to_file(path: &Path, entries: &[LedgerHeaderHistoryEntry
     std::fs::write(path, compressed).expect("Failed to write file");
 }
 
-/// Modify all entries in a ledger file: set tx_set_hash to a wrong value,
-/// recompute each entry's hash, and fix the internal prev-hash chain so
+/// Modify all entries in a ledger file: set the specified hash field to a wrong
+/// value, recompute each entry's hash, and fix the internal prev-hash chain so
 /// the file passes per-entry and intra-checkpoint validation. The mismatch
-/// surfaces only when cross-checking against the transactions file.
-fn corrupt_tx_set_hash_preserving_entry_hash(archive_path: &Path, archive_type: ArchiveType) {
+/// surfaces only during cross-file verification.
+fn corrupt_ledger_hash_field_preserving_entry_hash(
+    archive_path: &Path,
+    archive_type: ArchiveType,
+    field: &str,
+) {
     let ledger_file = get_first_file_in_range(archive_path, archive_type, "/ledger-");
     let mut entries = read_and_parse_ledger_file(&ledger_file);
 
     for i in 0..entries.len() {
-        entries[i].header.scp_value.tx_set_hash = Hash([0xDE; 32]);
-        if i > 0 {
-            entries[i].header.previous_ledger_hash = entries[i - 1].hash.clone();
+        match field {
+            "tx_set" => entries[i].header.scp_value.tx_set_hash = Hash([0xDE; 32]),
+            "result" => entries[i].header.tx_set_result_hash = Hash([0xDE; 32]),
+            _ => unreachable!(),
         }
-        recompute_entry_hash(&mut entries[i]);
-    }
-
-    write_ledger_entries_to_file(&ledger_file, &entries);
-}
-
-/// Same as above but for tx_set_result_hash.
-fn corrupt_result_hash_preserving_entry_hash(archive_path: &Path, archive_type: ArchiveType) {
-    let ledger_file = get_first_file_in_range(archive_path, archive_type, "/ledger-");
-    let mut entries = read_and_parse_ledger_file(&ledger_file);
-
-    for i in 0..entries.len() {
-        entries[i].header.tx_set_result_hash = Hash([0xDE; 32]);
         if i > 0 {
             entries[i].header.previous_ledger_hash = entries[i - 1].hash.clone();
         }
@@ -965,8 +957,9 @@ async fn test_verify_detects_true_cross_file_mismatch(
 ) {
     let (_temp_dir, archive_path) = setup_archive(archive_type);
     match corruption_type {
-        "tx_set" => corrupt_tx_set_hash_preserving_entry_hash(&archive_path, archive_type),
-        "result" => corrupt_result_hash_preserving_entry_hash(&archive_path, archive_type),
+        "tx_set" | "result" => {
+            corrupt_ledger_hash_field_preserving_entry_hash(&archive_path, archive_type, corruption_type)
+        }
         "chain" => corrupt_cross_checkpoint_boundary(&archive_path, archive_type),
         _ => unreachable!(),
     }
