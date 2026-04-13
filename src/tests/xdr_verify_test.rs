@@ -289,14 +289,26 @@ fn test_parse_ledger_entries_hash_mismatch() {
     assert!(err.message.contains("hash mismatch"));
 }
 
-#[test]
-fn test_parse_ledger_entries_duplicate_sequence() {
-    let entry = create_valid_ledger_entry(100, [0; 32], [0; 32], [0; 32]);
-    let mut data = frame_xdr(&entry);
-    data.extend(frame_xdr(&entry));
-
-    let err = parse_ledger_entries(&data).unwrap_err();
-    assert!(err.message.contains("duplicate ledger entry"));
+#[rstest]
+#[case::ledger("ledger")]
+#[case::transaction("transaction")]
+#[case::result("result")]
+fn test_parse_rejects_duplicate_sequence(#[case] file_type: &str) {
+    let frame = match file_type {
+        "ledger" => frame_xdr(&create_valid_ledger_entry(100, [0; 32], [0; 32], [0; 32])),
+        "transaction" => frame_xdr(&v0_history_entry(100, [0; 32], vec![tx_v0_envelope(1)])),
+        "result" => frame_xdr(&result_entry(100, &[1])),
+        _ => unreachable!(),
+    };
+    let mut data = frame.clone();
+    data.extend(frame);
+    let err = match file_type {
+        "ledger" => parse_ledger_entries(&data).unwrap_err(),
+        "transaction" => parse_transaction_entries(&data).unwrap_err(),
+        "result" => parse_result_entries(&data).unwrap_err(),
+        _ => unreachable!(),
+    };
+    assert!(err.message.contains("duplicate"));
 }
 
 #[rstest]
@@ -337,15 +349,6 @@ fn test_parse_result_entries_single_entry() {
     assert_eq!(parsed, HashMap::from([(100, expected)]));
 }
 
-#[test]
-fn test_parse_result_entries_duplicate_sequence() {
-    let entry = result_entry(100, &[1]);
-    let mut data = frame_xdr(&entry);
-    data.extend(frame_xdr(&entry));
-
-    let err = parse_result_entries(&data).unwrap_err();
-    assert!(err.message.contains("duplicate result entry"));
-}
 
 #[test]
 fn test_parse_transaction_entries_v0_non_empty() {
@@ -373,15 +376,6 @@ fn test_parse_transaction_entries_v1_non_empty() {
     assert!(!is_empty_tx_set_hash(&parsed[&100], &prev_hash));
 }
 
-#[test]
-fn test_parse_transaction_entries_duplicate_sequence() {
-    let entry = v0_history_entry(100, [0; 32], vec![tx_v0_envelope(1)]);
-    let mut data = frame_xdr(&entry);
-    data.extend(frame_xdr(&entry));
-
-    let err = parse_transaction_entries(&data).unwrap_err();
-    assert!(err.message.contains("duplicate transaction entry"));
-}
 
 #[test]
 fn test_compute_v0_tx_set_hash_matches_manual_hash() {
