@@ -1033,26 +1033,22 @@ fn test_manager_still_flags_missing_tx_set_when_result_hash_is_empty_array_hash(
 }
 
 
-#[test]
-fn test_parse_transaction_entries_rejects_ledger_outside_checkpoint_range() {
-    let entry = v0_history_entry(200, [0; 32], vec![tx_v0_envelope(1)]);
-    let data = frame_xdr(&entry);
-    let err = parse_transaction_entries_for_checkpoint(&data, Some(127)).unwrap_err();
-    assert!(err.message.contains("outside expected checkpoint range"));
-}
-
-#[test]
-fn test_parse_result_entries_rejects_ledger_outside_checkpoint_range() {
-    let entry = result_entry(200, &[1]);
-    let data = frame_xdr(&entry);
-    let err = parse_result_entries_for_checkpoint(&data, Some(127)).unwrap_err();
-    assert!(err.message.contains("outside expected checkpoint range"));
-}
-
-#[test]
-fn test_parse_ledger_entries_rejects_ledger_outside_checkpoint_range() {
-    let entry = create_valid_ledger_entry(200, [0; 32], [0; 32], [0; 32]);
-    let data = frame_xdr(&entry);
-    let err = parse_ledger_entries_for_checkpoint(&data, Some(127)).unwrap_err();
+#[rstest]
+#[case::ledger("ledger")]
+#[case::transaction("transaction")]
+#[case::result("result")]
+fn test_parse_rejects_ledger_outside_checkpoint_range(#[case] file_type: &str) {
+    let data = match file_type {
+        "ledger" => frame_xdr(&create_valid_ledger_entry(200, [0; 32], [0; 32], [0; 32])),
+        "transaction" => frame_xdr(&v0_history_entry(200, [0; 32], vec![tx_v0_envelope(1)])),
+        "result" => frame_xdr(&result_entry(200, &[1])),
+        _ => unreachable!(),
+    };
+    let err = match file_type {
+        "ledger" => parse_ledger_entries_for_checkpoint(&data, Some(127)).unwrap_err(),
+        "transaction" => parse_transaction_entries_for_checkpoint(&data, Some(127)).unwrap_err(),
+        "result" => parse_result_entries_for_checkpoint(&data, Some(127)).unwrap_err(),
+        _ => unreachable!(),
+    };
     assert!(err.message.contains("outside expected checkpoint range"));
 }
