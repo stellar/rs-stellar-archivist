@@ -299,10 +299,24 @@ fn test_parse_ledger_entries_duplicate_sequence() {
     assert!(err.message.contains("duplicate ledger entry"));
 }
 
-#[test]
-fn test_parse_ledger_entries_malformed_frame() {
-    let valid = frame_xdr(&create_valid_ledger_entry(100, [0; 32], [0; 32], [0; 32]));
-    let err = parse_ledger_entries(&valid[..valid.len() / 2]).unwrap_err();
+#[rstest]
+#[case::ledger("ledger")]
+#[case::transaction("transaction")]
+#[case::result("result")]
+fn test_parse_rejects_malformed_frame(#[case] file_type: &str) {
+    let valid = match file_type {
+        "ledger" => frame_xdr(&create_valid_ledger_entry(100, [0; 32], [0; 32], [0; 32])),
+        "transaction" => frame_xdr(&v0_history_entry(100, [0; 32], vec![tx_v0_envelope(1)])),
+        "result" => frame_xdr(&result_entry(100, &[1])),
+        _ => unreachable!(),
+    };
+    let truncated = &valid[..valid.len() / 2];
+    let err = match file_type {
+        "ledger" => parse_ledger_entries(truncated).unwrap_err(),
+        "transaction" => parse_transaction_entries(truncated).unwrap_err(),
+        "result" => parse_result_entries(truncated).unwrap_err(),
+        _ => unreachable!(),
+    };
     assert!(err.message.contains("failed to parse"));
 }
 
@@ -1018,21 +1032,6 @@ fn test_manager_still_flags_missing_tx_set_when_result_hash_is_empty_array_hash(
     );
 }
 
-#[test]
-fn test_parse_transaction_entries_malformed_frame() {
-    let entry = v0_history_entry(100, [0; 32], vec![tx_v0_envelope(1)]);
-    let valid = frame_xdr(&entry);
-    let err = parse_transaction_entries(&valid[..valid.len() / 2]).unwrap_err();
-    assert!(err.message.contains("failed to parse"));
-}
-
-#[test]
-fn test_parse_result_entries_malformed_frame() {
-    let entry = result_entry(100, &[1]);
-    let valid = frame_xdr(&entry);
-    let err = parse_result_entries(&valid[..valid.len() / 2]).unwrap_err();
-    assert!(err.message.contains("failed to parse"));
-}
 
 #[test]
 fn test_parse_transaction_entries_rejects_ledger_outside_checkpoint_range() {
