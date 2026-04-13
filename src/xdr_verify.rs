@@ -1,11 +1,20 @@
 //! XDR verification module.
 //!
-//! Provides hash verification for ledger, transaction, and result files.
-//! Cross-file verification validates that:
-//! - Ledger entry.hash == SHA256(entry.header.to_xdr())
-//! - Transaction set hash matches ledger header's scp_value.tx_set_hash
-//! - Result set hash matches ledger header's tx_set_result_hash
-//! - Ledger hash chain: ledger[N].previous_ledger_hash == hash(ledger[N-1])
+//! Parses and validates XDR-encoded archive files (ledger, transaction, result, SCP).
+//!
+//! Per-file verification:
+//! - Ledger header hash: `entry.hash == SHA256(entry.header.to_xdr())`
+//! - Transaction set hash: V0 = `SHA256(prev_hash || tx1 || ... || txN)`,
+//!   V1 = `SHA256(GeneralizedTransactionSet.to_xdr())`
+//! - Result set hash: `SHA256(tx_result_set.to_xdr())`
+//! - SCP entry: validates XDR frame structure
+//!
+//! Cross-file verification (via [`XdrVerificationManager`]):
+//! - Checkpoint completeness: all expected ledger sequences are present
+//! - Transaction set hash matches ledger header's `scp_value.tx_set_hash`
+//! - Result set hash matches ledger header's `tx_set_result_hash`
+//! - Intra-checkpoint hash chain: `ledger[N].previous_ledger_hash == hash(ledger[N-1])`
+//! - Cross-checkpoint hash chain: first ledger's `prev_hash` matches prior checkpoint's last hash
 
 use crate::history_format::{self, CHECKPOINT_FREQUENCY, GENESIS_CHECKPOINT_LEDGER};
 use crate::storage::{from_opendal_error, Error as StorageError, StorageRef};
@@ -46,11 +55,21 @@ pub(crate) fn expected_ledger_range(checkpoint: u32) -> (u32, u32) {
     }
 }
 
+/// Hashes extracted from a single ledger header entry, keyed by ledger sequence.
+/// Produced by [`parse_ledger_entries`], consumed by [`XdrVerificationManager`] for
+/// cross-file and hash-chain verification.
 #[derive(Debug, Clone)]
 pub struct LedgerVerificationData {
+    /// `SHA256(entry.header.to_xdr())` — verified to equal `entry.hash` at parse time.
     pub computed_hash: [u8; 32],
+    /// `entry.header.previous_ledger_hash` — checked against prior ledger's `computed_hash`
+    /// during intra-checkpoint and cross-checkpoint chain verification.
     pub prev_hash: [u8; 32],
+    /// `entry.header.scp_value.tx_set_hash` — cross-verified against the hash computed
+    /// from the transaction file for the same ledger sequence.
     pub expected_tx_set_hash: [u8; 32],
+    /// `entry.header.tx_set_result_hash` — cross-verified against the hash computed
+    /// from the result file for the same ledger sequence.
     pub expected_result_hash: [u8; 32],
 }
 
@@ -67,13 +86,33 @@ struct CheckpointBoundary {
     last_computed_hash: [u8; 32],
 }
 
+/// A verification failure detected during cross-file or chain validation.
+/// Accumulated by [`XdrVerificationManager`] and retrieved via
+/// [`get_errors`](XdrVerificationManager::get_errors).
 #[derive(Debug, Clone)]
 pub struct VerificationError {
     pub checkpoint: u32,
+    /// The specific ledger sequence that failed, or `None` for checkpoint-level errors
+    /// (e.g. missing ledger data, internal errors).
     pub ledger_seq: Option<u32>,
     pub message: String,
 }
 
+/// Coordinates cross-file XDR verification across concurrent checkpoint processing.
+///
+/// **Usage flow:**
+/// 1. For each checkpoint, record parsed data via `record_ledger_data`,
+///    `record_tx_set_hashes`, and `record_result_hashes` (order doesn't matter,
+///    can be called from different tasks concurrently).
+/// 2. Call [`verify_and_release`](Self::verify_and_release) once all three files
+///    for a checkpoint are recorded. This runs completeness, hash-match, and
+///    intra-checkpoint chain checks, then frees the checkpoint's pending data.
+/// 3. After all checkpoints are processed, call [`verify_checkpoint_chain`](Self::verify_checkpoint_chain)
+///    to verify hash continuity across consecutive checkpoint boundaries.
+///    Only checks adjacent checkpoints (skips non-consecutive ones from partial scans).
+/// 4. Retrieve all accumulated errors via [`get_errors`](Self::get_errors).
+///
+/// All state is `Mutex`-protected for concurrent access from the pipeline.
 pub struct XdrVerificationManager {
     pending: Mutex<HashMap<u32, PendingCheckpoint>>,
     boundaries: Mutex<BTreeMap<u32, CheckpointBoundary>>,
@@ -107,6 +146,15 @@ impl XdrVerificationManager {
         entry.result_hashes = Some(hashes);
     }
 
+    /// Run all intra-checkpoint verifications and free the pending data.
+    ///
+    /// Runs (in order): completeness check, tx set hash cross-check, result hash
+    /// cross-check, internal hash chain, then stores the first/last boundary hashes
+    /// for later cross-checkpoint verification. Errors are accumulated, not returned —
+    /// retrieve via [`get_errors`](Self::get_errors).
+    ///
+    /// No-op if no data was recorded for this checkpoint. If ledger data is missing
+    /// but tx/result data exists, records a warning and skips all checks.
     pub fn verify_and_release(&self, checkpoint: u32) {
         let data = {
             let mut pending = self.pending.lock().unwrap();
@@ -341,6 +389,12 @@ impl XdrVerificationManager {
         );
     }
 
+    /// Verify hash chain continuity across consecutive checkpoint boundaries.
+    /// Returns errors directly (not accumulated in `get_errors`) since this runs
+    /// after all per-checkpoint verification is complete.
+    ///
+    /// Only checks adjacent checkpoints separated by exactly `CHECKPOINT_FREQUENCY` —
+    /// non-consecutive checkpoints (from partial or bounded scans) are skipped.
     pub fn verify_checkpoint_chain(&self) -> Vec<VerificationError> {
         let boundaries = self.boundaries.lock().unwrap();
         let mut chain_errors = Vec::new();
@@ -390,6 +444,13 @@ impl Default for XdrVerificationManager {
     }
 }
 
+/// Parse decompressed ledger XDR data into per-ledger verification data.
+///
+/// For each frame, verifies `SHA256(header.to_xdr()) == entry.hash` and extracts
+/// the `prev_hash`, `tx_set_hash`, and `result_hash` fields for cross-file checks.
+///
+/// Returns a fatal error on hash mismatch, duplicate sequence, or malformed XDR.
+/// Empty input returns an empty map (valid for checkpoints with no ledger file).
 pub fn parse_ledger_entries(
     decompressed_data: &[u8],
 ) -> Result<BTreeMap<u32, LedgerVerificationData>, StorageError> {
@@ -542,13 +603,11 @@ pub(crate) fn compute_v1_tx_set_hash(
     Ok(Sha256::digest(&xdr).into())
 }
 
-/// Parse and validate transaction file XDR structure with hash verification.
+/// Parse decompressed result XDR data, computing `SHA256(tx_result_set.to_xdr())`
+/// per ledger. These hashes are cross-verified against `expected_result_hash` from
+/// the ledger headers.
 ///
-/// For each TransactionHistoryEntry:
-/// - V0 (ext == V0): Hash = SHA256(previous_ledger_hash || tx1_xdr || ... || txN_xdr)
-/// - V1 (ext == V1): Hash = SHA256(GeneralizedTransactionSet.to_xdr())
-///
-/// Records computed hashes for cross-verification against ledger headers.
+/// Returns a fatal error on duplicate sequence, out-of-range sequence, or malformed XDR.
 pub fn parse_result_entries(
     decompressed_data: &[u8],
 ) -> Result<HashMap<u32, [u8; 32]>, StorageError> {
@@ -613,13 +672,15 @@ pub(crate) fn parse_result_entries_for_checkpoint(
 }
 
 /// Decompress gzip data from a reader into an in-memory buffer.
-pub async fn decompress_to_buffer(path: &str, reader: Reader) -> Result<Vec<u8>, StorageError> {
+pub(crate) async fn decompress_to_buffer(path: &str, reader: Reader) -> Result<Vec<u8>, StorageError> {
     // the writer is None, thus the return sink is also None, which is safe to
     // be discarded
     let (decompressed, _) = decompress_and_write_internal(path, reader, None).await?;
     Ok(decompressed)
 }
 
+/// Decompress a gzipped ledger file from a reader and parse it.
+/// Infers the checkpoint number from the file path for range validation.
 pub async fn parse_ledger_stream(
     path: &str,
     reader: Reader,
@@ -628,6 +689,8 @@ pub async fn parse_ledger_stream(
     parse_ledger_entries_for_checkpoint(&decompressed, history_format::checkpoint_from_path(path))
 }
 
+/// Decompress a gzipped result file from a reader and parse it.
+/// Infers the checkpoint number from the file path for range validation.
 pub async fn parse_results_stream(
     path: &str,
     reader: Reader,
@@ -636,6 +699,13 @@ pub async fn parse_results_stream(
     parse_result_entries_for_checkpoint(&decompressed, history_format::checkpoint_from_path(path))
 }
 
+/// Parse decompressed transaction XDR data, computing content hashes per ledger.
+/// V0 entries: `SHA256(prev_hash || tx1_xdr || ... || txN_xdr)`.
+/// V1 entries: `SHA256(GeneralizedTransactionSet.to_xdr())`.
+/// These hashes are cross-verified against `expected_tx_set_hash` from the ledger headers.
+///
+/// Returns a fatal error on duplicate sequence, out-of-range sequence, malformed XDR,
+/// or V0 transactions not in hash-sorted order.
 pub fn parse_transaction_entries(
     decompressed_data: &[u8],
 ) -> Result<HashMap<u32, [u8; 32]>, StorageError> {
@@ -694,6 +764,8 @@ pub(crate) fn parse_transaction_entries_for_checkpoint(
     Ok(hashes)
 }
 
+/// Validate SCP history XDR frame structure. Only checks that frames deserialize
+/// correctly — no hashes are computed or returned. Fatal error on malformed XDR.
 pub fn parse_scp_entries(decompressed_data: &[u8]) -> Result<(), StorageError> {
     let cursor = Cursor::new(decompressed_data);
     let mut limited = Limited::new(cursor, Limits::none());
@@ -706,6 +778,8 @@ pub fn parse_scp_entries(decompressed_data: &[u8]) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Decompress a gzipped transaction file from a reader and parse it.
+/// Infers the checkpoint number from the file path for range validation.
 pub async fn parse_transactions_stream(
     path: &str,
     reader: Reader,
@@ -717,11 +791,15 @@ pub async fn parse_transactions_stream(
     )
 }
 
+/// Decompress a gzipped SCP file from a reader and validate its frame structure.
 pub async fn parse_scp_stream(path: &str, reader: Reader) -> Result<(), StorageError> {
     let decompressed = decompress_to_buffer(path, reader).await?;
     parse_scp_entries(&decompressed)
 }
 
+/// Result of parsing an XDR archive file during a verified mirror write.
+/// Carries computed hashes for the caller to feed into [`XdrVerificationManager`].
+/// `None` is returned for SCP files and unrecognized file types.
 pub enum XdrParseResult {
     Ledger(BTreeMap<u32, LedgerVerificationData>),
     Transactions(HashMap<u32, [u8; 32]>),
@@ -841,6 +919,9 @@ async fn cleanup_non_atomic_partial_write(path: &str, dst_store: &StorageRef) {
     }
 }
 
+/// Decompress, verify XDR structure, and write to destination in a single streaming pass.
+/// The file type is determined from `path` (ledger, transaction, result, or SCP).
+/// Returns the parsed hashes for the caller to record with [`XdrVerificationManager`].
 pub async fn verify_and_write_xdr(
     path: &str,
     reader: Reader,
