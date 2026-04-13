@@ -508,14 +508,12 @@ fn test_manager_records_and_verifies_checkpoint() {
 }
 
 #[rstest]
-#[case::beginning(1)]
-#[case::middle(31)]
-#[case::end(63)]
-fn test_chain_break_within_ledger_file(#[case] offset_from_first: u32) {
+#[case::beginning(127, 65)]
+#[case::middle(127, 95)]
+#[case::end(127, 127)]
+#[case::genesis(63, 2)]
+fn test_chain_break_within_ledger_file(#[case] checkpoint: u32, #[case] corrupted_ledger: u32) {
     let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-    let first_ledger = 64;
-    let corrupted_ledger = first_ledger + offset_from_first;
 
     let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
     ledger_data.get_mut(&corrupted_ledger).unwrap().prev_hash = [0xff; 32];
@@ -527,19 +525,6 @@ fn test_chain_break_within_ledger_file(#[case] offset_from_first: u32) {
         .get_errors()
         .iter()
         .any(|e| e.ledger_seq == Some(corrupted_ledger) && e.message.contains("hash chain break")));
-}
-
-#[test]
-fn test_manager_detects_internal_genesis_chain_break() {
-    let manager = XdrVerificationManager::new();
-    let mut ledger_data = create_complete_checkpoint_data(63, [0; 32]);
-    ledger_data.get_mut(&2).unwrap().prev_hash = [0xff; 32];
-
-    manager.record_ledger_data(63, ledger_data);
-    manager.verify_and_release(63);
-
-    assert_eq!(manager.get_errors().len(), 1);
-    assert!(manager.get_errors()[0].message.contains("hash chain break"));
 }
 
 #[rstest]
