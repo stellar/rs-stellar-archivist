@@ -844,121 +844,60 @@ fn test_manager_detects_missing_entry_for_non_empty_hash(#[case] hash_type: &str
         .any(|e| e.message.contains(&format!("missing {hash_type} entry"))));
 }
 
-#[test]
-fn test_manager_allows_missing_tx_set_entry_for_empty_v0_tx_set() {
+/// Missing entries should not be flagged when the expected hash indicates an empty
+/// or zero-valued set. Each case sets a different "empty" hash variant and verifies
+/// no spurious errors are produced.
+#[rstest]
+#[case::tx_set_empty_v0("tx set", "empty_v0")]
+#[case::tx_set_empty_v1("tx set", "empty_v1")]
+#[case::tx_set_zero("tx set", "zero")]
+#[case::result_empty_xdr_array("result", "empty_xdr_array")]
+#[case::result_zero("result", "zero")]
+fn test_manager_allows_missing_entry_for_empty_hash(
+    #[case] hash_type: &str,
+    #[case] empty_variant: &str,
+) {
     let manager = XdrVerificationManager::new();
     let checkpoint = 127;
 
     let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
     for data in ledger_data.values_mut() {
-        data.expected_tx_set_hash = compute_empty_v0_tx_set_hash(&data.prev_hash);
-        data.expected_result_hash = hash_of("some_result");
+        match (hash_type, empty_variant) {
+            ("tx set", "empty_v0") => {
+                data.expected_tx_set_hash = compute_empty_v0_tx_set_hash(&data.prev_hash);
+                data.expected_result_hash = hash_of("some_result");
+            }
+            ("tx set", "empty_v1") => {
+                data.expected_tx_set_hash = compute_empty_v1_tx_set_hash(&data.prev_hash);
+                data.expected_result_hash = hash_of("some_result");
+            }
+            ("tx set", "zero") => {} // defaults are already [0; 32]
+            ("result", "empty_xdr_array") => {
+                data.expected_result_hash = EMPTY_XDR_ARRAY_HASH;
+            }
+            ("result", "zero") => {} // defaults are already [0; 32]
+            _ => unreachable!(),
+        }
     }
 
     manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_tx_set_hashes(checkpoint, HashMap::new());
+    match hash_type {
+        "tx set" => manager.record_tx_set_hashes(checkpoint, HashMap::new()),
+        "result" => manager.record_result_hashes(checkpoint, HashMap::new()),
+        _ => unreachable!(),
+    }
     manager.verify_and_release(checkpoint);
 
-    let tx_errors: Vec<_> = manager
+    let errors: Vec<_> = manager
         .get_errors()
         .iter()
-        .filter(|e| e.message.contains("tx set"))
+        .filter(|e| e.message.contains(hash_type))
         .cloned()
         .collect();
     assert!(
-        tx_errors.is_empty(),
-        "Should allow missing tx set for empty v0 hash, got: {:?}",
-        tx_errors
+        errors.is_empty(),
+        "Should allow missing {hash_type} entry for {empty_variant} hash, got: {errors:?}",
     );
-}
-
-#[test]
-fn test_manager_allows_missing_tx_set_entry_for_empty_v1_tx_set() {
-    let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-
-    let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
-    for data in ledger_data.values_mut() {
-        data.expected_tx_set_hash = compute_empty_v1_tx_set_hash(&data.prev_hash);
-        data.expected_result_hash = hash_of("some_result");
-    }
-
-    manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_tx_set_hashes(checkpoint, HashMap::new());
-    manager.verify_and_release(checkpoint);
-
-    let tx_errors: Vec<_> = manager
-        .get_errors()
-        .iter()
-        .filter(|e| e.message.contains("tx set"))
-        .cloned()
-        .collect();
-    assert!(
-        tx_errors.is_empty(),
-        "Should allow missing tx set for empty v1 hash, got: {:?}",
-        tx_errors
-    );
-}
-
-#[test]
-fn test_manager_allows_missing_tx_set_entry_for_zero_tx_hash() {
-    let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-    let ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
-
-    manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_tx_set_hashes(checkpoint, HashMap::new());
-    manager.verify_and_release(checkpoint);
-
-    let tx_errors: Vec<_> = manager
-        .get_errors()
-        .iter()
-        .filter(|e| e.message.contains("tx set"))
-        .cloned()
-        .collect();
-    assert!(tx_errors.is_empty());
-}
-
-#[test]
-fn test_manager_allows_missing_result_entry_for_empty_result_hash() {
-    let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-
-    let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
-    for data in ledger_data.values_mut() {
-        data.expected_result_hash = EMPTY_XDR_ARRAY_HASH;
-    }
-
-    manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_result_hashes(checkpoint, HashMap::new());
-    manager.verify_and_release(checkpoint);
-
-    let result_errors: Vec<_> = manager
-        .get_errors()
-        .iter()
-        .filter(|e| e.message.contains("result"))
-        .cloned()
-        .collect();
-    assert!(result_errors.is_empty());
-}
-
-#[test]
-fn test_manager_allows_missing_result_entry_for_zero_result_hash() {
-    let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-    let ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
-
-    manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_result_hashes(checkpoint, HashMap::new());
-    manager.verify_and_release(checkpoint);
-
-    let result_errors: Vec<_> = manager
-        .get_errors()
-        .iter()
-        .filter(|e| e.message.contains("result"))
-        .cloned()
-        .collect();
-    assert!(result_errors.is_empty());
 }
 
 #[test]
