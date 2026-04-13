@@ -779,54 +779,39 @@ fn test_expected_ledger_range_large_checkpoint() {
     assert_eq!(last - first, 63);
 }
 
-#[test]
-fn test_manager_detects_tx_set_hash_mismatch() {
+#[rstest]
+#[case::tx_set("tx set")]
+#[case::result_set("result set")]
+fn test_manager_detects_hash_mismatch(#[case] hash_type: &str) {
     let manager = XdrVerificationManager::new();
     let checkpoint = 127;
-    let expected_tx = hash_of("expected_tx");
-    let wrong_tx = hash_of("wrong_tx");
+    let expected = hash_of("expected");
+    let wrong = hash_of("wrong");
 
     let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
     for data in ledger_data.values_mut() {
-        data.expected_tx_set_hash = expected_tx;
+        match hash_type {
+            "tx set" => data.expected_tx_set_hash = expected,
+            "result set" => data.expected_result_hash = expected,
+            _ => unreachable!(),
+        }
     }
 
-    let tx_set_hashes: HashMap<u32, [u8; 32]> =
-        ledger_data.keys().map(|&seq| (seq, wrong_tx)).collect();
+    let wrong_hashes: HashMap<u32, [u8; 32]> =
+        ledger_data.keys().map(|&seq| (seq, wrong)).collect();
 
     manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_tx_set_hashes(checkpoint, tx_set_hashes);
+    match hash_type {
+        "tx set" => manager.record_tx_set_hashes(checkpoint, wrong_hashes),
+        "result set" => manager.record_result_hashes(checkpoint, wrong_hashes),
+        _ => unreachable!(),
+    }
     manager.verify_and_release(checkpoint);
 
     assert!(manager
         .get_errors()
         .iter()
-        .any(|e| e.message.contains("tx set hash mismatch")));
-}
-
-#[test]
-fn test_manager_detects_result_set_hash_mismatch() {
-    let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-    let expected_result = hash_of("expected_result");
-    let wrong_result = hash_of("wrong_result");
-
-    let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
-    for data in ledger_data.values_mut() {
-        data.expected_result_hash = expected_result;
-    }
-
-    let result_hashes: HashMap<u32, [u8; 32]> =
-        ledger_data.keys().map(|&seq| (seq, wrong_result)).collect();
-
-    manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_result_hashes(checkpoint, result_hashes);
-    manager.verify_and_release(checkpoint);
-
-    assert!(manager
-        .get_errors()
-        .iter()
-        .any(|e| e.message.contains("result set hash mismatch")));
+        .any(|e| e.message.contains(&format!("{hash_type} hash mismatch"))));
 }
 
 #[test]
