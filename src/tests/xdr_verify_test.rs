@@ -814,48 +814,34 @@ fn test_manager_detects_hash_mismatch(#[case] hash_type: &str) {
         .any(|e| e.message.contains(&format!("{hash_type} hash mismatch"))));
 }
 
-#[test]
-fn test_manager_detects_missing_tx_set_entry_for_non_empty_tx_set() {
+#[rstest]
+#[case::tx_set("tx set")]
+#[case::result("result")]
+fn test_manager_detects_missing_entry_for_non_empty_hash(#[case] hash_type: &str) {
     let manager = XdrVerificationManager::new();
     let checkpoint = 127;
-    let non_empty_tx_hash = hash_of("non_empty_tx_set");
-    let non_empty_result_hash = hash_of("non_empty_result");
+    let non_empty_hash = hash_of("non_empty");
 
     let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
     for data in ledger_data.values_mut() {
-        data.expected_tx_set_hash = non_empty_tx_hash;
-        data.expected_result_hash = non_empty_result_hash;
+        // tx set missing-entry detection requires expected_result_hash != EMPTY_XDR_ARRAY_HASH,
+        // so both cases set non-empty hashes for both fields.
+        data.expected_tx_set_hash = non_empty_hash;
+        data.expected_result_hash = non_empty_hash;
     }
 
     manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_tx_set_hashes(checkpoint, HashMap::new());
+    match hash_type {
+        "tx set" => manager.record_tx_set_hashes(checkpoint, HashMap::new()),
+        "result" => manager.record_result_hashes(checkpoint, HashMap::new()),
+        _ => unreachable!(),
+    }
     manager.verify_and_release(checkpoint);
 
     assert!(manager
         .get_errors()
         .iter()
-        .any(|e| e.message.contains("missing tx set entry")));
-}
-
-#[test]
-fn test_manager_detects_missing_result_entry_for_non_empty_result_set() {
-    let manager = XdrVerificationManager::new();
-    let checkpoint = 127;
-    let non_empty_result_hash = hash_of("non_empty_result");
-
-    let mut ledger_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
-    for data in ledger_data.values_mut() {
-        data.expected_result_hash = non_empty_result_hash;
-    }
-
-    manager.record_ledger_data(checkpoint, ledger_data);
-    manager.record_result_hashes(checkpoint, HashMap::new());
-    manager.verify_and_release(checkpoint);
-
-    assert!(manager
-        .get_errors()
-        .iter()
-        .any(|e| e.message.contains("missing result entry")));
+        .any(|e| e.message.contains(&format!("missing {hash_type} entry"))));
 }
 
 #[test]
