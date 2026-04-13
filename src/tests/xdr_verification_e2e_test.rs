@@ -945,69 +945,37 @@ fn corrupt_cross_checkpoint_boundary(archive_path: &Path, archive_type: ArchiveT
 //=============================================================================
 
 #[rstest]
-#[case::scan_v0(VerifyOperation::Scan, ArchiveType::PubnetOldTxset)]
-#[case::scan_v1(VerifyOperation::Scan, ArchiveType::TestnetSmall)]
-#[case::mirror_v0(VerifyOperation::Mirror, ArchiveType::PubnetOldTxset)]
-#[case::mirror_v1(VerifyOperation::Mirror, ArchiveType::TestnetSmall)]
+#[case::tx_set_scan_v0(VerifyOperation::Scan, ArchiveType::PubnetOldTxset, "tx_set")]
+#[case::tx_set_scan_v1(VerifyOperation::Scan, ArchiveType::TestnetSmall, "tx_set")]
+#[case::tx_set_mirror_v0(VerifyOperation::Mirror, ArchiveType::PubnetOldTxset, "tx_set")]
+#[case::tx_set_mirror_v1(VerifyOperation::Mirror, ArchiveType::TestnetSmall, "tx_set")]
+#[case::result_scan_v0(VerifyOperation::Scan, ArchiveType::PubnetOldTxset, "result")]
+#[case::result_scan_v1(VerifyOperation::Scan, ArchiveType::TestnetSmall, "result")]
+#[case::result_mirror_v0(VerifyOperation::Mirror, ArchiveType::PubnetOldTxset, "result")]
+#[case::result_mirror_v1(VerifyOperation::Mirror, ArchiveType::TestnetSmall, "result")]
+#[case::chain_scan_v0(VerifyOperation::Scan, ArchiveType::PubnetOldTxset, "chain")]
+#[case::chain_scan_v1(VerifyOperation::Scan, ArchiveType::TestnetSmall, "chain")]
+#[case::chain_mirror_v0(VerifyOperation::Mirror, ArchiveType::PubnetOldTxset, "chain")]
+#[case::chain_mirror_v1(VerifyOperation::Mirror, ArchiveType::TestnetSmall, "chain")]
 #[tokio::test]
-async fn test_verify_detects_true_tx_set_hash_mismatch_in_scan_and_mirror(
+async fn test_verify_detects_true_cross_file_mismatch(
     #[case] op: VerifyOperation,
     #[case] archive_type: ArchiveType,
+    #[case] corruption_type: &str,
 ) {
     let (_temp_dir, archive_path) = setup_archive(archive_type);
-    corrupt_tx_set_hash_preserving_entry_hash(&archive_path, archive_type);
+    match corruption_type {
+        "tx_set" => corrupt_tx_set_hash_preserving_entry_hash(&archive_path, archive_type),
+        "result" => corrupt_result_hash_preserving_entry_hash(&archive_path, archive_type),
+        "chain" => corrupt_cross_checkpoint_boundary(&archive_path, archive_type),
+        _ => unreachable!(),
+    }
     let archive_url = format!("file://{}", archive_path.display());
 
     let result = op.run_with_verify(&archive_url, archive_type, true).await;
     assert!(
         result.is_err(),
-        "{:?} --verify should fail on {} true tx set hash mismatch",
-        op,
-        archive_type.name()
-    );
-}
-
-#[rstest]
-#[case::scan_v0(VerifyOperation::Scan, ArchiveType::PubnetOldTxset)]
-#[case::scan_v1(VerifyOperation::Scan, ArchiveType::TestnetSmall)]
-#[case::mirror_v0(VerifyOperation::Mirror, ArchiveType::PubnetOldTxset)]
-#[case::mirror_v1(VerifyOperation::Mirror, ArchiveType::TestnetSmall)]
-#[tokio::test]
-async fn test_verify_detects_true_result_hash_mismatch_in_scan_and_mirror(
-    #[case] op: VerifyOperation,
-    #[case] archive_type: ArchiveType,
-) {
-    let (_temp_dir, archive_path) = setup_archive(archive_type);
-    corrupt_result_hash_preserving_entry_hash(&archive_path, archive_type);
-    let archive_url = format!("file://{}", archive_path.display());
-
-    let result = op.run_with_verify(&archive_url, archive_type, true).await;
-    assert!(
-        result.is_err(),
-        "{:?} --verify should fail on {} true result hash mismatch",
-        op,
-        archive_type.name()
-    );
-}
-
-#[rstest]
-#[case::scan_v0(VerifyOperation::Scan, ArchiveType::PubnetOldTxset)]
-#[case::scan_v1(VerifyOperation::Scan, ArchiveType::TestnetSmall)]
-#[case::mirror_v0(VerifyOperation::Mirror, ArchiveType::PubnetOldTxset)]
-#[case::mirror_v1(VerifyOperation::Mirror, ArchiveType::TestnetSmall)]
-#[tokio::test]
-async fn test_verify_detects_true_cross_checkpoint_chain_break_in_scan_and_mirror(
-    #[case] op: VerifyOperation,
-    #[case] archive_type: ArchiveType,
-) {
-    let (_temp_dir, archive_path) = setup_archive(archive_type);
-    corrupt_cross_checkpoint_boundary(&archive_path, archive_type);
-    let archive_url = format!("file://{}", archive_path.display());
-
-    let result = op.run_with_verify(&archive_url, archive_type, true).await;
-    assert!(
-        result.is_err(),
-        "{:?} --verify should fail on {} cross-checkpoint chain break",
+        "{:?} --verify should fail on {} true {corruption_type} mismatch",
         op,
         archive_type.name()
     );
