@@ -261,14 +261,14 @@ impl XdrVerificationManager {
             let expected = data.expected_tx_set_hash;
 
             let err_msg = if let Some(&actual) = tx_set_hashes.get(&seq) {
-                if actual != expected {
+                if actual == expected {
+                    None
+                } else {
                     Some(format!(
                         "tx set hash mismatch: expected {}, got {}",
                         hex::encode(expected),
                         hex::encode(actual),
                     ))
-                } else {
-                    None
                 }
             } else if data.expected_result_hash != EMPTY_XDR_ARRAY_HASH
                 && !is_empty_tx_set_hash(&expected, &data.prev_hash)
@@ -302,14 +302,14 @@ impl XdrVerificationManager {
             let expected = data.expected_result_hash;
 
             let err_msg = if let Some(&actual) = result_hashes.get(&seq) {
-                if actual != expected {
+                if actual == expected {
+                    None
+                } else {
                     Some(format!(
                         "result set hash mismatch: expected {}, got {}",
                         hex::encode(expected),
                         hex::encode(actual),
                     ))
-                } else {
-                    None
                 }
             } else if expected != EMPTY_XDR_ARRAY_HASH && expected != [0; 32] {
                 Some(format!(

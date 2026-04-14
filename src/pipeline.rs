@@ -253,7 +253,7 @@ impl<Op: Operation> Pipeline<Op> {
         let history_path = checkpoint_path("history", checkpoint);
 
         // Download the history file with retries
-        let buffer = match self
+        let Ok(buffer) = self
             .with_retries(&history_path, "download history", async || {
                 let reader = self.src_store.open_reader(&history_path).await?;
                 let stream = reader
@@ -268,12 +268,9 @@ impl<Op: Operation> Pipeline<Op> {
                 Ok(buffer)
             })
             .await
-        {
-            Ok(buf) => buf,
-            Err(_) => {
-                self.operation.record_failure(&history_path).await;
-                return;
-            }
+        else {
+            self.operation.record_failure(&history_path).await;
+            return;
         };
 
         // Parse and validate
