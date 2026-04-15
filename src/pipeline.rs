@@ -165,28 +165,24 @@ impl<Op: Operation> Pipeline<Op> {
         }
 
         // Form a lazy iterator that produces checkpoint-processing futures
+        let num_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let checkpoints = (lower_bound..=upper_bound)
             .step_by(history_format::CHECKPOINT_FREQUENCY as usize)
             .map(|ck| {
                 let pipeline = self.clone();
+                let completed = num_completed.clone();
                 async move {
                     pipeline.process_checkpoint(ck).await;
+                    let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                    if done % PROGRESS_REPORTING_FREQUENCY == 0 || done == total_count {
+                        info!("Progress: {}/{} checkpoints processed", done, total_count);
+                    }
                 }
             });
 
         // Process checkpoints concurrently, limiting to config.concurrency at a time
         stream::iter(checkpoints)
-            .enumerate()
-            .for_each_concurrent(self.config.concurrency, |(i, fut)| async move {
-                fut.await;
-                let completed = i + 1;
-                if completed % PROGRESS_REPORTING_FREQUENCY == 0 || completed == total_count {
-                    info!(
-                        "Progress: {}/{} checkpoints processed",
-                        completed, total_count
-                    );
-                }
-            })
+            .for_each_concurrent(self.config.concurrency, |fut| fut)
             .await;
 
         // Finalize operation with the highest checkpoint we processed
