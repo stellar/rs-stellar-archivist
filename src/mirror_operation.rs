@@ -227,7 +227,7 @@ impl MirrorOperation {
 
         if let Some(base_path) = self.dst_store.get_base_path() {
             let file_path = base_path.join(path);
-            if file_path.exists() {
+            if tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
                 tokio::fs::remove_file(&file_path).await.map_err(|e| {
                     StorageError::fatal(format!(
                         "Failed to remove partial file {}: {}",
