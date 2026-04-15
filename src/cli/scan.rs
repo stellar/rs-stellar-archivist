@@ -40,8 +40,7 @@ impl ScanCmd {
             args.storage_config.max_retries as u32,
             args.storage_config.retry_min_delay.as_millis() as u64,
             args.verify,
-        )
-        .await?;
+        )?;
 
         // Configure the pipeline with low/high bounds and storage config
         let pipeline_config = PipelineConfig {

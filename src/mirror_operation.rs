@@ -59,7 +59,7 @@ pub struct MirrorOperation {
 }
 
 impl MirrorOperation {
-    pub async fn new(
+    pub fn new(
         dst: &str,
         overwrite: bool,
         low: Option<u32>,

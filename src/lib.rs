@@ -241,8 +241,7 @@ pub mod test_helpers {
             config.storage_config.max_retries as u32,
             config.storage_config.retry_min_delay.as_millis() as u64,
             config.verify,
-        )
-        .await?;
+        )?;
 
         let pipeline_config = PipelineConfig {
             source: config.archive,
@@ -271,8 +270,7 @@ pub mod test_helpers {
             config.allow_mirror_gaps,
             &config.storage_config,
             config.verify,
-        )
-        .await?;
+        )?;
 
         let pipeline_config = PipelineConfig {
             source: config.src,

@@ -39,7 +39,7 @@ pub struct ScanOperation {
 }
 
 impl ScanOperation {
-    pub async fn new(
+    pub fn new(
         low: Option<u32>,
         high: Option<u32>,
         max_retries: u32,

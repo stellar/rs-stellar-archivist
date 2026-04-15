@@ -48,8 +48,7 @@ impl MirrorCmd {
             self.allow_mirror_gaps,
             &args.storage_config,
             args.verify,
-        )
-        .await?;
+        )?;
 
         let pipeline_config = PipelineConfig {
             source: self.src.clone(),
