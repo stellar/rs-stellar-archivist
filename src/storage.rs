@@ -769,7 +769,7 @@ impl Storage for OpendalStore {
 /// - `sftp://[user@]host[:port]/path` - SFTP (uses `SFTP_USER`, `SFTP_KEY` env vars)
 ///
 /// Creates a backend from a URL string with configuration.
-pub async fn from_url_with_config(
+pub fn from_url_with_config(
     url_str: &str,
     config: &StorageConfig,
 ) -> Result<StorageRef, Error> {

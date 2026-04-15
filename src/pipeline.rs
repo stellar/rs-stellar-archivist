@@ -131,7 +131,6 @@ impl<Op: Operation> Pipeline<Op> {
     pub async fn new(operation: Op, config: PipelineConfig) -> Result<Self, Error> {
         let src_store =
             crate::storage::from_url_with_config(&config.source, &config.storage_config)
-                .await
                 .map_err(|e| {
                     std::io::Error::other(format!(
                         "Failed to create storage backend for {}: {}",

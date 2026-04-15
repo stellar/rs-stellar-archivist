@@ -26,7 +26,6 @@ async fn test_file_url_round_trip_base_path() {
     let url = file_url_from_path(temp_dir.path());
 
     let store = from_url_with_config(&url, &test_storage_config())
-        .await
         .expect("Failed to create store from file URL");
     let base = store
         .get_base_path()
@@ -42,7 +41,6 @@ async fn test_file_url_backslashes_are_accepted() {
     let raw = format!("file://{}", temp_dir.path().display());
 
     let store = from_url_with_config(&raw, &test_storage_config())
-        .await
         .expect("Failed to create store from backslash file URL");
     let base = store
         .get_base_path()

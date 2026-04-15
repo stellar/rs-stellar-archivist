@@ -68,7 +68,7 @@ impl MirrorOperation {
         storage_config: &StorageConfig,
         verify: bool,
     ) -> Result<Self, Error> {
-        let dst_store = crate::storage::from_url_with_config(dst, storage_config).await?;
+        let dst_store = crate::storage::from_url_with_config(dst, storage_config)?;
 
         if !dst_store.supports_writes() {
             return Err(std::io::Error::new(
