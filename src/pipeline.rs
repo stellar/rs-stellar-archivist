@@ -270,15 +270,7 @@ impl<Op: Operation> Pipeline<Op> {
         };
 
         // Parse and validate
-        let parse_result: Result<HistoryFileState, Error> = (|| {
-            let state: HistoryFileState = serde_json::from_reader(buffer.clone().reader())
-                .map_err(|e| history_format::Error::InvalidJson {
-                    path: history_path.clone(),
-                    error: e.to_string(),
-                })?;
-            state.validate()?;
-            Ok(state)
-        })();
+        let parse_result = parse_history(&buffer, &history_path);
 
         match parse_result {
             Ok(state) => {
@@ -370,6 +362,18 @@ impl<Op: Operation> Pipeline<Op> {
             }
         }
     }
+}
+
+fn parse_history(buffer: &Buffer, path: &str) -> Result<HistoryFileState, Error> {
+    let state: HistoryFileState =
+        serde_json::from_reader(buffer.clone().reader()).map_err(|e| {
+            history_format::Error::InvalidJson {
+                path: path.to_string(),
+                error: e.to_string(),
+            }
+        })?;
+    state.validate()?;
+    Ok(state)
 }
 
 pub use async_trait::async_trait;
