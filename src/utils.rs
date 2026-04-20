@@ -278,9 +278,13 @@ impl RetryState {
                 );
                 return true;
             }
+            error!(
+                "Exceeded {} retry attempts to {} {}: {}",
+                self.max_retries, action, path, error
+            );
+        } else {
+            error!("Failed to {} {}: {}", action, path, error);
         }
-
-        error!("Failed to {} {}: {}", action, path, error);
         false
     }
 
