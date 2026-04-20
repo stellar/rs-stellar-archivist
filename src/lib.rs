@@ -1,3 +1,12 @@
+// Raised from the default of 128 to accommodate deeply nested OpenDAL layer
+// types. Each .layer() call (Timeout, ConcurrentLimit, Logging, HttpClient,
+// Throttle) wraps the previous accessor in another generic struct. Async
+// methods in each layer compile to state machines that embed the inner layer's
+// future, so the compiler must recurse through all layers to compute type
+// layouts. The SFTP backend with all layers stacked pushes the nesting past 128
+// (the compiler reports a depth increase of ~130 for a single method like
+// create_dir). 256 gives comfortable headroom.
+#![recursion_limit = "256"]
 #![allow(clippy::missing_errors_doc)]
 #![allow(clippy::missing_panics_doc)]
 #![allow(clippy::must_use_candidate)]
