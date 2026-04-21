@@ -1,5 +1,10 @@
 # Stellar Archivist
 
+> **This software is under active development and has not undergone a security
+> audit. It is provided "as is" with no warranties. Use at your own risk. This
+> project is not covered by the
+> [Stellar Bug Bounty Program](https://stellar.org/bug-bounty-program).**
+
 A Rust implementation of tools for working with Stellar History Archives.
 
 ## Description
