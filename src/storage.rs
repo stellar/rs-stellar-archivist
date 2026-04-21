@@ -284,9 +284,14 @@ impl OpendalStore {
         }
     }
 
-    /// Direct file write that bypasses `OpenDAL`'s writer layer.
-    /// This avoids the `WriteGenerator` buffering and the fsync in `close()`.
-    /// Used when `fsync_file_writes` is false for filesystem backends.
+    /// Direct file write that bypasses `OpenDAL`'s writer layer. This avoids
+    /// the `WriteGenerator` buffering and the fsync in `close()`.
+    ///
+    /// Writes to a `.tmp` file first, then renames to the final path. This
+    /// prevents partial files from being visible at the final path if the
+    /// process is killed mid-write (SIGKILL, OOM etc.). Without this, a resumed
+    /// mirror would see the partial file via `pre_check()` and skip
+    /// re-downloading it.
     async fn copy_from_reader_direct(
         &self,
         root_path: &Path,
@@ -295,6 +300,7 @@ impl OpendalStore {
     ) -> Result<(), Error> {
         let object = object.trim_start_matches('/');
         let file_path = root_path.join(object);
+        let tmp_path = file_path.with_extension("tmp");
 
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
@@ -305,8 +311,11 @@ impl OpendalStore {
             })?;
         }
 
-        let mut file = tokio::fs::File::create(&file_path).await.map_err(|e| {
-            from_io_error(e, &format!("Failed to create file {}", file_path.display()))
+        let mut file = tokio::fs::File::create(&tmp_path).await.map_err(|e| {
+            from_io_error(
+                e,
+                &format!("Failed to create temp file {}", tmp_path.display()),
+            )
         })?;
 
         let mut stream = reader
@@ -314,18 +323,40 @@ impl OpendalStore {
             .await
             .map_err(|e| from_opendal_error(e, &format!("Failed to create stream for {object}")))?;
 
-        while let Some(result) = stream.next().await {
-            let buffer = result.map_err(|e| from_opendal_error(e, "Failed to read from source"))?;
-            for bytes in buffer {
-                file.write_all(&bytes).await.map_err(|e| {
-                    from_io_error(e, &format!("Failed to write to {}", file_path.display()))
-                })?;
+        let write_result: Result<(), Error> = async {
+            while let Some(result) = stream.next().await {
+                let buffer =
+                    result.map_err(|e| from_opendal_error(e, "Failed to read from source"))?;
+                for bytes in buffer {
+                    file.write_all(&bytes).await.map_err(|e| {
+                        from_io_error(e, &format!("Failed to write to {}", tmp_path.display()))
+                    })?;
+                }
             }
+            file.flush().await.map_err(|e| {
+                from_io_error(e, &format!("Failed to flush {}", tmp_path.display()))
+            })?;
+            Ok(())
+        }
+        .await;
+
+        if let Err(e) = write_result {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(e);
         }
 
-        file.flush()
+        tokio::fs::rename(&tmp_path, &file_path)
             .await
-            .map_err(|e| from_io_error(e, &format!("Failed to flush {}", file_path.display())))?;
+            .map_err(|e| {
+                from_io_error(
+                    e,
+                    &format!(
+                        "Failed to rename {} to {}",
+                        tmp_path.display(),
+                        file_path.display()
+                    ),
+                )
+            })?;
 
         Ok(())
     }

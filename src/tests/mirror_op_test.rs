@@ -621,6 +621,62 @@ async fn test_mirror_replaces_empty_files() {
     );
 }
 
+/// Verifies that a process crash during non-atomic writes doesn't leave partial
+/// files at the final path, preventing silent corruption on resume.
+///
+/// Scenario: mirror checkpoints 63 and 127, then simulate a crash by deleting
+/// a file at checkpoint 127 and leaving a truncated `.tmp` (as the temp+rename
+/// write strategy would). Resume mirror and verify the file is re-downloaded
+/// correctly and `.well-known` only advances once everything succeeds.
+#[tokio::test]
+async fn test_mirror_resume_after_crash_redownloads_missing_file() {
+    let src = file_url_from_path(&testnet_small_archive_path());
+    let temp_dir = TempDir::new().unwrap();
+    let dest_path = temp_dir.path().join("mirror_dest");
+    let dst = file_url_from_path(&dest_path);
+
+    // Mirror checkpoints 63 and 127
+    run_mirror(MirrorConfig::new(&src, &dst).skip_optional().high(127))
+        .await
+        .expect("Initial mirror should succeed");
+
+    // Record correct content of a file at checkpoint 127
+    let ledger_file = dest_path.join("ledger/00/00/00/ledger-0000007f.xdr.gz");
+    let correct_content = std::fs::read(&ledger_file).unwrap();
+    assert!(correct_content.len() > 10);
+
+    // Simulate crash: remove the final file, leave a truncated .tmp behind.
+    // With temp+rename, a killed process leaves only the .tmp — the final
+    // path was never created/updated for this write.
+    let tmp_file = ledger_file.with_extension("tmp");
+    std::fs::write(&tmp_file, &correct_content[..5]).unwrap();
+    std::fs::remove_file(&ledger_file).unwrap();
+
+    // Roll back .well-known to checkpoint 63 so resume re-processes checkpoint 127.
+    // This simulates the state after a crash: .well-known was at 63 (the previous
+    // successful run), and the run that was mirroring 127 was killed before finalize.
+    let wellknown = dest_path.join(".well-known/stellar-history.json");
+    let history_63 = dest_path.join("history/00/00/00/history-0000003f.json");
+    std::fs::copy(&history_63, &wellknown).unwrap();
+
+    // Resume mirror — should re-download the missing file at checkpoint 127
+    run_mirror(MirrorConfig::new(&src, &dst).skip_optional().high(127))
+        .await
+        .expect("Resume mirror should succeed");
+
+    // Final file should exist with correct content
+    let resumed_content = std::fs::read(&ledger_file).unwrap();
+    assert_eq!(resumed_content, correct_content);
+
+    // Stale .tmp should be gone (overwritten by the new write's temp, then renamed)
+    assert!(!tmp_file.exists(), "Stale .tmp should not remain");
+
+    // .well-known should now be at checkpoint 127
+    let wk_content = std::fs::read_to_string(&wellknown).unwrap();
+    let wk: serde_json::Value = serde_json::from_str(&wk_content).unwrap();
+    assert_eq!(wk["currentLedger"].as_u64().unwrap(), 127);
+}
+
 //=============================================================================
 // .well-known update tests
 //=============================================================================
