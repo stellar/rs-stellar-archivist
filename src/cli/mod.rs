@@ -1,8 +1,9 @@
 pub mod mirror;
+pub mod repair;
 pub mod scan;
 
 use crate::storage::StorageConfig;
-use crate::{self as stellar_archivist, mirror_operation, scan_operation};
+use crate::{self as stellar_archivist, mirror_operation, repair_operation, scan_operation};
 use clap::{Parser, Subcommand};
 use std::ffi::OsString;
 use std::io;
@@ -25,6 +26,9 @@ pub enum Error {
     #[error(transparent)]
     MirrorOperation(#[from] mirror_operation::Error),
 
+    #[error(transparent)]
+    RepairOperation(#[from] repair_operation::Error),
+
     #[error("{0}")]
     Other(String),
 }
@@ -35,6 +39,7 @@ impl From<stellar_archivist::Error> for Error {
             stellar_archivist::Error::Io(e) => Error::Io(e),
             stellar_archivist::Error::ScanOperation(e) => Error::ScanOperation(e),
             stellar_archivist::Error::MirrorOperation(e) => Error::MirrorOperation(e),
+            stellar_archivist::Error::RepairOperation(e) => Error::RepairOperation(e),
             stellar_archivist::Error::Other(s) => Error::Other(s),
         }
     }
@@ -104,6 +109,8 @@ struct Cli {
 pub enum Commands {
     /// Mirror files from source archive to destination
     Mirror(mirror::MirrorCmd),
+    /// Repair a corrupted archive by re-downloading broken files from a known-good source
+    Repair(repair::RepairCmd),
     /// Scan archive and verify integrity
     Scan(scan::ScanCmd),
 }
@@ -164,6 +171,7 @@ where
 
     match cli.command {
         Commands::Mirror(cmd) => cmd.run(global_args).await,
+        Commands::Repair(cmd) => cmd.run(global_args).await,
         Commands::Scan(cmd) => cmd.run(global_args).await,
     }
 }

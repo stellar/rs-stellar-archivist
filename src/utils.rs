@@ -77,6 +77,7 @@ pub fn map_pipeline_error(err: pipeline::Error) -> crate::Error {
     match err {
         pipeline::Error::ScanOperation(scan_err) => crate::Error::ScanOperation(scan_err),
         pipeline::Error::MirrorOperation(mirror_err) => crate::Error::MirrorOperation(mirror_err),
+        pipeline::Error::RepairOperation(repair_err) => crate::Error::RepairOperation(repair_err),
         pipeline::Error::Io(io_err) => crate::Error::Io(io_err),
         other => crate::Error::Other(other.to_string()),
     }
@@ -184,6 +185,11 @@ impl ArchiveStats {
             info!(
                 "Mirror completed: {} files copied, {} failed, {} skipped",
                 successful, failed, skipped
+            );
+        } else if operation == "repair" {
+            info!(
+                "Repair completed: {} files downloaded, {} failed",
+                successful, failed
             );
         } else {
             let missing_required = self.missing_required.load(Ordering::Relaxed);

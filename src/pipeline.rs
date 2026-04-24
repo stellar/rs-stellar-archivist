@@ -31,6 +31,9 @@ pub enum Error {
     #[error("Scan operation error: {0}")]
     ScanOperation(#[from] crate::scan_operation::Error),
 
+    #[error("Repair operation error: {0}")]
+    RepairOperation(#[from] crate::repair_operation::Error),
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
