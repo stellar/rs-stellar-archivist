@@ -6,19 +6,18 @@
 
 use crate::{
     history_format::{self, bucket_path, checkpoint_path, HistoryFileState},
-    storage::StorageConfig,
-    utils::RetryState,
+    storage::{cleanup_partial_file, download_buffer, StorageConfig, StorageRef},
+    utils::{self, ArchiveStats},
 };
-use bytes::Buf;
 use futures_util::{
     future::{join, join3, join_all},
     stream, StreamExt,
 };
 use lru::LruCache;
-use opendal::{Buffer, Reader};
+use opendal::Buffer;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 
 /// Pipeline errors
 #[derive(Error, Debug)]
@@ -45,72 +44,68 @@ const BUCKET_LRU_CACHE_SIZE: usize = 1_000_000;
 /// How often to report progress (every N checkpoints)
 const PROGRESS_REPORTING_FREQUENCY: usize = 100;
 
-/// Unified operation trait for scan and mirror
+// ============================================================================
+// Operation trait
+// ============================================================================
+
+/// Operation trait for scan, mirror, and repair.
+///
+/// Pipeline owns `src_store`, `dst_store` (optional), `stats`, and handles
+/// buffer writing and stats recording. Operations implement domain-specific
+/// logic: checkpoint bounds, file processing, verification, and finalization.
 #[async_trait::async_trait]
 pub trait Operation: Send + Sync + 'static {
-    /// Get the checkpoint bounds for this operation
-    /// Returns (`lower_bound`, `upper_bound`) checkpoints to process
-    async fn get_checkpoint_bounds(
+    /// Get the checkpoint bounds for this operation.
+    /// Returns (`lower_bound`, `upper_bound`) checkpoints to process.
+    async fn get_checkpoint_bounds(&self, source: &StorageRef) -> Result<(u32, u32), Error>;
+
+    /// Process a file from the source archive.
+    /// Each operation decides how to handle it (existence check, verify, copy, etc.).
+    async fn process_object(
         &self,
-        source: &crate::storage::StorageRef,
-    ) -> Result<(u32, u32), Error>;
+        path: &str,
+        _src_store: &StorageRef,
+    ) -> Result<(), crate::storage::Error>;
 
-    /// Process an object by streaming its content from the provided reader.
-    /// Only called when `existence_check_only()` returns false.
-    ///
-    /// Returns:
-    /// - Ok(()) on success
-    /// - Err(e) on failure (storage layer handles retries internally)
-    async fn process_object(&self, path: &str, reader: Reader)
-        -> Result<(), crate::storage::Error>;
-
-    /// Process an object from an in-memory buffer.
-    /// Used when the content is already loaded (e.g., history files that are parsed).
-    /// Each operation handles success/failure recording internally.
-    async fn process_buffer(&self, path: &str, buffer: Buffer);
-
-    /// Record a successful file processing
-    fn record_success(&self, path: &str);
-
-    /// Record a failed file processing
-    async fn record_failure(&self, path: &str);
-
-    /// Record a skipped file (already exists at destination)
-    fn record_skipped(&self, path: &str);
-
-    /// Called when all work is complete
-    /// The pipeline passes the highest checkpoint that was processed
-    /// This is where operations should check their internal failure counts and return an error if needed
-    async fn finalize(&self, highest_checkpoint: u32) -> Result<(), Error>;
-
-    /// Indicates if this operation only needs to check file existence, not read content.
-    fn existence_check_only(&self) -> bool {
-        false
-    }
+    /// Called when all work is complete. Pipeline passes stats for operations
+    /// that need to check failure counts or record additional failures
+    /// (e.g., cross-validation).
+    async fn finalize(&self, highest_checkpoint: u32, stats: &ArchiveStats) -> Result<(), Error>;
 
     /// Pre-check before hitting the source. Allows operations to skip files
     /// without making a source request (e.g., if destination already exists).
     ///
     /// Returns:
-    /// - Some(Ok(())) to skip (file already handled)
-    /// - Some(Err(e)) if pre-check failed
-    /// - None to proceed with fetching from source
+    /// - `Some(Ok(()))` to skip (file already handled)
+    /// - `Some(Err(e))` if pre-check failed
+    /// - `None` to proceed with fetching from source
     async fn pre_check(&self, _path: &str) -> Option<Result<(), crate::storage::Error>> {
-        None // Default: always proceed to source
+        None
     }
 
     /// Called when all files for a checkpoint have been processed.
-    /// This is the hook for per-checkpoint verification to trigger
-    /// and release memory for the completed checkpoint.
-    fn finalize_checkpoint(&self, _checkpoint: u32) {
-        // No-op by default
+    fn finalize_checkpoint(&self, _checkpoint: u32) {}
+
+    /// Fetch the history buffer for a checkpoint.
+    ///
+    /// Default implementation downloads from `src_store` (scan/mirror behavior).
+    /// Repair overrides this to read from destination first, falling back to source.
+    async fn fetch_history_buffer(
+        &self,
+        history_path: &str,
+        src_store: &StorageRef,
+        _dst_store: Option<&StorageRef>,
+    ) -> Result<Buffer, crate::storage::Error> {
+        download_buffer(src_store, history_path).await
     }
 }
 
+// ============================================================================
+// Pipeline config and struct
+// ============================================================================
+
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
-    /// Source archive URL, as provided by the user
-    pub source: String,
     /// Number of concurrent checkpoint workers
     pub concurrency: usize,
     /// Whether to skip optional SCP files
@@ -122,37 +117,36 @@ pub struct PipelineConfig {
 pub struct Pipeline<Op: Operation> {
     operation: Op,
     config: PipelineConfig,
-    src_store: crate::storage::StorageRef,
+    src_store: StorageRef,
+    dst_store: Option<StorageRef>,
+    stats: ArchiveStats,
     bucket_lru: Mutex<LruCache<String, ()>>,
 }
 
 impl<Op: Operation> Pipeline<Op> {
-    /// Create a new pipeline
-    pub async fn new(operation: Op, config: PipelineConfig) -> Result<Self, Error> {
-        let src_store =
-            crate::storage::from_url_with_config(&config.source, &config.storage_config).map_err(
-                |e| {
-                    std::io::Error::other(format!(
-                        "Failed to create storage backend for {}: {}",
-                        config.source, e
-                    ))
-                },
-            )?;
-
+    /// Create a new pipeline.
+    /// Callers create storage backends and pass them in directly.
+    pub fn new(
+        operation: Op,
+        config: PipelineConfig,
+        src_store: StorageRef,
+        dst_store: Option<StorageRef>,
+    ) -> Self {
         let bucket_lru = Mutex::new(LruCache::new(
             std::num::NonZeroUsize::new(BUCKET_LRU_CACHE_SIZE).unwrap(),
         ));
 
-        Ok(Self {
+        Self {
             operation,
             config,
             src_store,
+            dst_store,
+            stats: ArchiveStats::new(),
             bucket_lru,
-        })
+        }
     }
 
     pub async fn run(self: Arc<Self>) -> Result<(), Error> {
-        // Get checkpoint bounds from the operation
         let (lower_bound, upper_bound) = self
             .operation
             .get_checkpoint_bounds(&self.src_store)
@@ -164,7 +158,6 @@ impl<Op: Operation> Pipeline<Op> {
             return Ok(());
         }
 
-        // Form a lazy iterator that produces checkpoint-processing futures
         let num_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let checkpoints = (lower_bound..=upper_bound)
             .step_by(history_format::CHECKPOINT_FREQUENCY as usize)
@@ -174,32 +167,28 @@ impl<Op: Operation> Pipeline<Op> {
                 async move {
                     pipeline.process_checkpoint(ck).await;
                     let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if done % PROGRESS_REPORTING_FREQUENCY == 0 || done == total_count {
+                    if done.is_multiple_of(PROGRESS_REPORTING_FREQUENCY) || done == total_count {
                         info!("Progress: {}/{} checkpoints processed", done, total_count);
                     }
                 }
             });
 
-        // Process checkpoints concurrently, limiting to config.concurrency at a time
         stream::iter(checkpoints)
             .for_each_concurrent(self.config.concurrency, |fut| fut)
             .await;
 
-        // Finalize operation with the highest checkpoint we processed
-        self.operation.finalize(upper_bound).await?;
+        self.operation.finalize(upper_bound, &self.stats).await?;
 
         Ok(())
     }
 
     async fn process_checkpoint(self: Arc<Self>, checkpoint: u32) {
-        // Process history file and categories concurrently
-        let hist = self.clone().process_history(checkpoint);
+        let hist = self.clone().process_history_and_buckets(checkpoint);
         let cats = join_all(["ledger", "transactions", "results"].map(|cat| {
             let path = checkpoint_path(cat, checkpoint);
             self.clone().process_file(path)
         }));
 
-        // Optionally add SCP files
         if self.config.skip_optional {
             let _ = join(hist, cats).await;
         } else {
@@ -208,90 +197,81 @@ impl<Op: Operation> Pipeline<Op> {
             let _ = join3(hist, cats, scp).await;
         }
 
-        // Notify operation that all files for this checkpoint are processed
         self.operation.finalize_checkpoint(checkpoint);
     }
 
-    /// Run an async operation with retries and exponential backoff.
-    ///
-    /// Creates a per-call `RetryState`, retries on transient errors, and returns
-    /// `Ok(T)` on success or the final `Err` when retries are exhausted.
-    async fn with_retries<T>(
-        &self,
-        path: &str,
-        action: &str,
-        mut f: impl AsyncFnMut() -> Result<T, crate::storage::Error>,
-    ) -> Result<T, crate::storage::Error> {
-        let mut retry = RetryState::new(
-            self.config.storage_config.max_retries as u32,
-            self.config.storage_config.retry_min_delay.as_millis() as u64,
-        );
-        loop {
-            match f().await {
-                Ok(val) => return Ok(val),
-                Err(e) => {
-                    if retry.should_retry(&e, action, path) {
-                        retry.backoff().await;
-                        continue;
-                    }
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    /// Process a history file for a checkpoint.
-    /// Downloads and parses the history JSON, then processes buckets.
-    /// Retries are handled at this level to avoid file corruption from partial streams.
-    async fn process_history(self: Arc<Self>, checkpoint: u32) {
-        use futures_util::TryStreamExt;
-
+    /// Process a history file for a checkpoint: download, parse, write buffer
+    /// to destination (if present), and process buckets.
+    async fn process_history_and_buckets(self: Arc<Self>, checkpoint: u32) {
         let history_path = checkpoint_path("history", checkpoint);
 
-        // Download the history file with retries
-        let Ok(buffer) = self
-            .with_retries(&history_path, "download history", async || {
-                let reader = self.src_store.open_reader(&history_path).await?;
-                let stream = reader
-                    .into_stream(..)
+        // Download history buffer (operation can override sourcing)
+        let Ok(buffer) = utils::with_retries(
+            self.config.storage_config.max_retries as u32,
+            self.config.storage_config.retry_min_delay.as_millis() as u64,
+            "download history",
+            &history_path,
+            async || {
+                self.operation
+                    .fetch_history_buffer(&history_path, &self.src_store, self.dst_store.as_ref())
                     .await
-                    .map_err(|e| crate::storage::from_opendal_error(e, "Stream error"))?;
-                let chunks: Vec<Buffer> = stream
-                    .try_collect()
-                    .await
-                    .map_err(|e| crate::storage::from_opendal_error(e, "Read error"))?;
-                let buffer: Buffer = chunks.into_iter().flatten().collect();
-                Ok(buffer)
-            })
-            .await
+            },
+        )
+        .await
         else {
-            self.operation.record_failure(&history_path).await;
+            warn!(
+                "Bucket references for checkpoint {} (0x{:08x}) were not checked \
+                 because {} could not be downloaded",
+                checkpoint, checkpoint, history_path
+            );
+            self.stats.record_failure(&history_path).await;
             return;
         };
 
         // Parse and validate
-        let parse_result = parse_history(&buffer, &history_path);
-
-        match parse_result {
+        match history_format::parse_history(&buffer, &history_path) {
             Ok(state) => {
-                // Process the history file and process buckets concurrently
-                let history_path_clone = history_path.clone();
-                let process_history = self.operation.process_buffer(&history_path_clone, buffer);
+                // Write buffer to destination (if present) and process buckets concurrently
+                let write_history_buffer = self.process_buffer(&history_path, buffer);
                 let buckets = self.clone().process_buckets(state);
-                let _ = join(process_history, buckets).await;
+                let _ = join(write_history_buffer, buckets).await;
             }
             Err(e) => {
                 error!(
                     "Failed to parse history JSON for checkpoint {} (0x{:08x}): {}",
                     checkpoint, checkpoint, e
                 );
-                self.operation.record_failure(&history_path).await;
+                warn!(
+                    "Bucket references for checkpoint {} (0x{:08x}) were not checked \
+                     because {} could not be parsed",
+                    checkpoint, checkpoint, history_path
+                );
+                self.stats.record_failure(&history_path).await;
             }
         }
     }
 
+    /// Write the history buffer to the destination store (if present).
+    /// For scan (no dst_store), just records success.
+    async fn process_buffer(&self, path: &str, buffer: Buffer) {
+        if let Some(ref dst) = self.dst_store {
+            match dst.write(path, buffer).await {
+                Ok(()) => self.stats.record_success(path),
+                Err(e) => {
+                    if let Err(cleanup_err) = cleanup_partial_file(dst, path).await {
+                        error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
+                    }
+                    error!("Failed to write history file {}: {}", path, e);
+                    self.stats.record_failure(path).await;
+                }
+            }
+        } else {
+            // Scan mode: no destination, just record success
+            self.stats.record_success(path);
+        }
+    }
+
     async fn process_buckets(self: Arc<Self>, state: HistoryFileState) {
-        // Filter buckets through LRU cache for deduplication
         let bucket_futures: Vec<_> = {
             let mut cache = self.bucket_lru.lock().unwrap();
             state
@@ -299,7 +279,6 @@ impl<Op: Operation> Pipeline<Op> {
                 .iter()
                 .filter_map(|bucket| {
                     if cache.put(bucket.clone(), ()).is_none() {
-                        // New bucket, process it
                         bucket_path(bucket).ok().map(|path| {
                             let pipeline = self.clone();
                             async move {
@@ -307,7 +286,6 @@ impl<Op: Operation> Pipeline<Op> {
                             }
                         })
                     } else {
-                        // Already seen, skip
                         None
                     }
                 })
@@ -318,62 +296,41 @@ impl<Op: Operation> Pipeline<Op> {
     }
 
     /// Process a single file (bucket, ledger, transactions, results, scp).
-    /// All retries are handled at this level - no automatic retries in `OpenDAL`.
     async fn process_file(self: Arc<Self>, path: String) {
         // Pre-check: allow operation to skip without querying source
         if let Some(result) = self.operation.pre_check(&path).await {
             match result {
                 Ok(()) => {
                     debug!("Skipping: {}", path);
-                    self.operation.record_skipped(&path);
+                    self.stats.record_skipped(&path);
                 }
                 Err(e) => {
                     error!("Pre-check failed for {}: {}", path, e);
-                    self.operation.record_failure(&path).await;
+                    self.stats.record_failure(&path).await;
                 }
             }
             return;
         }
 
-        let result = if self.operation.existence_check_only() {
-            self.with_retries(&path, "check existence of", async || {
-                if self.src_store.exists(&path).await? {
-                    Ok(())
-                } else {
-                    Err(crate::storage::Error::not_found())
-                }
-            })
-            .await
-        } else {
-            self.with_retries(&path, "process", async || {
-                let reader = self.src_store.open_reader(&path).await?;
-                self.operation.process_object(&path, reader).await
-            })
-            .await
-        };
+        let result = utils::with_retries(
+            self.config.storage_config.max_retries as u32,
+            self.config.storage_config.retry_min_delay.as_millis() as u64,
+            "process",
+            &path,
+            async || self.operation.process_object(&path, &self.src_store).await,
+        )
+        .await;
 
         match result {
             Ok(()) => {
                 debug!("Processed: {}", path);
-                self.operation.record_success(&path);
+                self.stats.record_success(&path);
             }
             Err(_) => {
-                self.operation.record_failure(&path).await;
+                self.stats.record_failure(&path).await;
             }
         }
     }
-}
-
-fn parse_history(buffer: &Buffer, path: &str) -> Result<HistoryFileState, Error> {
-    let state: HistoryFileState =
-        serde_json::from_reader(buffer.clone().reader()).map_err(|e| {
-            history_format::Error::InvalidJson {
-                path: path.to_string(),
-                error: e.to_string(),
-            }
-        })?;
-    state.validate()?;
-    Ok(state)
 }
 
 pub use async_trait::async_trait;

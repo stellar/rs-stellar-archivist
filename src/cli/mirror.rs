@@ -2,7 +2,7 @@ use crate::cli::{Error, GlobalArgs};
 use crate::{
     mirror_operation::MirrorOperation,
     pipeline::{Pipeline, PipelineConfig},
-    utils,
+    storage, utils,
 };
 use clap::Parser;
 use std::sync::Arc;
@@ -40,28 +40,41 @@ impl MirrorCmd {
             self.src, self.dst, args.concurrency
         );
 
+        let src_store = storage::from_url_with_config(&self.src, &args.storage_config)
+            .map_err(|e| Error::Other(format!("Failed to create source backend: {e}")))?;
+
+        let dst_store = storage::from_url_with_config(&self.dst, &args.storage_config)
+            .map_err(|e| Error::Other(format!("Failed to create destination backend: {e}")))?;
+
+        if !dst_store.supports_writes() {
+            return Err(Error::Other(format!(
+                "Destination does not support writes: {}",
+                self.dst
+            )));
+        }
+
         let operation = MirrorOperation::new(
-            &self.dst,
+            dst_store.clone(),
             self.overwrite,
             self.low,
             self.high,
             self.allow_mirror_gaps,
             &args.storage_config,
             args.verify,
-        )?;
+        );
 
         let pipeline_config = PipelineConfig {
-            source: self.src.clone(),
             concurrency: args.concurrency,
             skip_optional: args.skip_optional,
             storage_config: args.storage_config,
         };
 
-        let pipeline = Arc::new(
-            Pipeline::new(operation, pipeline_config)
-                .await
-                .map_err(utils::map_pipeline_error)?,
-        );
+        let pipeline = Arc::new(Pipeline::new(
+            operation,
+            pipeline_config,
+            src_store,
+            Some(dst_store),
+        ));
 
         pipeline.run().await.map_err(utils::map_pipeline_error)?;
 

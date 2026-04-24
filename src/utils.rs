@@ -304,6 +304,34 @@ impl RetryState {
     }
 }
 
+/// Run an async fallible operation with retry-on-transient-error and
+/// exponential backoff.
+///
+/// Wraps `f` in a `RetryState` loop: on `Err`, calls `should_retry` to
+/// classify the error and (if retryable) waits via `backoff()` before retrying.
+/// Used by the pipeline (per-file processing) and by repair manual mode.
+pub async fn with_retries<T>(
+    max_retries: u32,
+    retry_min_delay_ms: u64,
+    action: &str,
+    path: &str,
+    mut f: impl AsyncFnMut() -> Result<T, crate::storage::Error>,
+) -> Result<T, crate::storage::Error> {
+    let mut retry = RetryState::new(max_retries, retry_min_delay_ms);
+    loop {
+        match f().await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                if retry.should_retry(&e, action, path) {
+                    retry.backoff().await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
+
 /// Fetch and validate .well-known/stellar-history.json from store
 ///
 /// Parameters:

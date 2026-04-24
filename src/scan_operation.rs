@@ -3,7 +3,7 @@ use crate::pipeline::{async_trait, Operation};
 use crate::storage::{from_opendal_error, Error as StorageError, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
-use opendal::{Buffer, Reader};
+use opendal::Reader;
 use std::sync::Arc;
 use thiserror::Error;
 use tracing::error;
@@ -24,8 +24,6 @@ pub enum Error {
 }
 
 pub struct ScanOperation {
-    stats: ArchiveStats,
-
     // User-specified arguments from CLI
     low: Option<u32>,
     high: Option<u32>,
@@ -47,7 +45,6 @@ impl ScanOperation {
         verify: bool,
     ) -> Result<Self, Error> {
         Ok(Self {
-            stats: ArchiveStats::new(),
             low,
             high,
             max_retries,
@@ -95,13 +92,10 @@ impl Operation for ScanOperation {
             .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))
     }
 
-    async fn process_object(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
-        debug_assert!(
-            !self.existence_check_only(),
-            "process_object called but existence_check_only() is true"
-        );
-
+    async fn process_object(&self, path: &str, src_store: &StorageRef) -> Result<(), StorageError> {
         if let Some(ref manager) = self.verification_manager {
+            // Verify mode: stream content and validate
+            let reader = src_store.open_reader(path).await?;
             if crate::history_format::is_bucket_file(path) {
                 crate::verify::verify_bucket_stream(path, reader).await
             } else if crate::history_format::is_ledger_file(path) {
@@ -125,38 +119,30 @@ impl Operation for ScanOperation {
                 self.consume_stream(path, reader).await
             }
         } else {
-            self.consume_stream(path, reader).await
+            // Existence-only mode: just check if file exists (no streaming)
+            if src_store.exists(path).await? {
+                Ok(())
+            } else {
+                Err(StorageError::not_found())
+            }
         }
     }
 
-    async fn process_buffer(&self, path: &str, _buffer: Buffer) {
-        // Scan doesn't write - just record that we successfully downloaded and parsed the history
-        self.stats.record_success(path);
-    }
-
-    fn record_success(&self, path: &str) {
-        self.stats.record_success(path);
-    }
-
-    async fn record_failure(&self, path: &str) {
-        self.stats.record_failure(path).await;
-    }
-
-    fn record_skipped(&self, _path: &str) {
-        // Scan never skips files
-    }
-
-    async fn finalize(&self, _highest_checkpoint: u32) -> Result<(), crate::pipeline::Error> {
+    async fn finalize(
+        &self,
+        _highest_checkpoint: u32,
+        stats: &ArchiveStats,
+    ) -> Result<(), crate::pipeline::Error> {
         if let Some(ref manager) = self.verification_manager {
             let chain_errors = manager.verify_checkpoint_chain();
             for err in &chain_errors {
                 error!("Checkpoint {}: {}", err.checkpoint, err.message);
-                self.stats.record_failure("xdr-chain-verification").await;
+                stats.record_failure("xdr-chain-verification").await;
             }
 
             let accumulated_errors = manager.get_errors();
             for _ in &accumulated_errors {
-                self.stats.record_failure("xdr-cross-verification").await;
+                stats.record_failure("xdr-cross-verification").await;
             }
 
             let total_errors = chain_errors.len() + accumulated_errors.len();
@@ -168,17 +154,13 @@ impl Operation for ScanOperation {
             }
         }
 
-        self.stats.report("scan").await;
+        stats.report("scan").await;
 
-        if self.stats.has_failures() {
+        if stats.has_failures() {
             return Err(Error::ScanFailed.into());
         }
 
         Ok(())
-    }
-
-    fn existence_check_only(&self) -> bool {
-        self.verification_manager.is_none()
     }
 
     fn finalize_checkpoint(&self, checkpoint: u32) {

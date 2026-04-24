@@ -317,6 +317,22 @@ impl HistoryFileState {
     }
 }
 
+/// Parse and validate a history file from a buffer.
+///
+/// Deserializes the JSON in `buffer` into a `HistoryFileState` and runs
+/// `validate()`. Used by both the pipeline (when downloading per-checkpoint
+/// history files) and repair (when reading destination-side history files).
+pub fn parse_history(buffer: &opendal::Buffer, path: &str) -> Result<HistoryFileState, Error> {
+    use bytes::Buf;
+    let state: HistoryFileState =
+        serde_json::from_reader(buffer.clone().reader()).map_err(|e| Error::InvalidJson {
+            path: path.to_string(),
+            error: e.to_string(),
+        })?;
+    state.validate()?;
+    Ok(state)
+}
+
 // Check if ledger is a checkpoint (63, 127, 191, ...)
 #[must_use]
 pub fn is_checkpoint(ledger: u32) -> bool {

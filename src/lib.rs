@@ -252,18 +252,18 @@ pub mod test_helpers {
             config.verify,
         )?;
 
+        let src_store =
+            crate::storage::from_url_with_config(&config.archive, &config.storage_config).map_err(
+                |e| crate::Error::Other(format!("Failed to create source backend: {e}")),
+            )?;
+
         let pipeline_config = PipelineConfig {
-            source: config.archive,
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
             storage_config: config.storage_config,
         };
 
-        let pipeline = Arc::new(
-            Pipeline::new(operation, pipeline_config)
-                .await
-                .map_err(crate::utils::map_pipeline_error)?,
-        );
+        let pipeline = Arc::new(Pipeline::new(operation, pipeline_config, src_store, None));
         pipeline
             .run()
             .await
@@ -271,28 +271,45 @@ pub mod test_helpers {
     }
 
     pub async fn run_mirror(config: MirrorConfig) -> Result<(), crate::Error> {
+        let src_store = crate::storage::from_url_with_config(&config.src, &config.storage_config)
+            .map_err(|e| {
+            crate::Error::Other(format!("Failed to create source backend: {e}"))
+        })?;
+
+        let dst_store = crate::storage::from_url_with_config(&config.dst, &config.storage_config)
+            .map_err(|e| {
+            crate::Error::Other(format!("Failed to create destination backend: {e}"))
+        })?;
+
+        if !dst_store.supports_writes() {
+            return Err(crate::Error::Other(format!(
+                "Destination does not support writes: {}",
+                config.dst
+            )));
+        }
+
         let operation = MirrorOperation::new(
-            &config.dst,
+            dst_store.clone(),
             config.overwrite,
             config.low,
             config.high,
             config.allow_mirror_gaps,
             &config.storage_config,
             config.verify,
-        )?;
+        );
 
         let pipeline_config = PipelineConfig {
-            source: config.src,
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
             storage_config: config.storage_config,
         };
 
-        let pipeline = Arc::new(
-            Pipeline::new(operation, pipeline_config)
-                .await
-                .map_err(crate::utils::map_pipeline_error)?,
-        );
+        let pipeline = Arc::new(Pipeline::new(
+            operation,
+            pipeline_config,
+            src_store,
+            Some(dst_store),
+        ));
         pipeline
             .run()
             .await

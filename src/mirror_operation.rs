@@ -2,10 +2,11 @@
 
 use crate::history_format;
 use crate::pipeline::{async_trait, Operation};
+use crate::storage::cleanup_partial_file;
 use crate::storage::{Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
-use opendal::{Buffer, Reader};
+use opendal::Reader;
 use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::OnceCell;
@@ -40,7 +41,6 @@ pub enum Error {
 pub struct MirrorOperation {
     dst_store: StorageRef,
     overwrite: bool,
-    stats: ArchiveStats,
 
     // User-specified arguments from CLI
     low: Option<u32>,
@@ -60,27 +60,22 @@ pub struct MirrorOperation {
 
 impl MirrorOperation {
     pub fn new(
-        dst: &str,
+        dst_store: StorageRef,
         overwrite: bool,
         low: Option<u32>,
         high: Option<u32>,
         allow_mirror_gaps: bool,
         storage_config: &StorageConfig,
         verify: bool,
-    ) -> Result<Self, Error> {
-        let dst_store = crate::storage::from_url_with_config(dst, storage_config)?;
+    ) -> Self {
+        debug_assert!(
+            dst_store.supports_writes(),
+            "MirrorOperation requires a writable destination store"
+        );
 
-        if !dst_store.supports_writes() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Unsupported,
-                format!("Destination storage backend does not support write operations. Only filesystem destinations (file://) are currently supported: {dst}"),
-            ).into());
-        }
-
-        Ok(Self {
+        Self {
             dst_store,
             overwrite,
-            stats: ArchiveStats::new(),
             low,
             high,
             allow_mirror_gaps,
@@ -92,7 +87,7 @@ impl MirrorOperation {
             } else {
                 None
             },
-        })
+        }
     }
 
     /// Get the destination's initial checkpoint from .well-known file, caching the result
@@ -214,31 +209,10 @@ impl MirrorOperation {
         match self.dst_store.copy_from_reader(path, reader).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                self.cleanup_partial_file(path).await?;
+                cleanup_partial_file(&self.dst_store, path).await?;
                 Err(e)
             }
         }
-    }
-
-    async fn cleanup_partial_file(&self, path: &str) -> Result<(), StorageError> {
-        if self.dst_store.uses_atomic_writes() {
-            return Ok(());
-        }
-
-        if let Some(base_path) = self.dst_store.get_base_path() {
-            let file_path = base_path.join(path);
-            if tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
-                tokio::fs::remove_file(&file_path).await.map_err(|e| {
-                    StorageError::fatal(format!(
-                        "Failed to remove partial file {}: {}",
-                        file_path.display(),
-                        e
-                    ))
-                })?;
-            }
-        }
-
-        Ok(())
     }
 
     fn checkpoint_from_verified_path(path: &str) -> Result<u32, StorageError> {
@@ -404,13 +378,14 @@ impl Operation for MirrorOperation {
         }
     }
 
-    async fn process_object(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
+    async fn process_object(&self, path: &str, src_store: &StorageRef) -> Result<(), StorageError> {
+        let reader = src_store.open_reader(path).await?;
         if let Some(ref manager) = self.verification_manager {
             if crate::history_format::is_bucket_file(path) {
                 match crate::verify::verify_and_write_bucket(path, reader, &self.dst_store).await {
                     Ok(()) => Ok(()),
                     Err(e) => {
-                        self.cleanup_partial_file(path).await?;
+                        cleanup_partial_file(&self.dst_store, path).await?;
                         Err(e)
                     }
                 }
@@ -426,7 +401,7 @@ impl Operation for MirrorOperation {
                     {
                         Ok(result) => result,
                         Err(e) => {
-                            self.cleanup_partial_file(path).await?;
+                            cleanup_partial_file(&self.dst_store, path).await?;
                             return Err(e);
                         }
                     };
@@ -457,44 +432,21 @@ impl Operation for MirrorOperation {
         }
     }
 
-    async fn process_buffer(&self, path: &str, buffer: Buffer) {
-        match self.dst_store.write(path, buffer).await {
-            Ok(()) => {
-                self.stats.record_success(path);
-            }
-            Err(e) => {
-                if let Err(cleanup_err) = self.cleanup_partial_file(path).await {
-                    error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
-                }
-                error!("Failed to write history file {}: {}", path, e);
-                self.stats.record_failure(path).await;
-            }
-        }
-    }
-
-    fn record_success(&self, path: &str) {
-        self.stats.record_success(path);
-    }
-
-    async fn record_failure(&self, path: &str) {
-        self.stats.record_failure(path).await;
-    }
-
-    fn record_skipped(&self, path: &str) {
-        self.stats.record_skipped(path);
-    }
-
-    async fn finalize(&self, highest_checkpoint: u32) -> Result<(), crate::pipeline::Error> {
+    async fn finalize(
+        &self,
+        highest_checkpoint: u32,
+        stats: &ArchiveStats,
+    ) -> Result<(), crate::pipeline::Error> {
         if let Some(ref manager) = self.verification_manager {
             let chain_errors = manager.verify_checkpoint_chain();
             for err in &chain_errors {
                 error!("Checkpoint {}: {}", err.checkpoint, err.message);
-                self.stats.record_failure("xdr-chain-verification").await;
+                stats.record_failure("xdr-chain-verification").await;
             }
 
             let accumulated_errors = manager.get_errors();
             for _ in &accumulated_errors {
-                self.stats.record_failure("xdr-cross-verification").await;
+                stats.record_failure("xdr-cross-verification").await;
             }
 
             let total_errors = chain_errors.len() + accumulated_errors.len();
@@ -506,9 +458,9 @@ impl Operation for MirrorOperation {
             }
         }
 
-        self.stats.report("mirror").await;
+        stats.report("mirror").await;
 
-        if self.stats.has_failures() {
+        if stats.has_failures() {
             return Err(Error::MirrorFailed.into());
         }
 

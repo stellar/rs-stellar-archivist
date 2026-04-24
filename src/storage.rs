@@ -1048,3 +1048,40 @@ fn file_url_to_path(url: &url::Url, url_str: &str) -> Result<PathBuf, Error> {
         "Invalid file URL '{url_str}': unable to convert to filesystem path"
     )))
 }
+
+/// Download a file into a buffer from a storage backend.
+pub async fn download_buffer(store: &StorageRef, path: &str) -> Result<opendal::Buffer, Error> {
+    use futures_util::TryStreamExt;
+
+    let reader = store.open_reader(path).await?;
+    let stream = reader
+        .into_stream(..)
+        .await
+        .map_err(|e| from_opendal_error(e, "Stream error"))?;
+    let chunks: Vec<opendal::Buffer> = stream
+        .try_collect()
+        .await
+        .map_err(|e| from_opendal_error(e, "Read error"))?;
+    Ok(chunks.into_iter().flatten().collect())
+}
+
+/// Clean up a partial file on the destination after a write failure.
+/// No-op on atomic-write backends (temp file is discarded automatically).
+pub async fn cleanup_partial_file(store: &StorageRef, path: &str) -> Result<(), Error> {
+    if store.uses_atomic_writes() {
+        return Ok(());
+    }
+    if let Some(base_path) = store.get_base_path() {
+        let file_path = base_path.join(path);
+        if tokio::fs::try_exists(&file_path).await.unwrap_or(false) {
+            tokio::fs::remove_file(&file_path).await.map_err(|e| {
+                Error::fatal(format!(
+                    "Failed to remove partial file {}: {}",
+                    file_path.display(),
+                    e
+                ))
+            })?;
+        }
+    }
+    Ok(())
+}
