@@ -5,7 +5,6 @@ use crate::{
     storage, utils,
 };
 use clap::Parser;
-use std::sync::Arc;
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -51,7 +50,7 @@ impl ScanCmd {
             storage_config: args.storage_config,
         };
 
-        let pipeline = Arc::new(Pipeline::new(operation, pipeline_config, src_store, None));
+        let pipeline = Pipeline::new(operation, pipeline_config, src_store, None);
 
         pipeline.run().await.map_err(utils::map_pipeline_error)?;
 

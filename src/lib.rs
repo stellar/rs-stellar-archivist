@@ -72,7 +72,6 @@ pub mod test_helpers {
         scan_operation::ScanOperation,
         storage::StorageConfig,
     };
-    use std::sync::Arc;
     use std::time::Duration;
 
     /// Create a `StorageConfig` suitable for testing (generous timeouts, limited concurrency)
@@ -263,7 +262,7 @@ pub mod test_helpers {
             storage_config: config.storage_config,
         };
 
-        let pipeline = Arc::new(Pipeline::new(operation, pipeline_config, src_store, None));
+        let pipeline = Pipeline::new(operation, pipeline_config, src_store, None);
         pipeline
             .run()
             .await
@@ -304,12 +303,7 @@ pub mod test_helpers {
             storage_config: config.storage_config,
         };
 
-        let pipeline = Arc::new(Pipeline::new(
-            operation,
-            pipeline_config,
-            src_store,
-            Some(dst_store),
-        ));
+        let pipeline = Pipeline::new(operation, pipeline_config, src_store, Some(dst_store));
         pipeline
             .run()
             .await

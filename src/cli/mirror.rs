@@ -5,7 +5,6 @@ use crate::{
     storage, utils,
 };
 use clap::Parser;
-use std::sync::Arc;
 use tracing::info;
 
 #[derive(Parser, Debug)]
@@ -69,12 +68,7 @@ impl MirrorCmd {
             storage_config: args.storage_config,
         };
 
-        let pipeline = Arc::new(Pipeline::new(
-            operation,
-            pipeline_config,
-            src_store,
-            Some(dst_store),
-        ));
+        let pipeline = Pipeline::new(operation, pipeline_config, src_store, Some(dst_store));
 
         pipeline.run().await.map_err(utils::map_pipeline_error)?;
 

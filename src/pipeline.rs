@@ -15,7 +15,7 @@ use futures_util::{
 };
 use lru::LruCache;
 use opendal::Buffer;
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -146,7 +146,7 @@ impl<Op: Operation> Pipeline<Op> {
         }
     }
 
-    pub async fn run(self: Arc<Self>) -> Result<(), Error> {
+    pub async fn run(&self) -> Result<(), Error> {
         let (lower_bound, upper_bound) = self
             .operation
             .get_checkpoint_bounds(&self.src_store)
@@ -158,23 +158,19 @@ impl<Op: Operation> Pipeline<Op> {
             return Ok(());
         }
 
-        let num_completed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let checkpoints = (lower_bound..=upper_bound)
-            .step_by(history_format::CHECKPOINT_FREQUENCY as usize)
-            .map(|ck| {
-                let pipeline = self.clone();
-                let completed = num_completed.clone();
-                async move {
-                    pipeline.process_checkpoint(ck).await;
-                    let done = completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    if done.is_multiple_of(PROGRESS_REPORTING_FREQUENCY) || done == total_count {
-                        info!("Progress: {}/{} checkpoints processed", done, total_count);
-                    }
-                }
-            });
+        let num_completed = std::sync::atomic::AtomicUsize::new(0);
+        let completed_ref = &num_completed;
+        let checkpoints =
+            (lower_bound..=upper_bound).step_by(history_format::CHECKPOINT_FREQUENCY as usize);
 
         stream::iter(checkpoints)
-            .for_each_concurrent(self.config.concurrency, |fut| fut)
+            .for_each_concurrent(self.config.concurrency, |ck| async move {
+                self.process_checkpoint(ck).await;
+                let done = completed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if done.is_multiple_of(PROGRESS_REPORTING_FREQUENCY) || done == total_count {
+                    info!("Progress: {}/{} checkpoints processed", done, total_count);
+                }
+            })
             .await;
 
         self.operation.finalize(upper_bound, &self.stats).await?;
@@ -182,18 +178,25 @@ impl<Op: Operation> Pipeline<Op> {
         Ok(())
     }
 
-    async fn process_checkpoint(self: Arc<Self>, checkpoint: u32) {
-        let hist = self.clone().process_history_and_buckets(checkpoint);
+    /// Process a single checkpoint: history+buckets concurrently with the
+    /// per-checkpoint files (ledger, transactions, results, optional scp).
+    ///
+    /// Public so external callers (e.g. repair's retry phase, which builds a
+    /// `Pipeline<MirrorOperation>` to re-mirror failed checkpoints) can drive
+    /// the pipeline machinery directly without `Pipeline::run`'s full bounds +
+    /// iteration loop.
+    pub async fn process_checkpoint(&self, checkpoint: u32) {
+        let hist = self.process_history_and_buckets(checkpoint);
         let cats = join_all(["ledger", "transactions", "results"].map(|cat| {
             let path = checkpoint_path(cat, checkpoint);
-            self.clone().process_file(path)
+            self.process_file(path)
         }));
 
         if self.config.skip_optional {
             let _ = join(hist, cats).await;
         } else {
             let path = checkpoint_path("scp", checkpoint);
-            let scp = self.clone().process_file(path);
+            let scp = self.process_file(path);
             let _ = join3(hist, cats, scp).await;
         }
 
@@ -202,7 +205,7 @@ impl<Op: Operation> Pipeline<Op> {
 
     /// Process a history file for a checkpoint: download, parse, write buffer
     /// to destination (if present), and process buckets.
-    async fn process_history_and_buckets(self: Arc<Self>, checkpoint: u32) {
+    async fn process_history_and_buckets(&self, checkpoint: u32) {
         let history_path = checkpoint_path("history", checkpoint);
 
         // Download history buffer (operation can override sourcing)
@@ -211,10 +214,12 @@ impl<Op: Operation> Pipeline<Op> {
             self.config.storage_config.retry_min_delay.as_millis() as u64,
             "download history",
             &history_path,
-            async || {
-                self.operation
-                    .fetch_history_buffer(&history_path, &self.src_store, self.dst_store.as_ref())
-                    .await
+            || {
+                self.operation.fetch_history_buffer(
+                    &history_path,
+                    &self.src_store,
+                    self.dst_store.as_ref(),
+                )
             },
         )
         .await
@@ -233,7 +238,7 @@ impl<Op: Operation> Pipeline<Op> {
             Ok(state) => {
                 // Write buffer to destination (if present) and process buckets concurrently
                 let write_history_buffer = self.process_buffer(&history_path, buffer);
-                let buckets = self.clone().process_buckets(state);
+                let buckets = self.process_buckets(state);
                 let _ = join(write_history_buffer, buckets).await;
             }
             Err(e) => {
@@ -271,7 +276,7 @@ impl<Op: Operation> Pipeline<Op> {
         }
     }
 
-    async fn process_buckets(self: Arc<Self>, state: HistoryFileState) {
+    async fn process_buckets(&self, state: HistoryFileState) {
         let bucket_futures: Vec<_> = {
             let mut cache = self.bucket_lru.lock().unwrap();
             state
@@ -279,12 +284,7 @@ impl<Op: Operation> Pipeline<Op> {
                 .iter()
                 .filter_map(|bucket| {
                     if cache.put(bucket.clone(), ()).is_none() {
-                        bucket_path(bucket).ok().map(|path| {
-                            let pipeline = self.clone();
-                            async move {
-                                pipeline.process_file(path).await;
-                            }
-                        })
+                        bucket_path(bucket).ok().map(|path| self.process_file(path))
                     } else {
                         None
                     }
@@ -296,7 +296,7 @@ impl<Op: Operation> Pipeline<Op> {
     }
 
     /// Process a single file (bucket, ledger, transactions, results, scp).
-    async fn process_file(self: Arc<Self>, path: String) {
+    async fn process_file(&self, path: String) {
         // Pre-check: allow operation to skip without querying source
         if let Some(result) = self.operation.pre_check(&path).await {
             match result {
@@ -317,7 +317,7 @@ impl<Op: Operation> Pipeline<Op> {
             self.config.storage_config.retry_min_delay.as_millis() as u64,
             "process",
             &path,
-            async || self.operation.process_object(&path, &self.src_store).await,
+            || self.operation.process_object(&path, &self.src_store),
         )
         .await;
 

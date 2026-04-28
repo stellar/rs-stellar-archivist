@@ -304,19 +304,35 @@ impl RetryState {
     }
 }
 
-/// Run an async fallible operation with retry-on-transient-error and
+/// Run a fallible async operation with retry-on-transient-error and
 /// exponential backoff.
 ///
 /// Wraps `f` in a `RetryState` loop: on `Err`, calls `should_retry` to
 /// classify the error and (if retryable) waits via `backoff()` before retrying.
 /// Used by the pipeline (per-file processing) and by repair manual mode.
-pub async fn with_retries<T>(
+///
+/// **Signature note.** `F: FnMut() -> Fut` with an explicit `Fut: Send` bound
+/// (rather than `impl AsyncFnMut() -> ...`) so the future's `Send`-ness is a
+/// concrete constraint on a named type — this propagates cleanly through
+/// outer compositions, including async_trait-wrapped methods that demand Send
+/// on the boxed future. `AsyncFnMut`'s implicit `CallMutFuture` associated
+/// type has no Send bound and is opaque, which trips Send-HRTB inference when
+/// the resulting future is composed inside another async_trait method.
+///
+/// Caller usage: pass `|| obj.async_method(args)` (closure returns the future
+/// directly) rather than `async || obj.async_method(args).await` — both work,
+/// but the former avoids an extra opaque async-block layer.
+pub async fn with_retries<T, F, Fut>(
     max_retries: u32,
     retry_min_delay_ms: u64,
     action: &str,
     path: &str,
-    mut f: impl AsyncFnMut() -> Result<T, crate::storage::Error>,
-) -> Result<T, crate::storage::Error> {
+    mut f: F,
+) -> Result<T, crate::storage::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, crate::storage::Error>> + Send,
+{
     let mut retry = RetryState::new(max_retries, retry_min_delay_ms);
     loop {
         match f().await {
@@ -344,46 +360,18 @@ pub async fn fetch_well_known_history_file(
     retry_min_delay_ms: u64,
 ) -> Result<HistoryFileState, Error> {
     use crate::history_format::ROOT_WELL_KNOWN_PATH;
-    use futures_util::TryStreamExt;
-    use opendal::Buffer;
 
     debug!("Fetching .well-known from path: {}", ROOT_WELL_KNOWN_PATH);
 
-    let mut retry_state = RetryState::new(max_retries, retry_min_delay_ms);
-
-    // Download the .well-known file with retries at this level
-    let buffer = loop {
-        let download_result: Result<Buffer, crate::storage::Error> = async {
-            let reader = store.open_reader(ROOT_WELL_KNOWN_PATH).await?;
-            // Convert to stream and collect all chunks
-            let stream = reader
-                .into_stream(..)
-                .await
-                .map_err(|e| crate::storage::from_opendal_error(e, "Stream error"))?;
-            let chunks: Vec<Buffer> = stream
-                .try_collect()
-                .await
-                .map_err(|e| crate::storage::from_opendal_error(e, "Read error"))?;
-            // Merge chunks into a single buffer
-            let buffer: Buffer = chunks.into_iter().flatten().collect();
-            Ok(buffer)
-        }
-        .await;
-
-        match download_result {
-            Ok(buf) => break buf,
-            Err(e) => {
-                if retry_state.should_retry(&e, "download", ROOT_WELL_KNOWN_PATH) {
-                    retry_state.backoff().await;
-                    continue;
-                }
-                return Err(std::io::Error::other(format!(
-                    "Failed to fetch {ROOT_WELL_KNOWN_PATH}: {e}"
-                ))
-                .into());
-            }
-        }
-    };
+    let buffer = with_retries(
+        max_retries,
+        retry_min_delay_ms,
+        "download",
+        ROOT_WELL_KNOWN_PATH,
+        || crate::storage::download_buffer(store, ROOT_WELL_KNOWN_PATH),
+    )
+    .await
+    .map_err(|e| std::io::Error::other(format!("Failed to fetch {ROOT_WELL_KNOWN_PATH}: {e}")))?;
 
     // Parse the JSON
     tracing::debug!("Read {} bytes from {}", buffer.len(), ROOT_WELL_KNOWN_PATH);

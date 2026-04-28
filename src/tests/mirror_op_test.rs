@@ -879,10 +879,10 @@ async fn test_mirror_race_condition_with_advancing_archive() {
                 let count = request_count.fetch_add(1, Ordering::Relaxed);
                 let well_known_content = if count >= advance_threshold {
                     // Return advanced .well-known after threshold
-                    advanced_well_known.to_string()
+                    advanced_well_known.clone()
                 } else {
                     // Initial reads get initial .well-known
-                    initial_well_known.to_string()
+                    initial_well_known.clone()
                 };
                 async move { well_known_content }
             }),
