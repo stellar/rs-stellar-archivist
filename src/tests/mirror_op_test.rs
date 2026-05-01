@@ -648,7 +648,7 @@ async fn test_mirror_resume_after_crash_redownloads_missing_file() {
     // Simulate crash: remove the final file, leave a truncated .tmp behind.
     // With temp+rename, a killed process leaves only the .tmp — the final
     // path was never created/updated for this write.
-    let tmp_file = ledger_file.with_extension("tmp");
+    let tmp_file = ledger_file.with_added_extension("tmp");
     std::fs::write(&tmp_file, &correct_content[..5]).unwrap();
     std::fs::remove_file(&ledger_file).unwrap();
 

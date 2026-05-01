@@ -300,7 +300,7 @@ impl OpendalStore {
     ) -> Result<(), Error> {
         let object = object.trim_start_matches('/');
         let file_path = root_path.join(object);
-        let tmp_path = file_path.with_extension("tmp");
+        let tmp_path = file_path.with_added_extension("tmp");
 
         if let Some(parent) = file_path.parent() {
             tokio::fs::create_dir_all(parent).await.map_err(|e| {
