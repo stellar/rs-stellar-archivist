@@ -1077,18 +1077,29 @@ pub async fn verify_and_write_xdr(
 ) -> Result<XdrParseResult, StorageError> {
     use futures_util::SinkExt;
 
-    let writer = dst_store.open_writer(path).await?;
-    let (decompressed, sink) = match decompress_and_write_internal(path, reader, Some(writer)).await
-    {
-        Ok(result) => result,
-        Err(e) => {
-            // Decompression or I/O error — sink was dropped inside
-            // decompress_and_write_internal without close. Clean up any
-            // partial data on non-atomic backends.
-            cleanup_non_atomic_partial_write(path, dst_store).await;
-            return Err(e);
-        }
+    // For non-atomic backends, write to a `.tmp` sibling first and rename to
+    // `path` only after parsing succeeds. This prevents a partial file from
+    // being visible at the final path if the process is killed mid-stream
+    // (SIGKILL, OOM), which would otherwise cause `pre_check()` to skip
+    // re-downloading on resume. Atomic backends handle this internally.
+    let write_path: String = if dst_store.uses_atomic_writes() {
+        path.to_string()
+    } else {
+        format!("{path}.tmp")
     };
+
+    let writer = dst_store.open_writer(&write_path).await?;
+    let (decompressed, sink) =
+        match decompress_and_write_internal(&write_path, reader, Some(writer)).await {
+            Ok(result) => result,
+            Err(e) => {
+                // Decompression or I/O error — sink was dropped inside
+                // decompress_and_write_internal without close. Clean up any
+                // partial data on non-atomic backends.
+                cleanup_non_atomic_partial_write(&write_path, dst_store).await;
+                return Err(e);
+            }
+        };
 
     let parse_result = if crate::history_format::is_ledger_file(path) {
         parse_ledger_entries_for_checkpoint(
@@ -1118,9 +1129,26 @@ pub async fn verify_and_write_xdr(
         Ok(result) => {
             // Verification passed — close sink to commit the write
             if let Some(mut s) = sink {
-                s.close()
-                    .await
-                    .map_err(|e| from_opendal_error(e, &format!("failed to close {}", path)))?;
+                s.close().await.map_err(|e| {
+                    from_opendal_error(e, &format!("failed to close {}", write_path))
+                })?;
+            }
+            // Non-atomic FS backend: rename the temp to the final path.
+            // Removes the temp on rename failure to avoid leaking `.tmp` files.
+            if write_path != path {
+                if let Some(base) = dst_store.get_base_path() {
+                    let tmp_full = base.join(&write_path);
+                    let final_full = base.join(path);
+                    if let Err(e) = tokio::fs::rename(&tmp_full, &final_full).await {
+                        let _ = tokio::fs::remove_file(&tmp_full).await;
+                        return Err(StorageError::fatal(format!(
+                            "failed to rename {} to {}: {}",
+                            tmp_full.display(),
+                            final_full.display(),
+                            e
+                        )));
+                    }
+                }
             }
             Ok(result)
         }
@@ -1128,7 +1156,7 @@ pub async fn verify_and_write_xdr(
             // Verification failed — don't close sink, prevents committing corrupt data
             // on atomic backends. For non-atomic backends, data is already on disk via
             // send() so clean up the partial file.
-            cleanup_non_atomic_partial_write(path, dst_store).await;
+            cleanup_non_atomic_partial_write(&write_path, dst_store).await;
             Err(err)
         }
     }

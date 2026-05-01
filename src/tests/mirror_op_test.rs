@@ -14,6 +14,7 @@ use crate::{
     test_helpers::{run_mirror, run_scan, test_storage_config, MirrorConfig, ScanConfig},
 };
 use axum::{routing::get_service, Router};
+use rstest::rstest;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -621,46 +622,61 @@ async fn test_mirror_replaces_empty_files() {
     );
 }
 
-/// Verifies that a process crash during non-atomic writes doesn't leave partial
-/// files at the final path, preventing silent corruption on resume.
+/// Verifies that a process crash during non-atomic writes doesn't leave
+/// partial files at the final path, preventing silent corruption on resume.
 ///
-/// Scenario: mirror checkpoints 63 and 127, then simulate a crash by deleting
-/// a file at checkpoint 127 and leaving a truncated `.tmp` (as the temp+rename
-/// write strategy would). Resume mirror and verify the file is re-downloaded
-/// correctly and `.well-known` only advances once everything succeeds.
+/// Two cases cover the two distinct write paths in `MirrorOperation::process_object`:
+/// - `no_verify`: ledger files go through `OpendalStore::copy_from_reader_direct`
+///   (storage.rs) — pure tokio::fs temp+rename.
+/// - `verify`: ledger files go through `xdr_verify::verify_and_write_xdr` —
+///   OpenDAL writer/sink + tokio::fs::rename at commit.
+///
+/// Scenario: mirror checkpoints 63 and 127, simulate a crash on a ledger file
+/// at checkpoint 127 by deleting the final file and leaving a truncated `.tmp`
+/// behind (matching what a killed temp+rename would leave). Resume and confirm
+/// the file is re-downloaded correctly, the stale `.tmp` is gone, and
+/// `.well-known` only advances once everything succeeds.
+#[rstest]
+#[case::no_verify(false)]
+#[case::verify(true)]
 #[tokio::test]
-async fn test_mirror_resume_after_crash_redownloads_missing_file() {
+async fn test_mirror_resume_after_crash_redownloads_missing_file(#[case] verify: bool) {
     let src = file_url_from_path(&testnet_small_archive_path());
     let temp_dir = TempDir::new().unwrap();
     let dest_path = temp_dir.path().join("mirror_dest");
     let dst = file_url_from_path(&dest_path);
 
+    let make_config = || {
+        let mut c = MirrorConfig::new(&src, &dst).skip_optional().high(127);
+        if verify {
+            c = c.verify();
+        }
+        c
+    };
+
     // Mirror checkpoints 63 and 127
-    run_mirror(MirrorConfig::new(&src, &dst).skip_optional().high(127))
+    run_mirror(make_config())
         .await
         .expect("Initial mirror should succeed");
 
-    // Record correct content of a file at checkpoint 127
+    // Record correct content of a ledger file at checkpoint 127
     let ledger_file = dest_path.join("ledger/00/00/00/ledger-0000007f.xdr.gz");
     let correct_content = std::fs::read(&ledger_file).unwrap();
     assert!(correct_content.len() > 10);
 
     // Simulate crash: remove the final file, leave a truncated .tmp behind.
-    // With temp+rename, a killed process leaves only the .tmp — the final
-    // path was never created/updated for this write.
+    // Both write paths use "{final}.tmp" as the temp name.
     let tmp_file = ledger_file.with_added_extension("tmp");
     std::fs::write(&tmp_file, &correct_content[..5]).unwrap();
     std::fs::remove_file(&ledger_file).unwrap();
 
     // Roll back .well-known to checkpoint 63 so resume re-processes checkpoint 127.
-    // This simulates the state after a crash: .well-known was at 63 (the previous
-    // successful run), and the run that was mirroring 127 was killed before finalize.
     let wellknown = dest_path.join(".well-known/stellar-history.json");
     let history_63 = dest_path.join("history/00/00/00/history-0000003f.json");
     std::fs::copy(&history_63, &wellknown).unwrap();
 
-    // Resume mirror — should re-download the missing file at checkpoint 127
-    run_mirror(MirrorConfig::new(&src, &dst).skip_optional().high(127))
+    // Resume — should re-download the missing file at checkpoint 127
+    run_mirror(make_config())
         .await
         .expect("Resume mirror should succeed");
 
