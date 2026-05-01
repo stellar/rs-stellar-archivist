@@ -345,18 +345,17 @@ impl OpendalStore {
             return Err(e);
         }
 
-        tokio::fs::rename(&tmp_path, &file_path)
-            .await
-            .map_err(|e| {
-                from_io_error(
-                    e,
-                    &format!(
-                        "Failed to rename {} to {}",
-                        tmp_path.display(),
-                        file_path.display()
-                    ),
-                )
-            })?;
+        if let Err(e) = tokio::fs::rename(&tmp_path, &file_path).await {
+            let _ = tokio::fs::remove_file(&tmp_path).await;
+            return Err(from_io_error(
+                e,
+                &format!(
+                    "Failed to rename {} to {}",
+                    tmp_path.display(),
+                    file_path.display()
+                ),
+            ));
+        }
 
         Ok(())
     }
