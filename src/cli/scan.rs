@@ -39,7 +39,7 @@ impl ScanCmd {
             args.storage_config.max_retries as u32,
             args.storage_config.retry_min_delay.as_millis() as u64,
             args.verify,
-        )?;
+        );
 
         let src_store = storage::from_url_with_config(&self.archive, &args.storage_config)
             .map_err(|e| Error::Other(format!("Failed to create source backend: {e}")))?;

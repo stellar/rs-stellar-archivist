@@ -249,7 +249,7 @@ pub mod test_helpers {
             config.storage_config.max_retries as u32,
             config.storage_config.retry_min_delay.as_millis() as u64,
             config.verify,
-        )?;
+        );
 
         let src_store =
             crate::storage::from_url_with_config(&config.archive, &config.storage_config).map_err(

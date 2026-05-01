@@ -43,8 +43,8 @@ impl ScanOperation {
         max_retries: u32,
         retry_min_delay_ms: u64,
         verify: bool,
-    ) -> Result<Self, Error> {
-        Ok(Self {
+    ) -> Self {
+        Self {
             low,
             high,
             max_retries,
@@ -54,7 +54,7 @@ impl ScanOperation {
             } else {
                 None
             },
-        })
+        }
     }
 
     async fn consume_stream(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
