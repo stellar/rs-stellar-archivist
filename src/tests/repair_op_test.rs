@@ -599,15 +599,49 @@ async fn test_repair_dry_run_reports_but_no_download() {
 
     let deleted = delete_first_file(dest_dir.path(), "/ledger-");
 
+    // History files: dry-run must not write history-*.json regardless of
+    // whether dst is missing or corrupt (Pipeline used to write the src
+    // buffer back via process_buffer even in dry-run).
+    let history_files = get_files_by_pattern(dest_dir.path(), "/history-");
+    assert!(
+        history_files.len() >= 2,
+        "Need at least two history files to exercise both missing and corrupt cases"
+    );
+
+    let deleted_history = history_files[0].clone();
+    let deleted_history_relative = deleted_history
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    std::fs::remove_file(&deleted_history).unwrap();
+
+    let corrupted_history = history_files[1].clone();
+    let corrupted_content: &[u8] = b"{ invalid json garbage }}";
+    std::fs::write(&corrupted_history, corrupted_content).unwrap();
+
     // Dry run should not actually download anything
     run_repair(RepairConfig::new(&src_url, &dest_url).dry_run())
         .await
         .expect("Dry run should succeed");
 
-    // File should still be missing
+    // Ledger file should still be missing
     assert!(
         !dest_dir.path().join(&deleted).exists(),
         "Dry run should not restore deleted file"
+    );
+
+    // Deleted history file should still be missing
+    assert!(
+        !dest_dir.path().join(&deleted_history_relative).exists(),
+        "Dry run should not restore deleted history file"
+    );
+
+    // Corrupted history file should still have its corrupt content
+    assert_eq!(
+        std::fs::read(&corrupted_history).unwrap(),
+        corrupted_content,
+        "Dry run should not overwrite corrupted history file"
     );
 }
 

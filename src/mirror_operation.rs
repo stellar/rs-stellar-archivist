@@ -3,9 +3,10 @@
 use crate::history_format;
 use crate::pipeline::{async_trait, Operation};
 use crate::storage::cleanup_partial_file;
-use crate::storage::{Error as StorageError, StorageConfig, StorageRef};
+use crate::storage::{self, Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
+use opendal::Buffer;
 use opendal::Reader;
 use std::sync::Arc;
 use thiserror::Error;
@@ -475,6 +476,17 @@ impl Operation for MirrorOperation {
     fn finalize_checkpoint(&self, checkpoint: u32) {
         if let Some(ref manager) = self.verification_manager {
             manager.verify_and_release(checkpoint);
+        }
+    }
+
+    /// Mirror writes the history buffer to its own dst.
+    async fn process_buffer(&self, path: &str, buffer: Buffer, stats: &ArchiveStats) {
+        match storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await {
+            Ok(()) => stats.record_success(path),
+            Err(e) => {
+                error!("Failed to write history file {}: {}", path, e);
+                stats.record_failure(path).await;
+            }
         }
     }
 }

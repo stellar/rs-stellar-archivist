@@ -546,6 +546,23 @@ impl Operation for RepairOperation {
 
         Ok(())
     }
+
+    /// Repair writes the history buffer to its own dst, except in dry-run mode
+    /// where the write is skipped entirely (and stats are left untouched —
+    /// dry-run reports via `needs_repair_count`, populated in
+    /// `fetch_history_buffer`).
+    async fn process_buffer(&self, path: &str, buffer: Buffer, stats: &ArchiveStats) {
+        if self.dry_run {
+            return;
+        }
+        match storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await {
+            Ok(()) => stats.record_success(path),
+            Err(e) => {
+                error!("Failed to write history file {}: {}", path, e);
+                stats.record_failure(path).await;
+            }
+        }
+    }
 }
 
 // ============================================================================

@@ -6,7 +6,7 @@
 
 use crate::{
     history_format::{self, bucket_path, checkpoint_path, HistoryFileState},
-    storage::{cleanup_partial_file, download_buffer, StorageConfig, StorageRef},
+    storage::{download_buffer, StorageConfig, StorageRef},
     utils::{self, ArchiveStats},
 };
 use futures_util::{
@@ -101,6 +101,14 @@ pub trait Operation: Send + Sync + 'static {
     ) -> Result<Buffer, crate::storage::Error> {
         download_buffer(src_store, history_path).await
     }
+
+    /// Write a fetched buffer (currently the history file) to the operation's
+    /// destination and record the outcome into `stats`.
+    ///
+    /// Implementations diverge by mode: scan records success without writing;
+    /// mirror writes via `storage::write_buffer_with_cleanup`; repair skips the
+    /// write entirely in dry-run mode and otherwise writes like mirror.
+    async fn process_buffer(&self, path: &str, buffer: Buffer, stats: &ArchiveStats);
 }
 
 // ============================================================================
@@ -189,29 +197,49 @@ impl<Op: Operation> Pipeline<Op> {
     /// the pipeline machinery directly without `Pipeline::run`'s full bounds +
     /// iteration loop.
     pub async fn process_checkpoint(&self, checkpoint: u32) {
-        let hist = self.process_history_and_buckets(checkpoint);
+        // History work: fetch + parse, then concurrently write the buffer to
+        // dst and process the buckets it references. Fetch/parse failures are
+        // logged and recorded inside `fetch_history_file_state`; on failure
+        // this future just returns early so the rest of the checkpoint's files
+        // still get processed.
+        let history_work = async {
+            let Some((state, buffer)) = self.fetch_history_file_state(checkpoint).await else {
+                return;
+            };
+            let history_path = checkpoint_path("history", checkpoint);
+            let write_history_buffer =
+                self.operation
+                    .process_buffer(&history_path, buffer, &self.stats);
+            let buckets = self.process_buckets(state);
+            let _ = join(write_history_buffer, buckets).await;
+        };
+
         let cats = join_all(["ledger", "transactions", "results"].map(|cat| {
             let path = checkpoint_path(cat, checkpoint);
             self.process_file(path)
         }));
 
         if self.config.skip_optional {
-            let _ = join(hist, cats).await;
+            let _ = join(history_work, cats).await;
         } else {
-            let path = checkpoint_path("scp", checkpoint);
-            let scp = self.process_file(path);
-            let _ = join3(hist, cats, scp).await;
+            let scp_path = checkpoint_path("scp", checkpoint);
+            let scp = self.process_file(scp_path);
+            let _ = join3(history_work, cats, scp).await;
         }
 
         self.operation.finalize_checkpoint(checkpoint);
     }
 
-    /// Process a history file for a checkpoint: download, parse, write buffer
-    /// to destination (if present), and process buckets.
-    async fn process_history_and_buckets(&self, checkpoint: u32) {
+    /// Fetch and parse a checkpoint's history file. On download or parse
+    /// failure, logs the error and records a failure into `stats`, returning
+    /// `None`. On success, returns the parsed state alongside the raw buffer
+    /// (the caller needs the buffer to write it to dst).
+    async fn fetch_history_file_state(
+        &self,
+        checkpoint: u32,
+    ) -> Option<(HistoryFileState, Buffer)> {
         let history_path = checkpoint_path("history", checkpoint);
 
-        // Download history buffer (operation can override sourcing)
         let Ok(buffer) = utils::with_retries(
             self.config.storage_config.max_retries as u32,
             self.config.storage_config.retry_min_delay.as_millis() as u64,
@@ -233,17 +261,11 @@ impl<Op: Operation> Pipeline<Op> {
                 checkpoint, checkpoint, history_path
             );
             self.stats.record_failure(&history_path).await;
-            return;
+            return None;
         };
 
-        // Parse and validate
         match history_format::parse_history(&buffer, &history_path) {
-            Ok(state) => {
-                // Write buffer to destination (if present) and process buckets concurrently
-                let write_history_buffer = self.process_buffer(&history_path, buffer);
-                let buckets = self.process_buckets(state);
-                let _ = join(write_history_buffer, buckets).await;
-            }
+            Ok(state) => Some((state, buffer)),
             Err(e) => {
                 error!(
                     "Failed to parse history JSON for checkpoint {} (0x{:08x}): {}",
@@ -255,27 +277,8 @@ impl<Op: Operation> Pipeline<Op> {
                     checkpoint, checkpoint, history_path
                 );
                 self.stats.record_failure(&history_path).await;
+                None
             }
-        }
-    }
-
-    /// Write the history buffer to the destination store (if present).
-    /// For scan (no dst_store), just records success.
-    async fn process_buffer(&self, path: &str, buffer: Buffer) {
-        if let Some(ref dst) = self.dst_store {
-            match dst.write(path, buffer).await {
-                Ok(()) => self.stats.record_success(path),
-                Err(e) => {
-                    if let Err(cleanup_err) = cleanup_partial_file(dst, path).await {
-                        error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
-                    }
-                    error!("Failed to write history file {}: {}", path, e);
-                    self.stats.record_failure(path).await;
-                }
-            }
-        } else {
-            // Scan mode: no destination, just record success
-            self.stats.record_success(path);
         }
     }
 

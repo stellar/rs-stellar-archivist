@@ -3,6 +3,7 @@ use crate::pipeline::{async_trait, Operation};
 use crate::storage::{from_opendal_error, Error as StorageError, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
+use opendal::Buffer;
 use opendal::Reader;
 use std::sync::Arc;
 use thiserror::Error;
@@ -167,5 +168,10 @@ impl Operation for ScanOperation {
         if let Some(ref manager) = self.verification_manager {
             manager.verify_and_release(checkpoint);
         }
+    }
+
+    /// Scan never writes — record success and discard the buffer.
+    async fn process_buffer(&self, path: &str, _buffer: Buffer, stats: &ArchiveStats) {
+        stats.record_success(path);
     }
 }
