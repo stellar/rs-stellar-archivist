@@ -8,7 +8,7 @@ use crate::xdr_verify::{
 };
 use rstest::rstest;
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use stellar_xdr::curr::{
     AccountId, CreateAccountOp, GeneralizedTransactionSet, Hash, LedgerHeader, LedgerHeaderExt,
     LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerScpMessages, Limits, Memo,
@@ -217,10 +217,10 @@ fn create_complete_checkpoint_data(
         header_data.insert(
             seq,
             LedgerHeaderVerificationData {
-                computed_hash,
-                prev_hash,
-                expected_tx_set_hash: [0; 32],
-                expected_result_hash: [0; 32],
+                computed_hash: Hash(computed_hash),
+                prev_hash: Hash(prev_hash),
+                expected_tx_set_hash: Hash([0; 32]),
+                expected_result_hash: Hash([0; 32]),
             },
         );
         prev_hash = computed_hash;
@@ -248,10 +248,10 @@ fn single_ledger_header_data(
     BTreeMap::from([(
         seq,
         LedgerHeaderVerificationData {
-            computed_hash,
-            prev_hash,
-            expected_tx_set_hash: [0; 32],
-            expected_result_hash: [0; 32],
+            computed_hash: Hash(computed_hash),
+            prev_hash: Hash(prev_hash),
+            expected_tx_set_hash: Hash([0; 32]),
+            expected_result_hash: Hash([0; 32]),
         },
     )])
 }
@@ -301,9 +301,9 @@ fn test_parse_ledger_header_entries_single_entry() {
 
     assert_eq!(parsed.len(), 1);
     let actual = parsed.get(&100).unwrap();
-    assert_eq!(actual.prev_hash, [1; 32]);
-    assert_eq!(actual.expected_tx_set_hash, [2; 32]);
-    assert_eq!(actual.expected_result_hash, [3; 32]);
+    assert_eq!(actual.prev_hash, Hash([1; 32]));
+    assert_eq!(actual.expected_tx_set_hash, Hash([2; 32]));
+    assert_eq!(actual.expected_result_hash, Hash([3; 32]));
 }
 
 #[test]
@@ -379,7 +379,7 @@ fn test_parse_result_entries_single_entry() {
     let expected: [u8; 32] =
         Sha256::digest(entry.tx_result_set.to_xdr(Limits::none()).unwrap()).into();
 
-    assert_eq!(parsed, HashMap::from([(100, expected)]));
+    assert_eq!(parsed, BTreeMap::from([(100u32, Hash(expected))]));
 }
 
 #[test]
@@ -391,7 +391,7 @@ fn test_parse_transaction_entries_v0_non_empty() {
 
     assert_eq!(parsed.len(), 1);
     assert_eq!(parsed[&100], compute_v0_tx_set_hash(&entry.tx_set).unwrap());
-    assert!(!is_empty_tx_set_hash(&parsed[&100], &prev_hash));
+    assert!(!is_empty_tx_set_hash(&parsed[&100], &Hash(prev_hash)));
 }
 
 #[test]
@@ -405,7 +405,7 @@ fn test_parse_transaction_entries_v1_non_empty() {
     };
 
     assert_eq!(parsed[&100], compute_v1_tx_set_hash(generalized).unwrap());
-    assert!(!is_empty_tx_set_hash(&parsed[&100], &prev_hash));
+    assert!(!is_empty_tx_set_hash(&parsed[&100], &Hash(prev_hash)));
 }
 
 #[test]
@@ -424,7 +424,7 @@ fn test_compute_v0_tx_set_hash_matches_manual_hash() {
     }
 
     let expected: [u8; 32] = hasher.finalize().into();
-    assert_eq!(compute_v0_tx_set_hash(&tx_set).unwrap(), expected);
+    assert_eq!(compute_v0_tx_set_hash(&tx_set).unwrap(), Hash(expected));
 }
 
 #[test]
@@ -466,21 +466,24 @@ fn test_compute_v1_tx_set_hash_matches_manual_hash() {
     });
     let expected: [u8; 32] = Sha256::digest(generalized.to_xdr(Limits::none()).unwrap()).into();
 
-    assert_eq!(compute_v1_tx_set_hash(&generalized).unwrap(), expected);
+    assert_eq!(
+        compute_v1_tx_set_hash(&generalized).unwrap(),
+        Hash(expected)
+    );
 }
 
 #[test]
 fn test_is_empty_tx_set_hash_direct_hashes() {
-    let prev_hash = [0x55; 32];
-    let expected_v0: [u8; 32] = Sha256::digest(prev_hash).into();
-    assert_eq!(compute_empty_v0_tx_set_hash(&prev_hash), expected_v0);
+    let prev_hash = Hash([0x55; 32]);
+    let expected_v0: [u8; 32] = Sha256::digest(prev_hash.0).into();
+    assert_eq!(compute_empty_v0_tx_set_hash(&prev_hash), Hash(expected_v0));
 
     let empty_v1 = GeneralizedTransactionSet::V1(TransactionSetV1 {
-        previous_ledger_hash: Hash(prev_hash),
+        previous_ledger_hash: prev_hash.clone(),
         phases: VecM::default(),
     });
     let expected_v1: [u8; 32] = Sha256::digest(empty_v1.to_xdr(Limits::none()).unwrap()).into();
-    assert_eq!(compute_empty_v1_tx_set_hash(&prev_hash), expected_v1);
+    assert_eq!(compute_empty_v1_tx_set_hash(&prev_hash), Hash(expected_v1));
 
     assert!(is_empty_tx_set_hash(
         &compute_empty_v0_tx_set_hash(&prev_hash),
@@ -495,7 +498,7 @@ fn test_is_empty_tx_set_hash_direct_hashes() {
 #[test]
 fn test_empty_xdr_array_hash_constant_matches_hash() {
     let expected: [u8; 32] = Sha256::digest([0_u8, 0, 0, 0]).into();
-    assert_eq!(EMPTY_XDR_ARRAY_HASH, expected);
+    assert_eq!(EMPTY_XDR_ARRAY_HASH, Hash(expected));
 }
 
 #[test]
@@ -525,11 +528,13 @@ fn test_manager_records_and_verifies_checkpoint() {
 
     let mut header_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
     for data in header_data.values_mut() {
-        data.expected_result_hash = result_hash;
+        data.expected_result_hash = Hash(result_hash);
     }
 
-    let result_hashes: HashMap<u32, [u8; 32]> =
-        header_data.keys().map(|&seq| (seq, result_hash)).collect();
+    let result_hashes: BTreeMap<u32, Hash> = header_data
+        .keys()
+        .map(|&seq| (seq, Hash(result_hash)))
+        .collect();
 
     manager.record_header_data(checkpoint, header_data);
     manager.record_result_hashes(checkpoint, result_hashes);
@@ -547,7 +552,7 @@ fn test_chain_break_within_ledger_file(#[case] checkpoint: u32, #[case] corrupte
     let manager = XdrVerificationManager::new();
 
     let mut header_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
-    header_data.get_mut(&corrupted_ledger).unwrap().prev_hash = [0xff; 32];
+    header_data.get_mut(&corrupted_ledger).unwrap().prev_hash = Hash([0xff; 32]);
 
     manager.record_header_data(checkpoint, header_data);
     manager.verify_and_release(checkpoint);
@@ -597,10 +602,10 @@ fn test_ledger_outside_expected_checkpoint_range() {
     header_data.insert(
         200,
         LedgerHeaderVerificationData {
-            computed_hash: [0xaa; 32],
-            prev_hash: [0xbb; 32],
-            expected_tx_set_hash: [0; 32],
-            expected_result_hash: [0; 32],
+            computed_hash: Hash([0xaa; 32]),
+            prev_hash: Hash([0xbb; 32]),
+            expected_tx_set_hash: Hash([0; 32]),
+            expected_result_hash: Hash([0; 32]),
         },
     );
 
@@ -642,23 +647,23 @@ fn test_cross_checkpoint_chain(#[case] break_chain: bool) {
 fn test_consecutive_checkpoints_full(#[case] break_chain: bool) {
     let manager = XdrVerificationManager::new();
     let header_data_63 = create_complete_checkpoint_data(63, [0; 32]);
-    let last_hash_of_63 = header_data_63.get(&63).unwrap().computed_hash;
+    let last_hash_of_63 = header_data_63.get(&63).unwrap().computed_hash.clone();
 
     let mut header_data_127 = BTreeMap::new();
     let mut prev_hash = if break_chain {
-        [0xff; 32]
+        Hash([0xff; 32])
     } else {
         last_hash_of_63
     };
     for seq in 64_u32..=127 {
-        let computed_hash: [u8; 32] = Sha256::digest(seq.to_le_bytes()).into();
+        let computed_hash = Hash(Sha256::digest(seq.to_le_bytes()).into());
         header_data_127.insert(
             seq,
             LedgerHeaderVerificationData {
-                computed_hash,
-                prev_hash,
-                expected_tx_set_hash: [0; 32],
-                expected_result_hash: [0; 32],
+                computed_hash: computed_hash.clone(),
+                prev_hash: prev_hash.clone(),
+                expected_tx_set_hash: Hash([0; 32]),
+                expected_result_hash: Hash([0; 32]),
             },
         );
         prev_hash = computed_hash;
@@ -722,7 +727,7 @@ fn test_manager_memory_freed_after_verification() {
 #[test]
 fn test_verify_and_release_with_only_tx_hashes_records_error_and_is_idempotent() {
     let manager = XdrVerificationManager::new();
-    manager.record_tx_set_hashes(127, HashMap::from([(100, [1; 32])]));
+    manager.record_tx_set_hashes(127, BTreeMap::from([(100u32, Hash([1; 32]))]));
     manager.verify_and_release(127);
     let first_errors = manager.get_errors();
     manager.verify_and_release(127);
@@ -736,7 +741,7 @@ fn test_verify_and_release_with_only_tx_hashes_records_error_and_is_idempotent()
 #[test]
 fn test_verify_and_release_with_only_result_hashes_records_error() {
     let manager = XdrVerificationManager::new();
-    manager.record_result_hashes(127, HashMap::from([(100, [1; 32])]));
+    manager.record_result_hashes(127, BTreeMap::from([(100u32, Hash([1; 32]))]));
     manager.verify_and_release(127);
 
     assert_has_error(&manager, "missing ledger verification data");
@@ -746,10 +751,10 @@ fn test_verify_and_release_with_only_result_hashes_records_error() {
 fn test_verify_checkpoint_chain_with_three_consecutive_checkpoints() {
     let manager = XdrVerificationManager::new();
     let header_data_63 = create_complete_checkpoint_data(63, [0; 32]);
-    let hash_63 = header_data_63.get(&63).unwrap().computed_hash;
-    let header_data_127 = create_complete_checkpoint_data(127, hash_63);
-    let hash_127 = header_data_127.get(&127).unwrap().computed_hash;
-    let header_data_191 = create_complete_checkpoint_data(191, hash_127);
+    let hash_63 = header_data_63.get(&63).unwrap().computed_hash.clone();
+    let header_data_127 = create_complete_checkpoint_data(127, hash_63.0);
+    let hash_127 = header_data_127.get(&127).unwrap().computed_hash.clone();
+    let header_data_191 = create_complete_checkpoint_data(191, hash_127.0);
 
     manager.record_header_data(63, header_data_63);
     manager.record_header_data(127, header_data_127);
@@ -787,14 +792,14 @@ fn test_manager_detects_hash_mismatch(#[case] hash_type: &str) {
     let mut header_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
     for data in header_data.values_mut() {
         match hash_type {
-            "tx set" => data.expected_tx_set_hash = expected,
-            "result set" => data.expected_result_hash = expected,
+            "tx set" => data.expected_tx_set_hash = Hash(expected),
+            "result set" => data.expected_result_hash = Hash(expected),
             _ => unreachable!(),
         }
     }
 
-    let wrong_hashes: HashMap<u32, [u8; 32]> =
-        header_data.keys().map(|&seq| (seq, wrong)).collect();
+    let wrong_hashes: BTreeMap<u32, Hash> =
+        header_data.keys().map(|&seq| (seq, Hash(wrong))).collect();
 
     manager.record_header_data(checkpoint, header_data);
     match hash_type {
@@ -819,14 +824,14 @@ fn test_manager_detects_missing_entry_for_non_empty_hash(#[case] hash_type: &str
     for data in header_data.values_mut() {
         // tx set missing-entry detection requires expected_result_hash != EMPTY_XDR_ARRAY_HASH,
         // so both cases set non-empty hashes for both fields.
-        data.expected_tx_set_hash = non_empty_hash;
-        data.expected_result_hash = non_empty_hash;
+        data.expected_tx_set_hash = Hash(non_empty_hash);
+        data.expected_result_hash = Hash(non_empty_hash);
     }
 
     manager.record_header_data(checkpoint, header_data);
     match hash_type {
-        "tx set" => manager.record_tx_set_hashes(checkpoint, HashMap::new()),
-        "result" => manager.record_result_hashes(checkpoint, HashMap::new()),
+        "tx set" => manager.record_tx_set_hashes(checkpoint, BTreeMap::new()),
+        "result" => manager.record_result_hashes(checkpoint, BTreeMap::new()),
         _ => unreachable!(),
     }
     manager.verify_and_release(checkpoint);
@@ -855,25 +860,25 @@ fn test_manager_allows_missing_entry_for_empty_hash(
         match (hash_type, empty_variant) {
             ("tx set", "empty_v0") => {
                 data.expected_tx_set_hash = compute_empty_v0_tx_set_hash(&data.prev_hash);
-                data.expected_result_hash = hash_of("some_result");
+                data.expected_result_hash = Hash(hash_of("some_result"));
             }
             ("tx set", "empty_v1") => {
                 data.expected_tx_set_hash = compute_empty_v1_tx_set_hash(&data.prev_hash);
-                data.expected_result_hash = hash_of("some_result");
+                data.expected_result_hash = Hash(hash_of("some_result"));
             }
-            ("tx set", "zero") => {} // defaults are already [0; 32]
+            ("tx set", "zero") => {} // defaults are already Hash([0; 32])
             ("result", "empty_xdr_array") => {
                 data.expected_result_hash = EMPTY_XDR_ARRAY_HASH;
             }
-            ("result", "zero") => {} // defaults are already [0; 32]
+            ("result", "zero") => {} // defaults are already Hash([0; 32])
             _ => unreachable!(),
         }
     }
 
     manager.record_header_data(checkpoint, header_data);
     match hash_type {
-        "tx set" => manager.record_tx_set_hashes(checkpoint, HashMap::new()),
-        "result" => manager.record_result_hashes(checkpoint, HashMap::new()),
+        "tx set" => manager.record_tx_set_hashes(checkpoint, BTreeMap::new()),
+        "result" => manager.record_result_hashes(checkpoint, BTreeMap::new()),
         _ => unreachable!(),
     }
     manager.verify_and_release(checkpoint);
@@ -894,12 +899,12 @@ fn test_manager_still_flags_missing_tx_set_when_result_hash_is_empty_array_hash(
 
     let mut header_data = create_complete_checkpoint_data(checkpoint, [0; 32]);
     for data in header_data.values_mut() {
-        data.expected_tx_set_hash = non_empty_tx_hash;
+        data.expected_tx_set_hash = Hash(non_empty_tx_hash);
         data.expected_result_hash = EMPTY_XDR_ARRAY_HASH;
     }
 
     manager.record_header_data(checkpoint, header_data);
-    manager.record_tx_set_hashes(checkpoint, HashMap::new());
+    manager.record_tx_set_hashes(checkpoint, BTreeMap::new());
     manager.verify_and_release(checkpoint);
 
     // The EMPTY_XDR_ARRAY_HASH result hash suppresses the missing tx set error

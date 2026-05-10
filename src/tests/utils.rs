@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use stellar_xdr::curr::Hash;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
@@ -475,14 +476,12 @@ pub fn parse_ledger_header_entries(
     parse_ledger_header_entries_for_checkpoint(decompressed_data, None)
 }
 
-pub fn parse_result_entries(
-    decompressed_data: &[u8],
-) -> Result<HashMap<u32, [u8; 32]>, StorageError> {
+pub fn parse_result_entries(decompressed_data: &[u8]) -> Result<BTreeMap<u32, Hash>, StorageError> {
     parse_result_entries_for_checkpoint(decompressed_data, None)
 }
 
 pub fn parse_transaction_entries(
     decompressed_data: &[u8],
-) -> Result<HashMap<u32, [u8; 32]>, StorageError> {
+) -> Result<BTreeMap<u32, Hash>, StorageError> {
     parse_transaction_entries_for_checkpoint(decompressed_data, None)
 }

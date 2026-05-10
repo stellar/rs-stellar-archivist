@@ -36,10 +36,31 @@ use tokio_util::io::StreamReader;
 use tracing::{debug, error, warn};
 
 /// SHA256 hash of empty XDR array \[0,0,0,0\] used for ledgers with no transactions.
-pub(crate) const EMPTY_XDR_ARRAY_HASH: [u8; 32] = [
+pub(crate) const EMPTY_XDR_ARRAY_HASH: Hash = Hash([
     0xdf, 0x3f, 0x61, 0x98, 0x04, 0xa9, 0x2f, 0xdb, 0x40, 0x57, 0x19, 0x2d, 0xc4, 0x3d, 0xd7, 0x48,
     0xea, 0x77, 0x8a, 0xdc, 0x52, 0xbc, 0x49, 0x8c, 0xe8, 0x05, 0x24, 0xc0, 0x14, 0xb8, 0x11, 0x19,
-];
+]);
+
+/// All-zero hash. Used as a sentinel for "no result entry expected."
+const ZERO_HASH: Hash = Hash([0; 32]);
+
+/// SHA-256 of `data` returned as a `stellar_xdr::curr::Hash` (the same newtype
+/// used by ledger headers, tx-set hashes, etc.).
+fn sha256(data: &[u8]) -> Hash {
+    Hash(Sha256::digest(data).into())
+}
+
+/// Extension methods for `stellar_xdr::curr::Hash`.
+pub(crate) trait HashExt {
+    /// Hex-encode the 32 bytes (lowercase, no prefix).
+    fn to_hex(&self) -> String;
+}
+
+impl HashExt for Hash {
+    fn to_hex(&self) -> String {
+        hex::encode(self.0)
+    }
+}
 
 const DECOMPRESS_BUFFER_SIZE: usize = 64 * 1024;
 const CHANNEL_CAPACITY: usize = 64;
@@ -68,29 +89,29 @@ pub(crate) fn expected_ledger_range(checkpoint: u32) -> (u32, u32) {
 #[derive(Debug, Clone)]
 pub struct LedgerHeaderVerificationData {
     /// `SHA256(entry.header.to_xdr())` — verified to equal `entry.hash` at parse time.
-    pub computed_hash: [u8; 32],
+    pub computed_hash: Hash,
     /// `entry.header.previous_ledger_hash` — checked against prior ledger's `computed_hash`
     /// during intra-checkpoint and cross-checkpoint chain verification.
-    pub prev_hash: [u8; 32],
+    pub prev_hash: Hash,
     /// `entry.header.scp_value.tx_set_hash` — cross-verified against the hash computed
     /// from the transaction file for the same ledger sequence.
-    pub expected_tx_set_hash: [u8; 32],
+    pub expected_tx_set_hash: Hash,
     /// `entry.header.tx_set_result_hash` — cross-verified against the hash computed
     /// from the result file for the same ledger sequence.
-    pub expected_result_hash: [u8; 32],
+    pub expected_result_hash: Hash,
 }
 
 #[derive(Default)]
 struct PendingCheckpoint {
     header_data: Option<BTreeMap<u32, LedgerHeaderVerificationData>>,
-    tx_set_hashes: Option<HashMap<u32, [u8; 32]>>,
-    result_hashes: Option<HashMap<u32, [u8; 32]>>,
+    tx_set_hashes: Option<BTreeMap<u32, Hash>>,
+    result_hashes: Option<BTreeMap<u32, Hash>>,
 }
 
 #[derive(Debug, Clone)]
 struct CheckpointBoundary {
-    first_prev_hash: [u8; 32],
-    last_computed_hash: [u8; 32],
+    first_prev_hash: Hash,
+    last_computed_hash: Hash,
 }
 
 /// A verification failure detected during cross-file or chain validation.
@@ -152,7 +173,7 @@ impl XdrVerificationManager {
 
     /// Record per-ledger transaction-set hashes parsed from the **transactions**
     /// file of a checkpoint. See [`record_header_data`](Self::record_header_data).
-    pub fn record_tx_set_hashes(&self, checkpoint: u32, hashes: HashMap<u32, [u8; 32]>) {
+    pub fn record_tx_set_hashes(&self, checkpoint: u32, hashes: BTreeMap<u32, Hash>) {
         let mut pending = self.pending.lock().unwrap();
         let entry = pending.entry(checkpoint).or_default();
         entry.tx_set_hashes = Some(hashes);
@@ -160,7 +181,7 @@ impl XdrVerificationManager {
 
     /// Record per-ledger result-set hashes parsed from the **results** file of
     /// a checkpoint. See [`record_header_data`](Self::record_header_data).
-    pub fn record_result_hashes(&self, checkpoint: u32, hashes: HashMap<u32, [u8; 32]>) {
+    pub fn record_result_hashes(&self, checkpoint: u32, hashes: BTreeMap<u32, Hash>) {
         let mut pending = self.pending.lock().unwrap();
         let entry = pending.entry(checkpoint).or_default();
         entry.result_hashes = Some(hashes);
@@ -311,28 +332,28 @@ impl XdrVerificationManager {
     fn verify_tx_set_hashes_internal(
         checkpoint: u32,
         header_data: &BTreeMap<u32, LedgerHeaderVerificationData>,
-        tx_set_hashes: &HashMap<u32, [u8; 32]>,
+        tx_set_hashes: &BTreeMap<u32, Hash>,
     ) -> Vec<VerificationError> {
         let mut errors = Vec::new();
         for (&seq, data) in header_data {
-            let expected = data.expected_tx_set_hash;
+            let expected = &data.expected_tx_set_hash;
 
-            let err_msg = if let Some(&actual) = tx_set_hashes.get(&seq) {
+            let err_msg = if let Some(actual) = tx_set_hashes.get(&seq) {
                 if actual == expected {
                     None
                 } else {
                     Some(format!(
                         "tx set hash mismatch: expected {}, got {}",
-                        hex::encode(expected),
-                        hex::encode(actual),
+                        expected.to_hex(),
+                        actual.to_hex(),
                     ))
                 }
             } else if data.expected_result_hash != EMPTY_XDR_ARRAY_HASH
-                && !is_empty_tx_set_hash(&expected, &data.prev_hash)
+                && !is_empty_tx_set_hash(expected, &data.prev_hash)
             {
                 Some(format!(
                     "missing tx set entry, expected hash {}",
-                    hex::encode(expected),
+                    expected.to_hex(),
                 ))
             } else {
                 None
@@ -361,26 +382,26 @@ impl XdrVerificationManager {
     fn verify_result_hashes_internal(
         checkpoint: u32,
         header_data: &BTreeMap<u32, LedgerHeaderVerificationData>,
-        result_hashes: &HashMap<u32, [u8; 32]>,
+        result_hashes: &BTreeMap<u32, Hash>,
     ) -> Vec<VerificationError> {
         let mut errors = Vec::new();
         for (&seq, data) in header_data {
-            let expected = data.expected_result_hash;
+            let expected = &data.expected_result_hash;
 
-            let err_msg = if let Some(&actual) = result_hashes.get(&seq) {
+            let err_msg = if let Some(actual) = result_hashes.get(&seq) {
                 if actual == expected {
                     None
                 } else {
                     Some(format!(
                         "result set hash mismatch: expected {}, got {}",
-                        hex::encode(expected),
-                        hex::encode(actual),
+                        expected.to_hex(),
+                        actual.to_hex(),
                     ))
                 }
-            } else if expected != EMPTY_XDR_ARRAY_HASH && expected != [0; 32] {
+            } else if *expected != EMPTY_XDR_ARRAY_HASH && *expected != ZERO_HASH {
                 Some(format!(
                     "missing result entry, expected hash {}",
-                    hex::encode(expected),
+                    expected.to_hex(),
                 ))
             } else {
                 None
@@ -428,9 +449,9 @@ impl XdrVerificationManager {
                 } else if prev_data.computed_hash != data.prev_hash {
                     err_msg = Some(format!(
                         "hash chain break: previous_ledger_hash {} != computed hash of ledger {} ({})",
-                        hex::encode(data.prev_hash),
+                        data.prev_hash.to_hex(),
                         prev_seq,
-                        hex::encode(prev_data.computed_hash),
+                        prev_data.computed_hash.to_hex(),
                     ));
                     ledger_seq = Some(seq);
                 }
@@ -477,8 +498,8 @@ impl XdrVerificationManager {
         self.boundaries.lock().unwrap().insert(
             checkpoint,
             CheckpointBoundary {
-                first_prev_hash: first_data.prev_hash,
-                last_computed_hash: last_data.computed_hash,
+                first_prev_hash: first_data.prev_hash.clone(),
+                last_computed_hash: last_data.computed_hash.clone(),
             },
         );
     }
@@ -508,8 +529,8 @@ impl XdrVerificationManager {
                 let err_msg = format!(
                     "hash chain break between checkpoints {prev_checkpoint} and {curr_checkpoint}: \
                      ledger {first_ledger} prev_hash {} != checkpoint {prev_checkpoint} last hash {}",
-                    hex::encode(curr_boundary.first_prev_hash),
-                    hex::encode(prev_boundary.last_computed_hash),
+                    curr_boundary.first_prev_hash.to_hex(),
+                    prev_boundary.last_computed_hash.to_hex(),
                 );
                 error!("{err_msg}");
                 chain_errors.push(VerificationError {
@@ -585,35 +606,27 @@ pub(crate) fn parse_ledger_header_entries_for_checkpoint(
             ))
         })?;
 
-        let computed_hash: [u8; 32] = Sha256::digest(&header_xdr).into();
-        let expected_hash: [u8; 32] = entry.hash.0;
+        let computed_hash = sha256(&header_xdr);
+        let expected_hash = entry.hash;
 
         if computed_hash != expected_hash {
             return Err(StorageError::fatal(format!(
                 "ledger header hash mismatch at seq {}: expected {}, computed {}",
                 seq,
-                hex::encode(expected_hash),
-                hex::encode(computed_hash)
+                expected_hash.to_hex(),
+                computed_hash.to_hex()
             )));
         }
 
-        debug!(
-            "Verified ledger {} hash: {}",
-            seq,
-            hex::encode(computed_hash)
-        );
-
-        let prev_hash: [u8; 32] = entry.header.previous_ledger_hash.0;
-        let tx_set_hash: [u8; 32] = entry.header.scp_value.tx_set_hash.0;
-        let result_hash: [u8; 32] = entry.header.tx_set_result_hash.0;
+        debug!("Verified ledger {} hash: {}", seq, computed_hash.to_hex());
 
         data.insert(
             seq,
             LedgerHeaderVerificationData {
                 computed_hash,
-                prev_hash,
-                expected_tx_set_hash: tx_set_hash,
-                expected_result_hash: result_hash,
+                prev_hash: entry.header.previous_ledger_hash,
+                expected_tx_set_hash: entry.header.scp_value.tx_set_hash,
+                expected_result_hash: entry.header.tx_set_result_hash,
             },
         );
     }
@@ -623,35 +636,35 @@ pub(crate) fn parse_ledger_header_entries_for_checkpoint(
 
 /// Hash of an empty V0 `TransactionSet`: `SHA256(previous_ledger_hash)` —
 /// equivalent to the V0 hash recipe with zero transactions concatenated.
-pub(crate) fn compute_empty_v0_tx_set_hash(previous_ledger_hash: &[u8; 32]) -> [u8; 32] {
-    Sha256::digest(previous_ledger_hash).into()
+pub(crate) fn compute_empty_v0_tx_set_hash(previous_ledger_hash: &Hash) -> Hash {
+    sha256(&previous_ledger_hash.0)
 }
 
 /// Hash of an empty V1 `GeneralizedTransactionSet`: SHA-256 of the
 /// XDR-serialized struct with `previous_ledger_hash` set and no phases.
-pub(crate) fn compute_empty_v1_tx_set_hash(previous_ledger_hash: &[u8; 32]) -> [u8; 32] {
+pub(crate) fn compute_empty_v1_tx_set_hash(previous_ledger_hash: &Hash) -> Hash {
     let empty_v1 = GeneralizedTransactionSet::V1(TransactionSetV1 {
-        previous_ledger_hash: Hash(*previous_ledger_hash),
+        previous_ledger_hash: previous_ledger_hash.clone(),
         phases: VecM::default(),
     });
     let xdr = empty_v1
         .to_xdr(Limits::none())
         .expect("serializing empty GeneralizedTransactionSet should not fail");
-    Sha256::digest(&xdr).into()
+    sha256(&xdr)
 }
 
 /// Whether `expected` is one of the recognized "no transactions in this ledger"
 /// markers, given the ledger's `prev_hash`.
 ///
 /// Treated as empty if `expected` matches any of:
-/// - all-zero hash (`[0; 32]`)
+/// - all-zero hash ([`ZERO_HASH`])
 /// - [`compute_empty_v0_tx_set_hash`]`(prev_hash)` — empty V0 set
 /// - [`compute_empty_v1_tx_set_hash`]`(prev_hash)` — empty V1 set
 ///
 /// Used by [`verify_tx_set_hashes_internal`](XdrVerificationManager::verify_tx_set_hashes_internal)
 /// to decide whether a missing transactions-file entry is acceptable.
-pub(crate) fn is_empty_tx_set_hash(expected: &[u8; 32], prev_hash: &[u8; 32]) -> bool {
-    *expected == [0; 32]
+pub(crate) fn is_empty_tx_set_hash(expected: &Hash, prev_hash: &Hash) -> bool {
+    *expected == ZERO_HASH
         || *expected == compute_empty_v0_tx_set_hash(prev_hash)
         || *expected == compute_empty_v1_tx_set_hash(prev_hash)
 }
@@ -664,13 +677,13 @@ pub(crate) fn is_empty_tx_set_hash(expected: &[u8; 32], prev_hash: &[u8; 32]) ->
 /// This matches stellar-core's `computeNonGeneralizedTxSetContentsHash()`.
 pub(crate) fn compute_v0_tx_set_hash(
     tx_set: &stellar_xdr::curr::TransactionSet,
-) -> Result<[u8; 32], StorageError> {
+) -> Result<Hash, StorageError> {
     let mut serialized_txs = Vec::with_capacity(tx_set.txs.len());
     for tx in tx_set.txs.iter() {
         let tx_xdr = tx.to_xdr(Limits::none()).map_err(|e| {
             StorageError::fatal(format!("failed to serialize TransactionEnvelope: {}", e))
         })?;
-        let tx_hash: [u8; 32] = Sha256::digest(&tx_xdr).into();
+        let tx_hash = sha256(&tx_xdr);
         serialized_txs.push((tx_hash, tx_xdr));
     }
 
@@ -685,7 +698,7 @@ pub(crate) fn compute_v0_tx_set_hash(
     for (_, tx_xdr) in serialized_txs {
         hasher.update(&tx_xdr);
     }
-    Ok(hasher.finalize().into())
+    Ok(Hash(hasher.finalize().into()))
 }
 
 /// Compute the hash of a V1 GeneralizedTransactionSet.
@@ -694,7 +707,7 @@ pub(crate) fn compute_v0_tx_set_hash(
 /// This matches stellar-core's `xdrSha256(xdrTxSet)`.
 pub(crate) fn compute_v1_tx_set_hash(
     generalized_tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
-) -> Result<[u8; 32], StorageError> {
+) -> Result<Hash, StorageError> {
     let xdr = generalized_tx_set.to_xdr(Limits::none()).map_err(|e| {
         StorageError::fatal(format!(
             "failed to serialize GeneralizedTransactionSet: {}",
@@ -702,7 +715,7 @@ pub(crate) fn compute_v1_tx_set_hash(
         ))
     })?;
 
-    Ok(Sha256::digest(&xdr).into())
+    Ok(sha256(&xdr))
 }
 
 /// Parse decompressed result XDR data, computing `SHA256(tx_result_set.to_xdr())`
@@ -714,10 +727,10 @@ pub(crate) fn compute_v1_tx_set_hash(
 pub(crate) fn parse_result_entries_for_checkpoint(
     decompressed_data: &[u8],
     checkpoint: Option<u32>,
-) -> Result<HashMap<u32, [u8; 32]>, StorageError> {
+) -> Result<BTreeMap<u32, Hash>, StorageError> {
     let cursor = Cursor::new(decompressed_data);
     let mut limited = Limited::new(cursor, Limits::none());
-    let mut hashes = HashMap::new();
+    let mut hashes = BTreeMap::new();
 
     let expected_range = checkpoint.map(expected_ledger_range);
 
@@ -754,12 +767,12 @@ pub(crate) fn parse_result_entries_for_checkpoint(
             ))
         })?;
 
-        let computed_hash: [u8; 32] = Sha256::digest(&result_xdr).into();
+        let computed_hash = sha256(&result_xdr);
 
         debug!(
             "Computed result hash for ledger {}: {}",
             seq,
-            hex::encode(computed_hash)
+            computed_hash.to_hex()
         );
 
         hashes.insert(seq, computed_hash);
@@ -795,7 +808,7 @@ pub async fn parse_ledger_header_stream(
 pub async fn parse_results_stream(
     path: &str,
     reader: Reader,
-) -> Result<HashMap<u32, [u8; 32]>, StorageError> {
+) -> Result<BTreeMap<u32, Hash>, StorageError> {
     let decompressed = decompress_to_buffer(path, reader).await?;
     parse_result_entries_for_checkpoint(&decompressed, history_format::checkpoint_from_path(path))
 }
@@ -811,10 +824,10 @@ pub async fn parse_results_stream(
 pub(crate) fn parse_transaction_entries_for_checkpoint(
     decompressed_data: &[u8],
     checkpoint: Option<u32>,
-) -> Result<HashMap<u32, [u8; 32]>, StorageError> {
+) -> Result<BTreeMap<u32, Hash>, StorageError> {
     let cursor = Cursor::new(decompressed_data);
     let mut limited = Limited::new(cursor, Limits::none());
-    let mut hashes = HashMap::new();
+    let mut hashes = BTreeMap::new();
 
     let expected_range = checkpoint.map(expected_ledger_range);
 
@@ -851,7 +864,7 @@ pub(crate) fn parse_transaction_entries_for_checkpoint(
         debug!(
             "Computed tx set hash for ledger {}: {}",
             seq,
-            hex::encode(computed_hash)
+            computed_hash.to_hex()
         );
 
         hashes.insert(seq, computed_hash);
@@ -879,7 +892,7 @@ pub fn parse_scp_entries(decompressed_data: &[u8]) -> Result<(), StorageError> {
 pub async fn parse_transactions_stream(
     path: &str,
     reader: Reader,
-) -> Result<HashMap<u32, [u8; 32]>, StorageError> {
+) -> Result<BTreeMap<u32, Hash>, StorageError> {
     let decompressed = decompress_to_buffer(path, reader).await?;
     parse_transaction_entries_for_checkpoint(
         &decompressed,
@@ -898,8 +911,8 @@ pub async fn parse_scp_stream(path: &str, reader: Reader) -> Result<(), StorageE
 /// `None` is returned for SCP files and unrecognized file types.
 pub enum XdrParseResult {
     Ledger(BTreeMap<u32, LedgerHeaderVerificationData>),
-    Transactions(HashMap<u32, [u8; 32]>),
-    Results(HashMap<u32, [u8; 32]>),
+    Transactions(BTreeMap<u32, Hash>),
+    Results(BTreeMap<u32, Hash>),
     None,
 }
 
