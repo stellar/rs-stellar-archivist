@@ -529,17 +529,11 @@ impl Default for XdrVerificationManager {
 ///
 /// For each frame, verifies `SHA256(header.to_xdr()) == entry.hash` and extracts
 /// the `prev_hash`, `tx_set_hash`, and `result_hash` fields for cross-file checks.
+/// When `checkpoint` is `Some`, also rejects ledger sequences outside the
+/// expected range.
 ///
 /// Returns a fatal error on hash mismatch, duplicate sequence, or malformed XDR.
 /// Empty input returns an empty map (valid for checkpoints with no ledger file).
-pub fn parse_ledger_entries(
-    decompressed_data: &[u8],
-) -> Result<BTreeMap<u32, LedgerVerificationData>, StorageError> {
-    parse_ledger_entries_for_checkpoint(decompressed_data, None)
-}
-
-/// Same as [`parse_ledger_entries`] but additionally rejects ledger sequences
-/// outside the expected range when `checkpoint` is provided.
 pub(crate) fn parse_ledger_entries_for_checkpoint(
     decompressed_data: &[u8],
     checkpoint: Option<u32>,
@@ -702,17 +696,10 @@ pub(crate) fn compute_v1_tx_set_hash(
 
 /// Parse decompressed result XDR data, computing `SHA256(tx_result_set.to_xdr())`
 /// per ledger. These hashes are cross-verified against `expected_result_hash` from
-/// the ledger headers.
+/// the ledger headers. When `checkpoint` is `Some`, rejects ledger sequences
+/// outside the expected range.
 ///
 /// Returns a fatal error on duplicate sequence, out-of-range sequence, or malformed XDR.
-pub fn parse_result_entries(
-    decompressed_data: &[u8],
-) -> Result<HashMap<u32, [u8; 32]>, StorageError> {
-    parse_result_entries_for_checkpoint(decompressed_data, None)
-}
-
-/// Same as [`parse_result_entries`] but additionally rejects ledger sequences
-/// outside the expected range when `checkpoint` is provided.
 pub(crate) fn parse_result_entries_for_checkpoint(
     decompressed_data: &[u8],
     checkpoint: Option<u32>,
@@ -772,10 +759,7 @@ pub(crate) fn parse_result_entries_for_checkpoint(
 
 /// Decompress a gzipped reader into an in-memory `Vec<u8>`. No write side —
 /// thin wrapper over [`decompress_and_write_internal`] with `writer = None`.
-pub(crate) async fn decompress_to_buffer(
-    path: &str,
-    reader: Reader,
-) -> Result<Vec<u8>, StorageError> {
+async fn decompress_to_buffer(path: &str, reader: Reader) -> Result<Vec<u8>, StorageError> {
     // the writer is None, thus the return sink is also None, which is safe to
     // be discarded
     let (decompressed, _) = decompress_and_write_internal(path, reader, None).await?;
@@ -806,17 +790,10 @@ pub async fn parse_results_stream(
 /// V0 entries: `SHA256(prev_hash || tx1_xdr || ... || txN_xdr)`.
 /// V1 entries: `SHA256(GeneralizedTransactionSet.to_xdr())`.
 /// These hashes are cross-verified against `expected_tx_set_hash` from the ledger headers.
+/// When `checkpoint` is `Some`, rejects ledger sequences outside the expected range.
 ///
 /// Returns a fatal error on duplicate sequence, out-of-range sequence, malformed XDR,
 /// or V0 transactions not in hash-sorted order.
-pub fn parse_transaction_entries(
-    decompressed_data: &[u8],
-) -> Result<HashMap<u32, [u8; 32]>, StorageError> {
-    parse_transaction_entries_for_checkpoint(decompressed_data, None)
-}
-
-/// Same as [`parse_transaction_entries`] but additionally rejects ledger
-/// sequences outside the expected range when `checkpoint` is provided.
 pub(crate) fn parse_transaction_entries_for_checkpoint(
     decompressed_data: &[u8],
     checkpoint: Option<u32>,
