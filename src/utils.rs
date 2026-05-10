@@ -1,6 +1,5 @@
 use bytes::Buf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -107,7 +106,7 @@ pub struct ArchiveStats {
     pub missing_scp: AtomicU64,
 
     // List of all failed/missing files for detailed reporting
-    pub failed_list: Arc<tokio::sync::Mutex<Vec<String>>>,
+    pub failed_list: tokio::sync::Mutex<Vec<String>>,
 }
 
 impl Default for ArchiveStats {
@@ -131,7 +130,7 @@ impl ArchiveStats {
             missing_results: AtomicU64::new(0),
             missing_buckets: AtomicU64::new(0),
             missing_scp: AtomicU64::new(0),
-            failed_list: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            failed_list: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
