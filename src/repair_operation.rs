@@ -215,7 +215,7 @@ impl RepairOperation {
                     }
                 };
             }
-            if history_format::is_ledger_file(path)
+            if history_format::is_ledger_header_file(path)
                 || history_format::is_transactions_file(path)
                 || history_format::is_results_file(path)
                 || history_format::is_scp_file(path)
@@ -272,11 +272,11 @@ impl RepairOperation {
 
         // XDR file types: parse into a uniform `XdrParseResult` and route
         // recording through the shared `record_result` helper.
-        let parsed = if history_format::is_ledger_file(path) {
+        let parsed = if history_format::is_ledger_header_file(path) {
             let Ok(reader) = self.dst_store.open_reader(path).await else {
                 return Ok(false);
             };
-            match xdr_verify::parse_ledger_stream(path, reader).await {
+            match xdr_verify::parse_ledger_header_stream(path, reader).await {
                 Ok(data) => XdrParseResult::Ledger(data),
                 Err(_) => return Ok(false),
             }
@@ -319,7 +319,7 @@ impl RepairOperation {
             return;
         };
         match result {
-            XdrParseResult::Ledger(data) => manager.record_ledger_data(cp, data),
+            XdrParseResult::Ledger(data) => manager.record_header_data(cp, data),
             XdrParseResult::Transactions(hashes) => manager.record_tx_set_hashes(cp, hashes),
             XdrParseResult::Results(hashes) => manager.record_result_hashes(cp, hashes),
             XdrParseResult::None => {}

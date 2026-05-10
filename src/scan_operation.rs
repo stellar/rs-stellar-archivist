@@ -99,10 +99,10 @@ impl Operation for ScanOperation {
             let reader = src_store.open_reader(path).await?;
             if crate::history_format::is_bucket_file(path) {
                 crate::verify::verify_bucket_stream(path, reader).await
-            } else if crate::history_format::is_ledger_file(path) {
+            } else if crate::history_format::is_ledger_header_file(path) {
                 let checkpoint = Self::checkpoint_from_verified_path(path)?;
-                let data = crate::xdr_verify::parse_ledger_stream(path, reader).await?;
-                manager.record_ledger_data(checkpoint, data);
+                let data = crate::xdr_verify::parse_ledger_header_stream(path, reader).await?;
+                manager.record_header_data(checkpoint, data);
                 Ok(())
             } else if crate::history_format::is_transactions_file(path) {
                 let checkpoint = Self::checkpoint_from_verified_path(path)?;

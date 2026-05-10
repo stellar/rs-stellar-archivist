@@ -391,7 +391,7 @@ impl Operation for MirrorOperation {
                         Err(e)
                     }
                 }
-            } else if crate::history_format::is_ledger_file(path)
+            } else if crate::history_format::is_ledger_header_file(path)
                 || crate::history_format::is_transactions_file(path)
                 || crate::history_format::is_results_file(path)
                 || crate::history_format::is_scp_file(path)
@@ -415,7 +415,7 @@ impl Operation for MirrorOperation {
                 };
                 match result {
                     XdrParseResult::Ledger(data) => {
-                        manager.record_ledger_data(checkpoint.unwrap(), data);
+                        manager.record_header_data(checkpoint.unwrap(), data);
                     }
                     XdrParseResult::Transactions(hashes) => {
                         manager.record_tx_set_hashes(checkpoint.unwrap(), hashes);

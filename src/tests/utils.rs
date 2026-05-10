@@ -12,8 +12,8 @@
 use crate::storage::Error as StorageError;
 use crate::utils::{NON_STANDARD_RETRYABLE_HTTP_ERRORS, STANDARD_RETRYABLE_HTTP_ERRORS};
 use crate::xdr_verify::{
-    parse_ledger_entries_for_checkpoint, parse_result_entries_for_checkpoint,
-    parse_transaction_entries_for_checkpoint, LedgerVerificationData,
+    parse_ledger_header_entries_for_checkpoint, parse_result_entries_for_checkpoint,
+    parse_transaction_entries_for_checkpoint, LedgerHeaderVerificationData,
 };
 use axum::{routing::get_service, Router};
 use normalize_path::NormalizePath;
@@ -469,10 +469,10 @@ pub fn transient_http_errors() -> Vec<(u16, &'static str)> {
 // tests when feeding hand-constructed XDR (no real ledger range to enforce).
 //=============================================================================
 
-pub fn parse_ledger_entries(
+pub fn parse_ledger_header_entries(
     decompressed_data: &[u8],
-) -> Result<BTreeMap<u32, LedgerVerificationData>, StorageError> {
-    parse_ledger_entries_for_checkpoint(decompressed_data, None)
+) -> Result<BTreeMap<u32, LedgerHeaderVerificationData>, StorageError> {
+    parse_ledger_header_entries_for_checkpoint(decompressed_data, None)
 }
 
 pub fn parse_result_entries(
