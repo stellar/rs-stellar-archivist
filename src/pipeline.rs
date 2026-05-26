@@ -41,7 +41,9 @@ pub enum Error {
     Other(String),
 }
 
-/// Maximum number of bucket entries to cache in the LRU for deduplication
+/// Max entries in the bucket-dedup LRU. Buckets are content-addressed and the
+/// same hash often appears in many checkpoints' history files; the LRU lets
+/// `process_buckets` skip repeat sightings within one pipeline run.
 const BUCKET_LRU_CACHE_SIZE: usize = 1_000_000;
 
 /// How often to report progress (every N checkpoints)
@@ -131,6 +133,8 @@ pub struct Pipeline<Op: Operation> {
     src_store: StorageRef,
     dst_store: Option<StorageRef>,
     stats: ArchiveStats,
+    /// Hash → () presence cache used by `process_buckets` to skip buckets
+    /// already seen elsewhere in this pipeline run.
     bucket_lru: Mutex<LruCache<String, ()>>,
 }
 
@@ -282,6 +286,11 @@ impl<Op: Operation> Pipeline<Op> {
         }
     }
 
+    /// Process every bucket referenced by `state`, deduped against the
+    /// pipeline-wide `bucket_lru`. The lock is held only across the filter-map
+    /// → collect (CPU-only — `LruCache::put` returns `None` iff the key is
+    /// new); each surviving `process_file` future then runs concurrently
+    /// outside the lock.
     async fn process_buckets(&self, state: HistoryFileState) {
         let bucket_futures: Vec<_> = {
             let mut cache = self.bucket_lru.lock().unwrap();

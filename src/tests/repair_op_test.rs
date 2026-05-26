@@ -14,6 +14,7 @@ use crate::test_helpers::{
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use rstest::rstest;
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::path::Path;
 use tempfile::TempDir;
@@ -835,8 +836,8 @@ async fn test_repair_verify_validates_downloads() {
 // K. Two-Wave Bucket Discovery (history file → bucket reference)
 //=============================================================================
 
-/// Helper: parse a history file and return the bucket hashes it references
-fn buckets_from_history_file(path: &std::path::Path) -> Vec<String> {
+/// Helper: parse a history file and return the bucket hashes it references.
+fn buckets_from_history_file(path: &std::path::Path) -> BTreeSet<String> {
     let content = std::fs::read_to_string(path).expect("Failed to read history file");
     let state: history_format::HistoryFileState =
         serde_json::from_str(&content).expect("Failed to parse history JSON");
@@ -957,7 +958,7 @@ async fn test_repair_missing_history_also_repairs_its_buckets() {
     );
 
     // Find the actual bucket file on disk
-    let bucket_hash = &bucket_hashes[0];
+    let bucket_hash = bucket_hashes.iter().next().unwrap();
     let bucket_files = get_files_by_pattern(dest_dir.path(), &format!("bucket-{bucket_hash}"));
     assert!(!bucket_files.is_empty(), "Bucket file must exist on disk");
     let target_bucket = &bucket_files[0];

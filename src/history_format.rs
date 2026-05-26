@@ -4,6 +4,7 @@
 //! Archive history files.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use thiserror::Error;
 
 // Both Bucket List types have exactly 11 levels
@@ -61,7 +62,10 @@ pub struct HistoryFileState {
     pub hot_archive_buckets: Option<[BucketLevel; NUM_BUCKETLIST_LEVELS]>,
 }
 
-// Bucket state for a single bucketlist level
+/// One level of Stellar's multi-level bucketlist as serialized in
+/// `.well-known/stellar-history.json`: the two committed bucket hashes
+/// (`curr` = current; `snap` = pending downward-merge into the next level)
+/// plus the in-progress merge descriptor (`next`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BucketLevel {
     pub curr: String,
@@ -69,8 +73,22 @@ pub struct BucketLevel {
     pub next: NextState,
 }
 
-// Merge state for bucket level
-// state: 0=idle, 1=running (output), 2=merging (curr/snap/shadow)
+/// In-progress merge state for a [`BucketLevel`]. The bucketlist merges
+/// snap-into-the-next-level incrementally across many ledgers, so a
+/// checkpoint snapshot has to encode wherever the merge happens to be:
+///
+/// - **`state = 0` (idle)**: no merge running. All option fields must be `None`.
+/// - **`state = 1` (running output)**: merge has produced a new bucket;
+///   `output` carries its hash and the resulting file must be backed up.
+///   All other option fields must be `None`.
+/// - **`state = 2` (merging)**: merge is in flight; `curr` and `snap` hold
+///   the merge's input hashes; `shadow` is an optional list of older bucket
+///   hashes shadowing entries during the merge. `output` must be `None`.
+///
+/// [`HistoryFileState::validate_bucket_level`] enforces these field
+/// combinations. [`HistoryFileState::buckets`] harvests only `output` — the
+/// state-2 fields point at buckets already enumerated at adjacent
+/// `BucketLevel`s, so re-collecting them would double-count.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NextState {
     pub state: u32,
@@ -85,7 +103,10 @@ pub struct NextState {
 }
 
 impl HistoryFileState {
-    // Helper function to validate a single bucket level
+    /// Validate one bucket level's hashes and its [`NextState`] field
+    /// combinations per the state-0/1/2 contract documented on
+    /// [`NextState`]. Called by [`Self::validate`] for every level of
+    /// `current_buckets` (and v2 `hot_archive_buckets`).
     fn validate_bucket_level(level: &BucketLevel, index: usize, prefix: &str) -> Result<(), Error> {
         if !is_valid_bucket_hash(&level.curr) {
             return Err(Error::MalformedBucketHash {
@@ -251,45 +272,35 @@ impl HistoryFileState {
         Ok(())
     }
 
-    // Extract all unique bucket hashes from current state, except for empty buckets with 0 hash
+    /// Every unique non-zero bucket hash this checkpoint references — the
+    /// backup set for this checkpoint. From each [`BucketLevel`] we take
+    /// `curr`, `snap`, and `next.output` (the only [`NextState`] field that
+    /// can introduce a bucket not already enumerated at some other level —
+    /// see the [`NextState`] doc).
     #[must_use]
-    pub fn buckets(&self) -> Vec<String> {
-        let mut result = Vec::new();
-
-        // Collect from currentBuckets
-        for level in &self.current_buckets {
-            if !level.curr.is_empty() && !is_zero_hash(&level.curr) {
-                result.push(level.curr.clone());
-            }
-            if !level.snap.is_empty() && !is_zero_hash(&level.snap) {
-                result.push(level.snap.clone());
-            }
-            if let Some(output) = &level.next.output {
-                if !output.is_empty() && !is_zero_hash(output) {
-                    result.push(output.clone());
-                }
-            }
-        }
-
-        // Collect from hotArchiveBuckets if present (version 2)
-        if let Some(ref hot_buckets) = self.hot_archive_buckets {
-            for level in hot_buckets {
+    pub(crate) fn buckets(&self) -> BTreeSet<String> {
+        let mut result = BTreeSet::new();
+        let mut push_levels = |levels: &[BucketLevel]| {
+            for level in levels {
                 if !level.curr.is_empty() && !is_zero_hash(&level.curr) {
-                    result.push(level.curr.clone());
+                    result.insert(level.curr.clone());
                 }
                 if !level.snap.is_empty() && !is_zero_hash(&level.snap) {
-                    result.push(level.snap.clone());
+                    result.insert(level.snap.clone());
                 }
                 if let Some(output) = &level.next.output {
                     if !output.is_empty() && !is_zero_hash(output) {
-                        result.push(output.clone());
+                        result.insert(output.clone());
                     }
                 }
             }
+        };
+
+        push_levels(&self.current_buckets);
+        if let Some(ref hot_buckets) = self.hot_archive_buckets {
+            push_levels(hot_buckets);
         }
 
-        result.sort();
-        result.dedup();
         result
     }
 
