@@ -1,6 +1,6 @@
 use crate::history_format;
 use crate::pipeline::{async_trait, Operation};
-use crate::storage::{from_opendal_error, Error as StorageError, StorageRef};
+use crate::storage::{from_opendal_error, Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
 use opendal::Buffer;
@@ -29,9 +29,8 @@ pub struct ScanOperation {
     low: Option<u32>,
     high: Option<u32>,
 
-    // Retry configuration for source fetches
-    max_retries: u32,
-    retry_min_delay_ms: u64,
+    // Storage configuration (retry params for source fetches live here)
+    storage_config: StorageConfig,
 
     // Populated if we should verify files, otherwise None
     verification_manager: Option<Arc<XdrVerificationManager>>,
@@ -41,15 +40,13 @@ impl ScanOperation {
     pub fn new(
         low: Option<u32>,
         high: Option<u32>,
-        max_retries: u32,
-        retry_min_delay_ms: u64,
+        storage_config: &StorageConfig,
         verify: bool,
     ) -> Self {
         Self {
             low,
             high,
-            max_retries,
-            retry_min_delay_ms,
+            storage_config: storage_config.clone(),
             verification_manager: if verify {
                 Some(Arc::new(XdrVerificationManager::new()))
             } else {
@@ -82,10 +79,13 @@ impl Operation for ScanOperation {
         &self,
         source: &StorageRef,
     ) -> Result<(u32, u32), crate::pipeline::Error> {
-        let source_state =
-            fetch_well_known_history_file(source, self.max_retries, self.retry_min_delay_ms)
-                .await
-                .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))?;
+        let source_state = fetch_well_known_history_file(
+            source,
+            self.storage_config.max_retries as u32,
+            self.storage_config.retry_min_delay.as_millis() as u64,
+        )
+        .await
+        .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))?;
         let source_checkpoint =
             history_format::round_to_lower_checkpoint(source_state.current_ledger);
 

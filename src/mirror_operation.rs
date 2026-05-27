@@ -48,9 +48,8 @@ pub struct MirrorOperation {
     high: Option<u32>,
     allow_mirror_gaps: bool,
 
-    // Retry configuration for source fetches
-    max_retries: u32,
-    retry_min_delay_ms: u64,
+    // Storage configuration (retry params for fetches live here)
+    storage_config: StorageConfig,
 
     // Cached destination checkpoint at start of operation (or None if destination doesn't exist)
     initial_dest_checkpoint: OnceCell<Option<u32>>,
@@ -80,8 +79,7 @@ impl MirrorOperation {
             low,
             high,
             allow_mirror_gaps,
-            max_retries: storage_config.max_retries as u32,
-            retry_min_delay_ms: storage_config.retry_min_delay.as_millis() as u64,
+            storage_config: storage_config.clone(),
             initial_dest_checkpoint: OnceCell::new(),
             verification_manager: if verify {
                 Some(Arc::new(XdrVerificationManager::new()))
@@ -100,8 +98,8 @@ impl MirrorOperation {
                 // Try to read the destination's .well-known file
                 match fetch_well_known_history_file(
                     &self.dst_store,
-                    self.max_retries,
-                    self.retry_min_delay_ms,
+                    self.storage_config.max_retries as u32,
+                    self.storage_config.retry_min_delay.as_millis() as u64,
                 )
                 .await
                 {
@@ -241,10 +239,13 @@ impl Operation for MirrorOperation {
         //    - If destination doesn't exist: start from genesis checkpoint
 
         // First, get the source's latest checkpoint to know what's available
-        let source_state =
-            fetch_well_known_history_file(source, self.max_retries, self.retry_min_delay_ms)
-                .await
-                .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
+        let source_state = fetch_well_known_history_file(
+            source,
+            self.storage_config.max_retries as u32,
+            self.storage_config.retry_min_delay.as_millis() as u64,
+        )
+        .await
+        .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
         let source_checkpoint =
             history_format::round_to_lower_checkpoint(source_state.current_ledger);
 

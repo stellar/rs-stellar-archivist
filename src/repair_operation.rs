@@ -80,8 +80,6 @@ pub struct RepairOperation {
     concurrency: usize,
     skip_optional: bool,
     storage_config: StorageConfig,
-    max_retries: u32,
-    retry_min_delay_ms: u64,
     /// Verification manager — populated only when `verify` is on. Records
     /// per-file XDR data (from dst-first parse or src-fetched verify) so that
     /// `finalize_checkpoint` can run cross-file checks and `finalize` can run
@@ -123,8 +121,6 @@ impl RepairOperation {
             concurrency,
             skip_optional,
             storage_config: storage_config.clone(),
-            max_retries: storage_config.max_retries as u32,
-            retry_min_delay_ms: storage_config.retry_min_delay.as_millis() as u64,
             verification_manager: if verify {
                 Some(Arc::new(XdrVerificationManager::new()))
             } else {
@@ -162,8 +158,8 @@ impl RepairOperation {
                 let completed = &completed;
                 async move {
                     let result = utils::with_retries(
-                        self.max_retries,
-                        self.retry_min_delay_ms,
+                        self.storage_config.max_retries as u32,
+                        self.storage_config.retry_min_delay.as_millis() as u64,
                         "repair",
                         path,
                         || async { self.fetch_from_src(path).await.map(|_| ()) },
@@ -411,7 +407,7 @@ impl Operation for RepairOperation {
         let dst_result = utils::fetch_well_known_history_file(
             &self.dst_store,
             0, // no retries for local filesystem
-            self.retry_min_delay_ms,
+            self.storage_config.retry_min_delay.as_millis() as u64,
         )
         .await;
 
@@ -427,8 +423,8 @@ impl Operation for RepairOperation {
                 // Fall back to source .well-known
                 let src_state = utils::fetch_well_known_history_file(
                     source,
-                    self.max_retries,
-                    self.retry_min_delay_ms,
+                    self.storage_config.max_retries as u32,
+                    self.storage_config.retry_min_delay.as_millis() as u64,
                 )
                 .await
                 .map_err(|e| pipeline::Error::RepairOperation(Error::Utils(e)))?;

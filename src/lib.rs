@@ -251,8 +251,7 @@ pub mod test_helpers {
         let operation = ScanOperation::new(
             config.low,
             config.high,
-            config.storage_config.max_retries as u32,
-            config.storage_config.retry_min_delay.as_millis() as u64,
+            &config.storage_config,
             config.verify,
         );
 
