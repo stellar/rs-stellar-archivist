@@ -27,7 +27,7 @@ use crate::history_format;
 use crate::mirror_operation::MirrorOperation;
 use crate::pipeline::{self, async_trait, Operation, Pipeline, PipelineConfig};
 use crate::storage::{
-    self, cleanup_partial_file, Error as StorageError, StorageConfig, StorageRef,
+    self, cleanup_partial_file, Error as StorageError, ErrorClass, StorageConfig, StorageRef,
 };
 use crate::utils::{self, ArchiveStats};
 use crate::xdr_verify::{self, XdrParseResult, XdrVerificationManager};
@@ -241,70 +241,98 @@ impl RepairOperation {
     /// Check whether dst already has a good copy of `path` and (when `--verify`
     /// is on) record the parsed data into the manager.
     ///
-    /// Returns `Ok(true)` if dst is acceptable (caller should skip src fetch),
-    /// `Ok(false)` on missing or corrupt dst (caller should fetch from src),
-    /// or `Err` if `path` doesn't match any recognized archive file type
-    /// (a contract violation from the pipeline's dispatch).
+    /// Returns:
+    /// - `Ok(true)` — dst is acceptable; caller skips src fetch.
+    /// - `Ok(false)` — dst is missing or corrupt; caller should fetch from src.
+    ///   NotFound on `open_reader`/`exists()` is treated as "missing" so the
+    ///   repair can fetch from src immediately. Same for parse failures on a
+    ///   present-but-corrupt file.
+    /// - `Err(StorageError)` — non-NotFound storage error on the dst probe
+    ///   (permission denied, transient I/O, malformed backend response, etc.),
+    ///   OR `path` doesn't match any recognized archive file type (contract
+    ///   violation). The pipeline wraps `process_object` in `with_retries`, so
+    ///   transient errors (`ErrorClass::Retry`) are retried automatically. If
+    ///   the error persists after retries there's a real filesystem issue at
+    ///   `path`; fetching from src is likely to fail too, so we record the
+    ///   failure and move on instead of attempting a src fetch under broken
+    ///   conditions.
     ///
     /// When `--verify` is off, only existence is checked — content is not
     /// validated and nothing is recorded into the manager.
     async fn verify_and_record_dst(&self, path: &str) -> Result<bool, StorageError> {
         if !self.verify {
-            return Ok(self.dst_store.exists(path).await.unwrap_or(false));
+            return match self.dst_store.exists(path).await {
+                Ok(present) => Ok(present),
+                Err(e) if e.class == ErrorClass::NotFound => Ok(false),
+                Err(e) => Err(e),
+            };
         }
 
         // Buckets and SCP files have no per-checkpoint manager state — verify
         // structurally on dst, no recording.
         if history_format::is_bucket_file(path) {
-            let Ok(reader) = self.dst_store.open_reader(path).await else {
-                return Ok(false);
+            return match self.dst_store.open_reader(path).await {
+                Ok(reader) => Ok(crate::verify::verify_bucket_stream(path, reader)
+                    .await
+                    .is_ok()),
+                Err(e) if e.class == ErrorClass::NotFound => Ok(false),
+                Err(e) => Err(e),
             };
-            return Ok(crate::verify::verify_bucket_stream(path, reader)
-                .await
-                .is_ok());
         }
         if history_format::is_scp_file(path) {
-            let Ok(reader) = self.dst_store.open_reader(path).await else {
-                return Ok(false);
+            return match self.dst_store.open_reader(path).await {
+                Ok(reader) => Ok(xdr_verify::parse_scp_stream(path, reader).await.is_ok()),
+                Err(e) if e.class == ErrorClass::NotFound => Ok(false),
+                Err(e) => Err(e),
             };
-            return Ok(xdr_verify::parse_scp_stream(path, reader).await.is_ok());
         }
 
-        // XDR file types: parse into a uniform `XdrParseResult` and route
-        // recording through the shared `record_result` helper.
-        let parsed = if history_format::is_ledger_header_file(path) {
-            let Ok(reader) = self.dst_store.open_reader(path).await else {
-                return Ok(false);
+        // XDR file types: open, parse, and route recording through the shared
+        // `record_result` helper inside the success arm.
+        if history_format::is_ledger_header_file(path) {
+            return match self.dst_store.open_reader(path).await {
+                Ok(reader) => match xdr_verify::parse_ledger_header_stream(path, reader).await {
+                    Ok(data) => {
+                        self.record_result(path, XdrParseResult::Ledger(data));
+                        Ok(true)
+                    }
+                    Err(_) => Ok(false),
+                },
+                Err(e) if e.class == ErrorClass::NotFound => Ok(false),
+                Err(e) => Err(e),
             };
-            match xdr_verify::parse_ledger_header_stream(path, reader).await {
-                Ok(data) => XdrParseResult::Ledger(data),
-                Err(_) => return Ok(false),
-            }
-        } else if history_format::is_transactions_file(path) {
-            let Ok(reader) = self.dst_store.open_reader(path).await else {
-                return Ok(false);
+        }
+        if history_format::is_transactions_file(path) {
+            return match self.dst_store.open_reader(path).await {
+                Ok(reader) => match xdr_verify::parse_transactions_stream(path, reader).await {
+                    Ok(hashes) => {
+                        self.record_result(path, XdrParseResult::Transactions(hashes));
+                        Ok(true)
+                    }
+                    Err(_) => Ok(false),
+                },
+                Err(e) if e.class == ErrorClass::NotFound => Ok(false),
+                Err(e) => Err(e),
             };
-            match xdr_verify::parse_transactions_stream(path, reader).await {
-                Ok(hashes) => XdrParseResult::Transactions(hashes),
-                Err(_) => return Ok(false),
-            }
-        } else if history_format::is_results_file(path) {
-            let Ok(reader) = self.dst_store.open_reader(path).await else {
-                return Ok(false);
+        }
+        if history_format::is_results_file(path) {
+            return match self.dst_store.open_reader(path).await {
+                Ok(reader) => match xdr_verify::parse_results_stream(path, reader).await {
+                    Ok(hashes) => {
+                        self.record_result(path, XdrParseResult::Results(hashes));
+                        Ok(true)
+                    }
+                    Err(_) => Ok(false),
+                },
+                Err(e) if e.class == ErrorClass::NotFound => Ok(false),
+                Err(e) => Err(e),
             };
-            match xdr_verify::parse_results_stream(path, reader).await {
-                Ok(hashes) => XdrParseResult::Results(hashes),
-                Err(_) => return Ok(false),
-            }
-        } else {
-            return Err(StorageError::fatal(format!(
-                "verify_and_record_dst: unrecognized archive path '{path}' \
-                 (expected bucket / ledger / transactions / results / scp)"
-            )));
-        };
+        }
 
-        self.record_result(path, parsed);
-        Ok(true)
+        Err(StorageError::fatal(format!(
+            "verify_and_record_dst: unrecognized archive path '{path}' \
+             (expected bucket / ledger / transactions / results / scp)"
+        )))
     }
 
     /// Record a parsed XDR result into the verification manager. Used for both

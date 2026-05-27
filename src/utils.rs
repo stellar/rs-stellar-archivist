@@ -187,7 +187,7 @@ impl ArchiveStats {
             );
         } else if operation == "repair" {
             info!(
-                "Repair completed: {} files downloaded, {} failed",
+                "Repair completed: {} files processed, {} failed",
                 successful, failed
             );
         } else {
