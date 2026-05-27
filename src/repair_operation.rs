@@ -634,6 +634,19 @@ fn report_dry_run(files: &[String]) {
 }
 
 /// Validate a JSON file list for manual repair mode.
+///
+/// Each entry must be a recognized archive path — `.well-known/stellar-history.json`
+/// or one of the per-category checkpoint/bucket paths under `history/`,
+/// `ledger/`, `transactions/`, `results/`, `scp/`, or `bucket/`. This prevents
+/// path traversal: manual-mode paths flow into `dst_store.copy_from_reader`,
+/// which on filesystem-backed destinations joins onto the archive root, so
+/// arbitrary input like `../../etc/foo` or `/absolute/path` would otherwise
+/// allow writes outside the archive.
+///
+/// Defense-in-depth: also reject any path containing `..` segments, a leading
+/// `/`, or a backslash, even if the per-category predicate were to drift in
+/// the future. Empty strings are skipped (legacy behavior). Duplicates are
+/// deduped.
 pub fn validate_file_list(file_list: &[String]) -> Result<Vec<String>, Error> {
     let mut seen = HashSet::new();
     let mut result = Vec::new();
@@ -641,6 +654,37 @@ pub fn validate_file_list(file_list: &[String]) -> Result<Vec<String>, Error> {
         if path.is_empty() {
             continue;
         }
+
+        // Path-traversal guards. Reject anything that looks like an absolute
+        // path, a Windows path separator, or contains a `..` segment.
+        if path.starts_with('/') || path.contains('\\') {
+            return Err(Error::InvalidFileList(format!(
+                "path '{path}' must be a relative archive path \
+                 (no leading '/', no '\\\\' separators)"
+            )));
+        }
+        if path.split('/').any(|seg| seg == "..") {
+            return Err(Error::InvalidFileList(format!(
+                "path '{path}' contains '..' segment; archive paths must not traverse"
+            )));
+        }
+
+        // Must be a recognized archive path shape.
+        let recognized = path == history_format::ROOT_WELL_KNOWN_PATH
+            || history_format::is_history_file(path)
+            || history_format::is_ledger_header_file(path)
+            || history_format::is_transactions_file(path)
+            || history_format::is_results_file(path)
+            || history_format::is_scp_file(path)
+            || history_format::is_bucket_file(path);
+        if !recognized {
+            return Err(Error::InvalidFileList(format!(
+                "path '{path}' is not a recognized archive path \
+                 (expected .well-known/stellar-history.json or a file under \
+                 history/ ledger/ transactions/ results/ scp/ bucket/)"
+            )));
+        }
+
         if seen.insert(path.clone()) {
             result.push(path.clone());
         }
@@ -707,6 +751,64 @@ mod tests {
         ];
         let result = validate_file_list(&list).unwrap();
         assert_eq!(result.len(), 1);
+    }
+
+    #[test]
+    fn test_validate_file_list_accepts_all_recognized_kinds() {
+        let list = vec![
+            ".well-known/stellar-history.json".to_string(),
+            "history/00/00/3f/history-0000003f.json".to_string(),
+            "ledger/00/00/3f/ledger-0000003f.xdr.gz".to_string(),
+            "transactions/00/00/3f/transactions-0000003f.xdr.gz".to_string(),
+            "results/00/00/3f/results-0000003f.xdr.gz".to_string(),
+            "scp/00/00/3f/scp-0000003f.xdr.gz".to_string(),
+            "bucket/ab/cd/ef/bucket-abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890.xdr.gz".to_string(),
+        ];
+        let result = validate_file_list(&list).unwrap();
+        assert_eq!(result.len(), 7);
+    }
+
+    #[test]
+    fn test_validate_file_list_rejects_path_traversal() {
+        let list = vec!["ledger/../etc/passwd".to_string()];
+        let err = validate_file_list(&list).unwrap_err().to_string();
+        assert!(err.contains(".."), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_file_list_rejects_path_traversal_at_start() {
+        let list = vec!["../escape.txt".to_string()];
+        let err = validate_file_list(&list).unwrap_err().to_string();
+        assert!(err.contains(".."), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_file_list_rejects_absolute_path() {
+        let list = vec!["/etc/passwd".to_string()];
+        let err = validate_file_list(&list).unwrap_err().to_string();
+        assert!(err.contains("relative"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_file_list_rejects_backslash() {
+        let list = vec!["ledger\\foo.xdr.gz".to_string()];
+        let err = validate_file_list(&list).unwrap_err().to_string();
+        assert!(err.contains("relative"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_file_list_rejects_unknown_prefix() {
+        let list = vec!["garbage/foo.xdr.gz".to_string()];
+        let err = validate_file_list(&list).unwrap_err().to_string();
+        assert!(err.contains("not a recognized"), "got: {err}");
+    }
+
+    #[test]
+    fn test_validate_file_list_rejects_bucket_with_bad_hash() {
+        // Right prefix, but the hash isn't 64 hex chars → is_bucket_file returns false.
+        let list = vec!["bucket/ab/cd/ef/bucket-shorthash.xdr.gz".to_string()];
+        let err = validate_file_list(&list).unwrap_err().to_string();
+        assert!(err.contains("not a recognized"), "got: {err}");
     }
 
     #[test]

@@ -496,6 +496,16 @@ pub fn is_bucket_file(path: &str) -> bool {
         && bucket_hash_from_path(path).is_some()
 }
 
+/// Check if a path is a checkpoint history JSON file (under `history/`).
+/// Excludes the singleton `.well-known/stellar-history.json` (root) — that
+/// is matched directly against [`ROOT_WELL_KNOWN_PATH`].
+pub fn is_history_file(path: &str) -> bool {
+    path.starts_with("history/")
+        && std::path::Path::new(path)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+}
+
 /// Check if a path is a ledger-header file (under `ledger/`, containing
 /// `LedgerHeaderHistoryEntry` frames — NOT bucket-resident `LedgerEntry`s).
 pub fn is_ledger_header_file(path: &str) -> bool {
