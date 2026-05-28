@@ -1064,6 +1064,25 @@ pub async fn download_buffer(store: &StorageRef, path: &str) -> Result<opendal::
     Ok(chunks.into_iter().flatten().collect())
 }
 
+/// Write `buffer` to `store` at `path`. On write failure, attempt to clean up
+/// any partial file left behind (logging but not propagating cleanup errors)
+/// and return the original write error.
+pub async fn write_buffer_with_cleanup(
+    store: &StorageRef,
+    path: &str,
+    buffer: opendal::Buffer,
+) -> Result<(), Error> {
+    match store.write(path, buffer).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if let Err(cleanup_err) = cleanup_partial_file(store, path).await {
+                tracing::error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Clean up a partial file on the destination after a write failure.
 /// No-op on atomic-write backends (temp file is discarded automatically).
 pub async fn cleanup_partial_file(store: &StorageRef, path: &str) -> Result<(), Error> {

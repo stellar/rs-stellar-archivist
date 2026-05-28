@@ -1,8 +1,9 @@
 use crate::history_format;
 use crate::pipeline::{async_trait, Operation};
-use crate::storage::{from_opendal_error, Error as StorageError, StorageRef};
+use crate::storage::{from_opendal_error, Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
+use opendal::Buffer;
 use opendal::Reader;
 use std::sync::Arc;
 use thiserror::Error;
@@ -28,9 +29,8 @@ pub struct ScanOperation {
     low: Option<u32>,
     high: Option<u32>,
 
-    // Retry configuration for source fetches
-    max_retries: u32,
-    retry_min_delay_ms: u64,
+    // Storage configuration (retry params for source fetches live here)
+    storage_config: StorageConfig,
 
     // Populated if we should verify files, otherwise None
     verification_manager: Option<Arc<XdrVerificationManager>>,
@@ -40,15 +40,13 @@ impl ScanOperation {
     pub fn new(
         low: Option<u32>,
         high: Option<u32>,
-        max_retries: u32,
-        retry_min_delay_ms: u64,
+        storage_config: &StorageConfig,
         verify: bool,
     ) -> Self {
         Self {
             low,
             high,
-            max_retries,
-            retry_min_delay_ms,
+            storage_config: storage_config.clone(),
             verification_manager: if verify {
                 Some(Arc::new(XdrVerificationManager::new()))
             } else {
@@ -81,10 +79,13 @@ impl Operation for ScanOperation {
         &self,
         source: &StorageRef,
     ) -> Result<(u32, u32), crate::pipeline::Error> {
-        let source_state =
-            fetch_well_known_history_file(source, self.max_retries, self.retry_min_delay_ms)
-                .await
-                .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))?;
+        let source_state = fetch_well_known_history_file(
+            source,
+            self.storage_config.max_retries as u32,
+            self.storage_config.retry_min_delay.as_millis() as u64,
+        )
+        .await
+        .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))?;
         let source_checkpoint =
             history_format::round_to_lower_checkpoint(source_state.current_ledger);
 
@@ -98,10 +99,10 @@ impl Operation for ScanOperation {
             let reader = src_store.open_reader(path).await?;
             if crate::history_format::is_bucket_file(path) {
                 crate::verify::verify_bucket_stream(path, reader).await
-            } else if crate::history_format::is_ledger_file(path) {
+            } else if crate::history_format::is_ledger_header_file(path) {
                 let checkpoint = Self::checkpoint_from_verified_path(path)?;
-                let data = crate::xdr_verify::parse_ledger_stream(path, reader).await?;
-                manager.record_ledger_data(checkpoint, data);
+                let data = crate::xdr_verify::parse_ledger_header_stream(path, reader).await?;
+                manager.record_header_data(checkpoint, data);
                 Ok(())
             } else if crate::history_format::is_transactions_file(path) {
                 let checkpoint = Self::checkpoint_from_verified_path(path)?;
@@ -167,5 +168,10 @@ impl Operation for ScanOperation {
         if let Some(ref manager) = self.verification_manager {
             manager.verify_and_release(checkpoint);
         }
+    }
+
+    /// Scan never writes — record success and discard the buffer.
+    async fn process_buffer(&self, path: &str, _buffer: Buffer, stats: &ArchiveStats) {
+        stats.record_success(path);
     }
 }

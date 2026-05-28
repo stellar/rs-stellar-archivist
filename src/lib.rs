@@ -33,6 +33,7 @@
 pub mod history_format;
 pub mod mirror_operation;
 pub mod pipeline;
+pub mod repair_operation;
 pub mod scan_operation;
 pub mod storage;
 pub mod utils;
@@ -56,6 +57,9 @@ pub enum Error {
     #[error(transparent)]
     ScanOperation(#[from] scan_operation::Error),
 
+    #[error(transparent)]
+    RepairOperation(#[from] repair_operation::Error),
+
     #[error("{0}")]
     Other(String),
 }
@@ -69,6 +73,7 @@ pub mod test_helpers {
     use crate::{
         mirror_operation::MirrorOperation,
         pipeline::{Pipeline, PipelineConfig},
+        repair_operation::RepairOperation,
         scan_operation::ScanOperation,
         storage::StorageConfig,
     };
@@ -246,8 +251,7 @@ pub mod test_helpers {
         let operation = ScanOperation::new(
             config.low,
             config.high,
-            config.storage_config.max_retries as u32,
-            config.storage_config.retry_min_delay.as_millis() as u64,
+            &config.storage_config,
             config.verify,
         );
 
@@ -296,6 +300,134 @@ pub mod test_helpers {
             &config.storage_config,
             config.verify,
         );
+
+        let pipeline_config = PipelineConfig {
+            concurrency: config.concurrency,
+            skip_optional: config.skip_optional,
+            storage_config: config.storage_config,
+        };
+
+        let pipeline = Pipeline::new(operation, pipeline_config, src_store, Some(dst_store));
+        pipeline
+            .run()
+            .await
+            .map_err(crate::utils::map_pipeline_error)
+    }
+
+    pub struct RepairConfig {
+        pub src: String,
+        pub dst: String,
+        pub concurrency: usize,
+        pub skip_optional: bool,
+        pub low: Option<u32>,
+        pub high: Option<u32>,
+        pub verify: bool,
+        pub dry_run: bool,
+        pub file_list: Option<Vec<String>>,
+        pub storage_config: StorageConfig,
+    }
+
+    impl RepairConfig {
+        pub fn new(src: impl Into<String>, dst: impl Into<String>) -> Self {
+            Self {
+                src: src.into(),
+                dst: dst.into(),
+                concurrency: 4,
+                skip_optional: false,
+                low: None,
+                high: None,
+                verify: false,
+                dry_run: false,
+                file_list: None,
+                storage_config: test_storage_config(),
+            }
+        }
+
+        #[must_use]
+        pub fn concurrency(mut self, concurrency: usize) -> Self {
+            self.concurrency = concurrency;
+            self
+        }
+
+        #[must_use]
+        pub fn skip_optional(mut self) -> Self {
+            self.skip_optional = true;
+            self
+        }
+
+        #[must_use]
+        pub fn low(mut self, low: u32) -> Self {
+            self.low = Some(low);
+            self
+        }
+
+        #[must_use]
+        pub fn high(mut self, high: u32) -> Self {
+            self.high = Some(high);
+            self
+        }
+
+        #[must_use]
+        pub fn verify(mut self) -> Self {
+            self.verify = true;
+            self
+        }
+
+        #[must_use]
+        pub fn dry_run(mut self) -> Self {
+            self.dry_run = true;
+            self
+        }
+
+        #[must_use]
+        pub fn files(mut self, list: Vec<String>) -> Self {
+            self.file_list = Some(list);
+            self
+        }
+
+        #[must_use]
+        pub fn storage_config(mut self, config: StorageConfig) -> Self {
+            self.storage_config = config;
+            self
+        }
+    }
+
+    pub async fn run_repair(config: RepairConfig) -> Result<(), crate::Error> {
+        let src_store = crate::storage::from_url_with_config(&config.src, &config.storage_config)
+            .map_err(|e| {
+            crate::Error::Other(format!("Failed to create source backend: {e}"))
+        })?;
+
+        let dst_store = crate::storage::from_url_with_config(&config.dst, &config.storage_config)
+            .map_err(|e| {
+            crate::Error::Other(format!("Failed to create destination backend: {e}"))
+        })?;
+
+        if !dst_store.supports_writes() {
+            return Err(crate::Error::Other(format!(
+                "Destination does not support writes: {}",
+                config.dst
+            )));
+        }
+
+        let operation = RepairOperation::new(
+            src_store.clone(),
+            dst_store.clone(),
+            config.low,
+            config.high,
+            config.verify,
+            config.dry_run,
+            config.concurrency,
+            config.skip_optional,
+            &config.storage_config,
+        );
+
+        if let Some(files) = config.file_list {
+            return operation
+                .run_manual(&files)
+                .await
+                .map_err(crate::Error::from);
+        }
 
         let pipeline_config = PipelineConfig {
             concurrency: config.concurrency,

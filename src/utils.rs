@@ -1,6 +1,5 @@
 use bytes::Buf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -77,6 +76,7 @@ pub fn map_pipeline_error(err: pipeline::Error) -> crate::Error {
     match err {
         pipeline::Error::ScanOperation(scan_err) => crate::Error::ScanOperation(scan_err),
         pipeline::Error::MirrorOperation(mirror_err) => crate::Error::MirrorOperation(mirror_err),
+        pipeline::Error::RepairOperation(repair_err) => crate::Error::RepairOperation(repair_err),
         pipeline::Error::Io(io_err) => crate::Error::Io(io_err),
         other => crate::Error::Other(other.to_string()),
     }
@@ -106,7 +106,7 @@ pub struct ArchiveStats {
     pub missing_scp: AtomicU64,
 
     // List of all failed/missing files for detailed reporting
-    pub failed_list: Arc<tokio::sync::Mutex<Vec<String>>>,
+    pub failed_list: tokio::sync::Mutex<Vec<String>>,
 }
 
 impl Default for ArchiveStats {
@@ -130,7 +130,7 @@ impl ArchiveStats {
             missing_results: AtomicU64::new(0),
             missing_buckets: AtomicU64::new(0),
             missing_scp: AtomicU64::new(0),
-            failed_list: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            failed_list: tokio::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -184,6 +184,11 @@ impl ArchiveStats {
             info!(
                 "Mirror completed: {} files copied, {} failed, {} skipped",
                 successful, failed, skipped
+            );
+        } else if operation == "repair" {
+            info!(
+                "Repair completed: {} files processed, {} failed",
+                successful, failed
             );
         } else {
             let missing_required = self.missing_required.load(Ordering::Relaxed);

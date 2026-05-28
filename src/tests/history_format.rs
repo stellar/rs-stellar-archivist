@@ -609,14 +609,11 @@ fn test_version_1_buckets_method(canonical_v1_has: HistoryFileState) {
     let buckets = canonical_v1_has.buckets();
 
     // Should not contain zero hashes
-    assert!(!buckets
-        .contains(&"0000000000000000000000000000000000000000000000000000000000000000".to_string()));
+    assert!(!buckets.contains("0000000000000000000000000000000000000000000000000000000000000000"));
 
     // Check some known buckets from v1
-    assert!(buckets
-        .contains(&"5a7e9c8d4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d".to_string()));
-    assert!(buckets
-        .contains(&"9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c".to_string()));
+    assert!(buckets.contains("5a7e9c8d4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d"));
+    assert!(buckets.contains("9b8c7d6e5f4a3b2c1d0e9f8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e1f0a9b8c"));
 
     // Verify we have a reasonable number of unique buckets
     assert!(
@@ -633,17 +630,14 @@ fn test_version_2_buckets_method(canonical_v2_has: HistoryFileState) {
     // currentBuckets and hotArchiveBuckets
 
     // Should not contain zero hashes
-    assert!(!buckets
-        .contains(&"0000000000000000000000000000000000000000000000000000000000000000".to_string()));
+    assert!(!buckets.contains("0000000000000000000000000000000000000000000000000000000000000000"));
 
     // Check that we got buckets from both arrays
     // From currentBuckets
-    assert!(buckets
-        .contains(&"5a7e9c8d4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d".to_string()));
+    assert!(buckets.contains("5a7e9c8d4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d6c5a4b3f2e1d"));
 
     // From hotArchiveBuckets
-    assert!(buckets
-        .contains(&"1a2b3c4d5e6f7081928394a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5".to_string()));
+    assert!(buckets.contains("1a2b3c4d5e6f7081928394a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5"));
 
     // Verify we have a reasonable number of unique buckets
     assert!(

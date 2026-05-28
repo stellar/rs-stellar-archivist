@@ -3,9 +3,10 @@
 use crate::history_format;
 use crate::pipeline::{async_trait, Operation};
 use crate::storage::cleanup_partial_file;
-use crate::storage::{Error as StorageError, StorageConfig, StorageRef};
+use crate::storage::{self, Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
+use opendal::Buffer;
 use opendal::Reader;
 use std::sync::Arc;
 use thiserror::Error;
@@ -47,9 +48,8 @@ pub struct MirrorOperation {
     high: Option<u32>,
     allow_mirror_gaps: bool,
 
-    // Retry configuration for source fetches
-    max_retries: u32,
-    retry_min_delay_ms: u64,
+    // Storage configuration (retry params for fetches live here)
+    storage_config: StorageConfig,
 
     // Cached destination checkpoint at start of operation (or None if destination doesn't exist)
     initial_dest_checkpoint: OnceCell<Option<u32>>,
@@ -79,8 +79,7 @@ impl MirrorOperation {
             low,
             high,
             allow_mirror_gaps,
-            max_retries: storage_config.max_retries as u32,
-            retry_min_delay_ms: storage_config.retry_min_delay.as_millis() as u64,
+            storage_config: storage_config.clone(),
             initial_dest_checkpoint: OnceCell::new(),
             verification_manager: if verify {
                 Some(Arc::new(XdrVerificationManager::new()))
@@ -99,8 +98,8 @@ impl MirrorOperation {
                 // Try to read the destination's .well-known file
                 match fetch_well_known_history_file(
                     &self.dst_store,
-                    self.max_retries,
-                    self.retry_min_delay_ms,
+                    self.storage_config.max_retries as u32,
+                    self.storage_config.retry_min_delay.as_millis() as u64,
                 )
                 .await
                 {
@@ -240,10 +239,13 @@ impl Operation for MirrorOperation {
         //    - If destination doesn't exist: start from genesis checkpoint
 
         // First, get the source's latest checkpoint to know what's available
-        let source_state =
-            fetch_well_known_history_file(source, self.max_retries, self.retry_min_delay_ms)
-                .await
-                .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
+        let source_state = fetch_well_known_history_file(
+            source,
+            self.storage_config.max_retries as u32,
+            self.storage_config.retry_min_delay.as_millis() as u64,
+        )
+        .await
+        .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
         let source_checkpoint =
             history_format::round_to_lower_checkpoint(source_state.current_ledger);
 
@@ -389,7 +391,7 @@ impl Operation for MirrorOperation {
                         Err(e)
                     }
                 }
-            } else if crate::history_format::is_ledger_file(path)
+            } else if crate::history_format::is_ledger_header_file(path)
                 || crate::history_format::is_transactions_file(path)
                 || crate::history_format::is_results_file(path)
                 || crate::history_format::is_scp_file(path)
@@ -413,7 +415,7 @@ impl Operation for MirrorOperation {
                 };
                 match result {
                     XdrParseResult::Ledger(data) => {
-                        manager.record_ledger_data(checkpoint.unwrap(), data);
+                        manager.record_header_data(checkpoint.unwrap(), data);
                     }
                     XdrParseResult::Transactions(hashes) => {
                         manager.record_tx_set_hashes(checkpoint.unwrap(), hashes);
@@ -475,6 +477,17 @@ impl Operation for MirrorOperation {
     fn finalize_checkpoint(&self, checkpoint: u32) {
         if let Some(ref manager) = self.verification_manager {
             manager.verify_and_release(checkpoint);
+        }
+    }
+
+    /// Mirror writes the history buffer to its own dst.
+    async fn process_buffer(&self, path: &str, buffer: Buffer, stats: &ArchiveStats) {
+        match storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await {
+            Ok(()) => stats.record_success(path),
+            Err(e) => {
+                error!("Failed to write history file {}: {}", path, e);
+                stats.record_failure(path).await;
+            }
         }
     }
 }

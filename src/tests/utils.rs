@@ -5,17 +5,25 @@
 //! - HTTP server helpers (axum-based and raw TCP)
 //! - Flaky server for testing retry/failure behavior
 //! - HTTP retry test helpers for parameterized testing
+//! - XDR parsing wrappers (range-validation off) for `xdr_verify` tests
 
 #![allow(dead_code)] // Test utilities may not all be used in every test run
 
+use crate::storage::Error as StorageError;
 use crate::utils::{NON_STANDARD_RETRYABLE_HTTP_ERRORS, STANDARD_RETRYABLE_HTTP_ERRORS};
+use crate::xdr_verify::{
+    parse_ledger_header_entries_for_checkpoint, parse_result_entries_for_checkpoint,
+    parse_transaction_entries_for_checkpoint, LedgerHeaderVerificationData,
+};
 use axum::{routing::get_service, Router};
 use normalize_path::NormalizePath;
 use path_slash::PathExt;
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
+use stellar_xdr::curr::Hash;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
@@ -453,4 +461,27 @@ pub fn transient_http_errors() -> Vec<(u16, &'static str)> {
         .chain(NON_STANDARD_RETRYABLE_HTTP_ERRORS.iter())
         .copied()
         .collect()
+}
+
+//=============================================================================
+// XDR parser wrappers (range-validation off)
+//
+// Thin sugar over the `_for_checkpoint` parsers, used only by xdr_verify
+// tests when feeding hand-constructed XDR (no real ledger range to enforce).
+//=============================================================================
+
+pub fn parse_ledger_header_entries(
+    decompressed_data: &[u8],
+) -> Result<BTreeMap<u32, LedgerHeaderVerificationData>, StorageError> {
+    parse_ledger_header_entries_for_checkpoint(decompressed_data, None)
+}
+
+pub fn parse_result_entries(decompressed_data: &[u8]) -> Result<BTreeMap<u32, Hash>, StorageError> {
+    parse_result_entries_for_checkpoint(decompressed_data, None)
+}
+
+pub fn parse_transaction_entries(
+    decompressed_data: &[u8],
+) -> Result<BTreeMap<u32, Hash>, StorageError> {
+    parse_transaction_entries_for_checkpoint(decompressed_data, None)
 }

@@ -915,7 +915,7 @@ fn read_and_parse_ledger_file(path: &Path) -> Vec<LedgerHeaderHistoryEntry> {
     let mut limited = Limited::new(cursor, Limits::none());
 
     Frame::<LedgerHeaderHistoryEntry>::read_xdr_iter(&mut limited)
-        .map(|r| r.expect("Failed to parse ledger entry").0)
+        .map(|r| r.expect("Failed to parse ledger-header entry").0)
         .collect()
 }
 
@@ -927,7 +927,7 @@ fn recompute_entry_hash(entry: &mut LedgerHeaderHistoryEntry) {
     entry.hash = Hash(Sha256::digest(&header_xdr).into());
 }
 
-fn write_ledger_entries_to_file(path: &Path, entries: &[LedgerHeaderHistoryEntry]) {
+fn write_ledger_header_entries_to_file(path: &Path, entries: &[LedgerHeaderHistoryEntry]) {
     let mut data = Vec::new();
     for entry in entries {
         let entry_xdr = entry
@@ -970,7 +970,7 @@ fn corrupt_ledger_hash_field_preserving_entry_hash(
         recompute_entry_hash(&mut entries[i]);
     }
 
-    write_ledger_entries_to_file(&ledger_file, &entries);
+    write_ledger_header_entries_to_file(&ledger_file, &entries);
 }
 
 /// Corrupt the first ledger of the second checkpoint file by changing its
@@ -996,7 +996,7 @@ fn corrupt_cross_checkpoint_boundary(archive_path: &Path, archive_type: ArchiveT
         recompute_entry_hash(&mut entries[i]);
     }
 
-    write_ledger_entries_to_file(second_file, &entries);
+    write_ledger_header_entries_to_file(second_file, &entries);
 }
 
 //=============================================================================
