@@ -1070,6 +1070,7 @@ async fn test_mirror_with_update_well_known_false_does_not_touch_well_known() {
         PipelineConfig {
             concurrency: 4,
             skip_optional: true,
+            skip_history_and_buckets: false,
             verify: false,
             storage_config: storage_config.clone(),
         },

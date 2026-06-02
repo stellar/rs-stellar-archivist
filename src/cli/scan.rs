@@ -41,6 +41,7 @@ impl ScanCmd {
         let pipeline_config = PipelineConfig {
             concurrency: args.concurrency,
             skip_optional: args.skip_optional,
+            skip_history_and_buckets: false,
             verify: args.verify,
             storage_config: args.storage_config,
         };

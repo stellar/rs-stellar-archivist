@@ -1058,6 +1058,7 @@ fn build_repair_op(
     let pipeline_config = crate::pipeline::PipelineConfig {
         concurrency: 4,
         skip_optional: false,
+        skip_history_and_buckets: false,
         verify,
         storage_config,
     };
@@ -1150,7 +1151,7 @@ async fn test_file_retry_history_repair_fetches_history_and_referenced_buckets()
     let parent_stats = crate::utils::ArchiveStats::new();
     parent_stats.record_failure(cp, &history_relative).await;
 
-    // Drive phase 1 in isolation.
+    // Drive `retry_failed_files` in isolation.
     let stats = op.retry_failed_files(&parent_stats).await;
 
     // History file is back.
@@ -1177,7 +1178,7 @@ async fn test_file_retry_history_repair_fetches_history_and_referenced_buckets()
 /// (mirror has no dst-first probe), which is wasted but correct work —
 /// `verify_and_write_bucket` hashes-verifies the new content before
 /// commit, so the buckets remain valid. End state: history restored, all
-/// buckets present and valid, phase 1 stats clean.
+/// buckets present and valid, `retry_failed_files` stats clean.
 #[tokio::test]
 async fn test_file_retry_history_repair_with_intact_buckets() {
     let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
@@ -1240,12 +1241,13 @@ async fn test_file_retry_history_repair_fails_when_referenced_bucket_unavailable
         .to_string();
     let hash_to_kill = hashes.iter().next().unwrap();
 
-    // Delete the bucket from BOTH src and dst — phase 1 will try src and fail.
+    // Delete the bucket from BOTH src and dst — `retry_failed_files` will
+    // try src and fail.
     let src_bucket_files = get_files_by_pattern(src_dir.path(), &format!("bucket-{hash_to_kill}"));
     assert!(!src_bucket_files.is_empty());
     std::fs::remove_file(&src_bucket_files[0]).expect("delete src bucket");
     std::fs::remove_file(bucket_to_kill).expect("delete dst bucket");
-    // Also delete dst's history so it's a phase 1 work item.
+    // Also delete dst's history so it's a `retry_failed_files` work item.
     std::fs::remove_file(&history_abs).expect("delete dst history");
 
     let op = build_repair_op(&src_url, &dest_url, /*verify=*/ true);
@@ -1298,7 +1300,7 @@ async fn test_file_retry_history_repair_corrupt_history_from_src() {
 
     // Corrupt src's history with junk text (won't parse as JSON).
     std::fs::write(&src_history, b"not valid json at all {").expect("write corrupt src history");
-    // Pre-remove dst's history so phase 1 has to fetch.
+    // Pre-remove dst's history so `retry_failed_files` has to fetch.
     std::fs::remove_file(&history_abs).expect("delete dst history");
 
     let op = build_repair_op(&src_url, &dest_url, /*verify=*/ true);
@@ -1312,12 +1314,12 @@ async fn test_file_retry_history_repair_corrupt_history_from_src() {
         "dst history should not be overwritten with corrupt src content"
     );
 
-    // HISTORY flag stays in stats because phase 1 failed.
+    // HISTORY flag stays in stats because `retry_failed_files` failed.
     let f = stats.failures.lock().await;
     let flags = f
         .files
         .get(&cp)
-        .expect("HISTORY flag should remain in stats after a failed phase 1 repair");
+        .expect("HISTORY flag should remain in stats after a failed retry_failed_files repair");
     assert!(flags.has(crate::utils::FileFlags::HISTORY));
     // No buckets touched (we never got past parse).
     assert!(f.buckets.is_empty());

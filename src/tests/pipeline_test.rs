@@ -180,6 +180,7 @@ fn make_config(concurrency: usize) -> PipelineConfig {
     PipelineConfig {
         concurrency,
         skip_optional: true, // 3 per-cp files (no SCP)
+        skip_history_and_buckets: false,
         verify: false,
         storage_config,
     }

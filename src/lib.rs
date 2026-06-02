@@ -258,6 +258,7 @@ pub mod test_helpers {
         let pipeline_config = PipelineConfig {
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
+            skip_history_and_buckets: false,
             verify: config.verify,
             storage_config: config.storage_config,
         };
@@ -300,6 +301,7 @@ pub mod test_helpers {
         let pipeline_config = PipelineConfig {
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
+            skip_history_and_buckets: false,
             verify: config.verify,
             storage_config: config.storage_config,
         };
@@ -410,6 +412,7 @@ pub mod test_helpers {
         let pipeline_config = PipelineConfig {
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
+            skip_history_and_buckets: false,
             verify: config.verify,
             storage_config: config.storage_config,
         };

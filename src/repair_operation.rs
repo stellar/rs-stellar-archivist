@@ -316,8 +316,14 @@ impl RepairOperation {
     /// overwrite=true, allow_mirror_gaps=true (the retry set is intentionally
     /// disjoint), update_well_known=false (a partial-set retry can't claim
     /// contiguous coverage), wired to repair's `src_store` and `dst_store`,
-    /// with the outer `pipeline_config` cloned verbatim.
-    fn build_retry_pipeline(&self) -> Pipeline<MirrorOperation> {
+    /// with the outer `pipeline_config` cloned. The caller chooses whether
+    /// the inner pipeline's `process_checkpoint` should skip
+    /// history-and-bucket work: `retry_failed_checkpoints` sets it true
+    /// (chain repair needs only per-cp xdr files); `retry_failed_files`
+    /// leaves it false (it drives `process_file` /
+    /// `process_history_and_buckets` directly, but the flag is wired
+    /// through explicitly for clarity).
+    fn build_retry_pipeline(&self, skip_history_and_buckets: bool) -> Pipeline<MirrorOperation> {
         let mirror_op = MirrorOperation::new(
             self.dst_store.clone(),
             /*overwrite=*/ true,
@@ -327,9 +333,11 @@ impl RepairOperation {
             &self.pipeline_config.storage_config,
             /*update_well_known=*/ false,
         );
+        let mut retry_config = self.pipeline_config.clone();
+        retry_config.skip_history_and_buckets = skip_history_and_buckets;
         Pipeline::new(
             mirror_op,
-            self.pipeline_config.clone(),
+            retry_config,
             self.src_store.clone(),
             Some(self.dst_store.clone()),
         )
@@ -364,7 +372,12 @@ impl RepairOperation {
 
         info!("Retrying {} failed file(s)", work.len());
 
-        let file_retry_pipeline = self.build_retry_pipeline();
+        // `retry_failed_files` drives `process_file` /
+        // `process_history_and_buckets` directly — these bypass
+        // `process_checkpoint`, so `skip_history_and_buckets` has no
+        // effect here. Passed `false` for clarity.
+        let file_retry_pipeline =
+            self.build_retry_pipeline(/*skip_history_and_buckets=*/ false);
         stream::iter(work.into_iter())
             .for_each_concurrent(self.pipeline_config.concurrency, |(cp, path)| {
                 let pipeline = &file_retry_pipeline;
@@ -412,7 +425,14 @@ impl RepairOperation {
             retry_cps.len()
         );
 
-        let checkpoint_retry_pipeline = self.build_retry_pipeline();
+        // `retry_failed_checkpoints` only needs per-cp xdr files. Chain
+        // checks don't read bucket content, and bucket failures are
+        // covered by `retry_failed_files` (either via `failures.buckets`
+        // direct fetches or via its HISTORY entries, which trigger
+        // `process_history_and_buckets`). So skip HAS + bucket work in
+        // the inner `process_checkpoint`.
+        let checkpoint_retry_pipeline =
+            self.build_retry_pipeline(/*skip_history_and_buckets=*/ true);
         let _ = checkpoint_retry_pipeline.run_checkpoints(retry_cps).await;
         checkpoint_retry_pipeline.into_stats()
     }
@@ -462,11 +482,23 @@ impl RepairOperation {
 /// of the snapshot; concurrent writers (there shouldn't be any at this point,
 /// but the lock is taken regardless) are blocked only for the duration of
 /// the read.
+///
+/// Non-HISTORY per-cp file entries whose cp is also in `failures.checkpoints`
+/// are skipped — `retry_failed_checkpoints` will re-mirror the whole cp
+/// anyway, so re-fetching individual files in `retry_failed_files` is
+/// redundant. HISTORY entries are kept unconditionally because the HISTORY
+/// repair path dispatches through `Pipeline::process_history_and_buckets(cp)`,
+/// which is the only bucket-discovery path for buckets that the main pass
+/// never probed (the case where the history download itself failed before
+/// bucket refs were walked). Bucket entries are also kept unconditionally —
+/// they're content-addressed, not cp-keyed, and `retry_failed_files` is the
+/// only place that repairs `failures.buckets`.
 async fn build_failed_files_work_list(parent_stats: &ArchiveStats) -> Vec<(u32, String)> {
     let f = parent_stats.failures.lock().await;
     let mut work = Vec::new();
 
     for (&cp, flags) in &f.files {
+        let cp_in_chain_retry = f.checkpoints.contains(&cp);
         for (bit, prefix) in [
             (utils::FileFlags::HISTORY, "history"),
             (utils::FileFlags::LEDGER, "ledger"),
@@ -474,9 +506,17 @@ async fn build_failed_files_work_list(parent_stats: &ArchiveStats) -> Vec<(u32, 
             (utils::FileFlags::RESULTS, "results"),
             (utils::FileFlags::SCP, "scp"),
         ] {
-            if flags.has(bit) {
-                work.push((cp, history_format::checkpoint_path(prefix, cp)));
+            if !flags.has(bit) {
+                continue;
             }
+            // Skip non-HISTORY per-cp files when `retry_failed_checkpoints`
+            // will re-mirror this whole cp anyway. HISTORY is kept because
+            // its repair path in `retry_failed_files` also re-walks bucket
+            // refs.
+            if bit != utils::FileFlags::HISTORY && cp_in_chain_retry {
+                continue;
+            }
+            work.push((cp, history_format::checkpoint_path(prefix, cp)));
         }
     }
 
@@ -590,7 +630,7 @@ impl Operation for RepairOperation {
     ) -> Result<(), pipeline::Error> {
         // Manager drain (verify_checkpoint_chain + record_all_errors) already
         // happened in `Pipeline::run_checkpoints`, so `stats.failures.checkpoints`
-        // is already populated for phase 2 to consume.
+        // is already populated for `retry_failed_checkpoints` to consume.
 
         if self.dry_run {
             let count = self.needs_repair_count.load(Ordering::Relaxed);
@@ -598,8 +638,9 @@ impl Operation for RepairOperation {
             return Ok(());
         }
 
-        // .well-known restoration. Separate path from phases (a follow-up
-        // may fold it into phase 1's per-path repair flow).
+        // .well-known restoration. Separate path from the two retry stages
+        // (a follow-up may fold it into `retry_failed_files`'s per-path
+        // repair flow).
         if self.well_known_needs_repair.load(Ordering::Relaxed) {
             self.repair_well_known(highest_checkpoint).await;
         }

@@ -11,7 +11,7 @@ use crate::{
     xdr_verify::XdrVerificationManager,
 };
 use futures_util::{
-    future::{join, join3, join_all},
+    future::{join, join3, join_all, OptionFuture},
     stream, StreamExt,
 };
 use lru::LruCache;
@@ -142,6 +142,14 @@ pub struct PipelineConfig {
     pub concurrency: usize,
     /// Whether to skip optional SCP files
     pub skip_optional: bool,
+    /// When true, `process_checkpoint` skips `process_history_and_buckets`
+    /// entirely — no HAS fetch, no bucket discovery, no bucket fetches.
+    /// Used by repair's `retry_failed_checkpoints` inner pipeline, where
+    /// chain repair only needs the per-cp xdr files (ledger/tx/results/scp)
+    /// and bucket / HAS work is either redundant (`retry_failed_files`
+    /// covers bucket repair via `failures.buckets` and HISTORY-flagged
+    /// entries) or unnecessary (chain checks don't read bucket content).
+    pub skip_history_and_buckets: bool,
     /// Whether to construct the pipeline's XDR verification manager. When
     /// true, `process_object` receives `Some(&XdrVerificationManager)` and
     /// the pipeline drives `verify_and_release` per cp + chain check + drain
@@ -286,25 +294,26 @@ impl<Op: Operation> Pipeline<Op> {
     /// the pipeline machinery directly without `Pipeline::run`'s full bounds +
     /// iteration loop.
     pub async fn process_checkpoint(&self, checkpoint: u32) {
-        // History work fetches + parses + writes the history buffer and
-        // processes the bucket references it discovers. Fetch/parse failures
-        // are logged and recorded inside `fetch_history_file_state`; on
-        // failure the work returns early so the rest of the checkpoint's files
-        // still get processed.
-        let history_work = self.process_history_and_buckets(checkpoint);
+        // Always: the three required per-cp xdr files.
+        let cats = join_all(
+            ["ledger", "transactions", "results"]
+                .map(|cat| self.process_file(checkpoint, checkpoint_path(cat, checkpoint))),
+        );
 
-        let cats = join_all(["ledger", "transactions", "results"].map(|cat| {
-            let path = checkpoint_path(cat, checkpoint);
-            self.process_file(checkpoint, path)
-        }));
+        // Optional: SCP file. Skipped when `skip_optional` is set.
+        let scp: OptionFuture<_> = (!self.config.skip_optional)
+            .then(|| self.process_file(checkpoint, checkpoint_path("scp", checkpoint)))
+            .into();
 
-        if self.config.skip_optional {
-            let _ = join(history_work, cats).await;
-        } else {
-            let scp_path = checkpoint_path("scp", checkpoint);
-            let scp = self.process_file(checkpoint, scp_path);
-            let _ = join3(history_work, cats, scp).await;
-        }
+        // Optional: HAS fetch + bucket discovery + bucket fetches. Skipped
+        // by repair's `retry_failed_checkpoints` inner pipeline (chain
+        // repair only needs the per-cp xdr files; bucket / HAS work is
+        // handled by `retry_failed_files`).
+        let history: OptionFuture<_> = (!self.config.skip_history_and_buckets)
+            .then(|| self.process_history_and_buckets(checkpoint))
+            .into();
+
+        let _ = join3(cats, scp, history).await;
 
         // Per-cp manager release: drive `verify_and_release` for this cp's
         // accumulated per-file data. Triggers intra-cp completeness, tx/result
