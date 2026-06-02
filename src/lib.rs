@@ -353,7 +353,7 @@ pub mod test_helpers {
         pub high: Option<u32>,
         pub verify: bool,
         pub dry_run: bool,
-        pub file_list: Option<Vec<String>>,
+        pub plan: Option<crate::report::ArchiveReport>,
         pub storage_config: StorageConfig,
         pub report_path: Option<std::path::PathBuf>,
     }
@@ -369,7 +369,7 @@ pub mod test_helpers {
                 high: None,
                 verify: false,
                 dry_run: false,
-                file_list: None,
+                plan: None,
                 storage_config: test_storage_config(),
                 report_path: None,
             }
@@ -419,8 +419,8 @@ pub mod test_helpers {
         }
 
         #[must_use]
-        pub fn files(mut self, list: Vec<String>) -> Self {
-            self.file_list = Some(list);
+        pub fn plan(mut self, plan: crate::report::ArchiveReport) -> Self {
+            self.plan = Some(plan);
             self
         }
 
@@ -465,9 +465,9 @@ pub mod test_helpers {
             pipeline_config.clone(),
         );
 
-        if let Some(files) = config.file_list {
+        if let Some(plan) = config.plan {
             return operation
-                .run_manual(&files)
+                .run_manual(plan, config.report_path.as_deref())
                 .await
                 .map_err(crate::Error::from);
         }

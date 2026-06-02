@@ -24,9 +24,10 @@ pub struct RepairCmd {
     #[arg(long)]
     pub high: Option<u32>,
 
-    /// JSON file listing specific file paths to repair (manual mode)
+    /// JSON plan (from a prior --dry-run) listing the broken files, buckets,
+    /// and checkpoints to repair. Cannot be combined with --low/--high/--dry-run.
     #[arg(long)]
-    pub files: Option<PathBuf>,
+    pub plan: Option<PathBuf>,
 
     /// Show what would be repaired without downloading
     #[arg(long)]
@@ -40,25 +41,11 @@ impl RepairCmd {
             self.src, self.dst, args.concurrency
         );
 
-        // Parse manual file list if provided
-        let file_list = if let Some(ref path) = self.files {
-            let content = std::fs::read_to_string(path).map_err(|e| {
-                Error::Other(format!(
-                    "Failed to read file list from {}: {}",
-                    path.display(),
-                    e
-                ))
-            })?;
-            let list = crate::repair_operation::parse_file_list_json(&content)?;
-            info!(
-                "Manual mode: {} files to repair from {}",
-                list.len(),
-                path.display()
-            );
-            Some(list)
-        } else {
-            None
-        };
+        if self.plan.is_some() && (self.low.is_some() || self.high.is_some() || self.dry_run) {
+            return Err(Error::Other(
+                "--plan cannot be combined with --low/--high/--dry-run".to_string(),
+            ));
+        }
 
         let src_store = storage::from_url_with_config(&self.src, &args.storage_config)
             .map_err(|e| Error::Other(format!("Failed to create source backend: {e}")))?;
@@ -89,8 +76,18 @@ impl RepairCmd {
             pipeline_config.clone(),
         );
 
-        if let Some(files) = file_list {
-            operation.run_manual(&files).await?;
+        if let Some(ref plan_path) = self.plan {
+            let report = crate::report::read_from_path(plan_path).map_err(|e| {
+                Error::Other(format!(
+                    "Failed to read plan from {}: {}",
+                    plan_path.display(),
+                    e
+                ))
+            })?;
+            info!("Plan mode: applying {}", plan_path.display());
+            operation
+                .run_manual(report, args.report_path.as_deref())
+                .await?;
             return Ok(());
         }
 

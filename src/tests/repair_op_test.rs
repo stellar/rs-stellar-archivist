@@ -527,67 +527,133 @@ async fn test_repair_no_verify_ignores_corrupt_xdr() {
 }
 
 //=============================================================================
-// D. Manual Mode
+// D. Plan Mode (--plan)
 //=============================================================================
 
 #[tokio::test]
-async fn test_repair_manual_specific_files() {
+async fn test_repair_plan_round_trip_fixes_archive() {
     let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
 
-    // Delete 3 files
+    // Damage: delete a ledger and corrupt a bucket.
     let deleted_ledger = delete_first_file(dest_dir.path(), "/ledger-");
-    let deleted_tx = delete_first_file(dest_dir.path(), "/transactions-");
-    let _deleted_results = delete_first_file(dest_dir.path(), "/results-");
+    corrupt_bucket_invalid_gzip(dest_dir.path());
 
-    // Only repair 2 of the 3
+    // 1. Dry-run produces a plan.
+    let plan_path = dest_dir.path().join("plan.json");
     run_repair(
         RepairConfig::new(&src_url, &dest_url)
-            .files(vec![deleted_ledger.clone(), deleted_tx.clone()]),
+            .verify()
+            .dry_run()
+            .report(&plan_path),
     )
     .await
-    .expect("Manual repair should succeed");
+    .expect("dry-run ok");
+    let plan = crate::report::read_from_path(&plan_path).unwrap();
 
-    // Ledger and transactions should be restored
-    assert!(dest_dir.path().join(&deleted_ledger).exists());
-    assert!(dest_dir.path().join(&deleted_tx).exists());
-
-    // Results should still be missing (wasn't in the repair list)
-    run_scan(ScanConfig::new(&dest_url))
+    // 2. Apply the plan.
+    run_repair(RepairConfig::new(&src_url, &dest_url).verify().plan(plan))
         .await
-        .expect_err("Results file should still be missing");
+        .expect("plan apply ok");
+
+    // 3. Archive is healthy again.
+    assert!(
+        dest_dir.path().join(&deleted_ledger).exists(),
+        "ledger restored"
+    );
+    run_scan(ScanConfig::new(&dest_url).verify())
+        .await
+        .expect("scan --verify passes after plan repair");
 }
 
 #[tokio::test]
-async fn test_repair_manual_empty_list() {
+async fn test_repair_plan_restores_well_known_from_cp() {
     let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
 
-    delete_first_file(dest_dir.path(), "/ledger-");
+    // Break only the dst .well-known.
+    let wk_path = dest_dir.path().join(".well-known/stellar-history.json");
+    std::fs::remove_file(&wk_path).expect("delete .well-known");
 
-    // Repair with empty file list
-    run_repair(RepairConfig::new(&src_url, &dest_url).files(vec![]))
+    // Dry-run -> plan carrying well_known: Some(K).
+    let plan_path = dest_dir.path().join("plan.json");
+    run_repair(
+        RepairConfig::new(&src_url, &dest_url)
+            .dry_run()
+            .report(&plan_path),
+    )
+    .await
+    .expect("dry-run ok");
+    let plan = crate::report::read_from_path(&plan_path).unwrap();
+    let k = plan.section.well_known.expect("plan flags .well-known");
+
+    // Apply the plan — restoration sources .well-known from the plan's checkpoint.
+    run_repair(RepairConfig::new(&src_url, &dest_url).plan(plan))
         .await
-        .expect("Repair with empty list should succeed (no-op)");
+        .expect("plan apply ok");
 
-    // File should still be missing
+    // .well-known restored and equals history-K on dst.
+    assert!(wk_path.exists(), ".well-known restored");
+    let history_k = dest_dir
+        .path()
+        .join(history_format::checkpoint_path("history", k));
+    assert_eq!(
+        std::fs::read(&wk_path).unwrap(),
+        std::fs::read(&history_k).unwrap(),
+        ".well-known should be a copy of history-K"
+    );
     run_scan(ScanConfig::new(&dest_url))
         .await
-        .expect_err("Deleted file should still be missing");
+        .expect("scan passes after .well-known restored");
 }
 
 #[tokio::test]
-async fn test_repair_manual_nonexistent_source_file() {
+async fn test_repair_rejects_invalid_plan() {
     let (src_url, _dest_dir, dest_url) = mirror_testnet_small().await;
 
-    // Try to repair a file that doesn't exist in source
-    let result = run_repair(RepairConfig::new(&src_url, &dest_url).files(vec![
-        "ledger/00/00/00/ledger-nonexistent.xdr.gz".to_string(),
-    ]))
-    .await;
+    // 100 is not a checkpoint boundary -> into_failures rejects it.
+    let mut bad = crate::report::ArchiveReport::from_failures_and_summary(
+        &crate::utils::FailureTracker::default(),
+        crate::report::Summary::default(),
+    );
+    bad.section.checkpoints.push(100);
+
+    let result = run_repair(RepairConfig::new(&src_url, &dest_url).plan(bad)).await;
+    assert!(result.is_err(), "invalid plan should be rejected");
+}
+
+#[tokio::test]
+async fn test_repair_empty_plan_is_noop() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+    let deleted = delete_first_file(dest_dir.path(), "/ledger-");
+
+    let empty = crate::report::ArchiveReport::from_failures_and_summary(
+        &crate::utils::FailureTracker::default(),
+        crate::report::Summary::default(),
+    );
+    run_repair(RepairConfig::new(&src_url, &dest_url).plan(empty))
+        .await
+        .expect("empty plan is a no-op");
 
     assert!(
-        result.is_err(),
-        "Repair should fail for nonexistent source file"
+        !dest_dir.path().join(&deleted).exists(),
+        "empty plan must not repair anything"
     );
+}
+
+#[tokio::test]
+async fn test_repair_plan_unfetchable_file_fails() {
+    let (src_url, _dest_dir, dest_url) = mirror_testnet_small().await;
+
+    // A well-formed checkpoint boundary beyond the archive: the ledger file is
+    // absent in source, so applying the plan must fail.
+    let mut tracker = crate::utils::FailureTracker::default();
+    tracker.record_file(16383, crate::utils::FileFlags::LEDGER);
+    let plan = crate::report::ArchiveReport::from_failures_and_summary(
+        &tracker,
+        crate::report::Summary::default(),
+    );
+
+    let result = run_repair(RepairConfig::new(&src_url, &dest_url).plan(plan)).await;
+    assert!(result.is_err(), "plan with unfetchable file should fail");
 }
 
 //=============================================================================
@@ -661,26 +727,6 @@ async fn test_repair_dry_run_with_verify() {
     run_scan(ScanConfig::new(&dest_url).verify())
         .await
         .expect_err("Bucket should still be corrupt after dry run");
-}
-
-#[tokio::test]
-async fn test_repair_dry_run_manual_mode() {
-    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
-
-    let deleted = delete_first_file(dest_dir.path(), "/ledger-");
-
-    run_repair(
-        RepairConfig::new(&src_url, &dest_url)
-            .files(vec![deleted.clone()])
-            .dry_run(),
-    )
-    .await
-    .expect("Dry run manual mode should succeed");
-
-    assert!(
-        !dest_dir.path().join(&deleted).exists(),
-        "Dry run should not download anything"
-    );
 }
 
 //=============================================================================
