@@ -4,7 +4,7 @@ use crate::xdr_verify::{
     compute_v1_tx_set_hash, expected_ledger_range, is_empty_tx_set_hash,
     parse_ledger_header_entries_for_checkpoint, parse_result_entries_for_checkpoint,
     parse_scp_entries, parse_transaction_entries_for_checkpoint, LedgerHeaderVerificationData,
-    XdrVerificationManager, EMPTY_XDR_ARRAY_HASH,
+    VerificationErrorType, XdrVerificationManager, EMPTY_XDR_ARRAY_HASH,
 };
 use rstest::rstest;
 use sha2::{Digest, Sha256};
@@ -557,10 +557,10 @@ fn test_chain_break_within_ledger_file(#[case] checkpoint: u32, #[case] corrupte
     manager.record_header_data(checkpoint, header_data);
     manager.verify_and_release(checkpoint);
 
-    assert!(manager
-        .get_errors()
-        .iter()
-        .any(|e| e.ledger_seq == Some(corrupted_ledger) && e.message.contains("hash chain break")),);
+    assert!(manager.get_errors().iter().any(|e| matches!(
+        e.kind,
+        VerificationErrorType::Ledger(seq) if seq == corrupted_ledger
+    ) && e.message.contains("hash chain break")));
 }
 
 #[rstest]
@@ -633,11 +633,13 @@ fn test_cross_checkpoint_chain(#[case] break_chain: bool) {
     manager.verify_and_release(63);
     manager.verify_and_release(127);
 
-    let chain_errors = manager.verify_checkpoint_chain();
+    let errors_before_chain = manager.get_errors().len();
+    manager.verify_checkpoint_chain();
+    let chain_errors_added = manager.get_errors().len() - errors_before_chain;
     if break_chain {
-        assert_eq!(chain_errors.len(), 1);
+        assert_eq!(chain_errors_added, 1);
     } else {
-        assert!(chain_errors.is_empty());
+        assert_eq!(chain_errors_added, 0);
     }
 }
 
@@ -675,11 +677,11 @@ fn test_consecutive_checkpoints_full(#[case] break_chain: bool) {
     manager.verify_and_release(127);
 
     assert!(manager.get_errors().is_empty());
-    let chain_errors = manager.verify_checkpoint_chain();
+    manager.verify_checkpoint_chain();
     if break_chain {
-        assert!(!chain_errors.is_empty());
+        assert!(!manager.get_errors().is_empty());
     } else {
-        assert!(chain_errors.is_empty());
+        assert!(manager.get_errors().is_empty());
     }
 }
 
@@ -692,7 +694,8 @@ fn test_non_consecutive_checkpoint_scanning() {
     manager.verify_and_release(191);
 
     assert!(manager.get_errors().is_empty());
-    assert!(manager.verify_checkpoint_chain().is_empty());
+    manager.verify_checkpoint_chain();
+    assert!(manager.get_errors().is_empty());
 }
 
 #[test]
@@ -705,9 +708,9 @@ fn test_cross_checkpoint_missing_last_ledger_breaks_chain() {
     manager.record_header_data(127, create_complete_checkpoint_data(127, [0; 32]));
     manager.verify_and_release(63);
     manager.verify_and_release(127);
+    manager.verify_checkpoint_chain();
 
-    let total_errors = manager.get_errors().len() + manager.verify_checkpoint_chain().len();
-    assert!(total_errors > 0);
+    assert!(!manager.get_errors().is_empty());
 }
 
 #[test]
@@ -762,14 +765,16 @@ fn test_verify_checkpoint_chain_with_three_consecutive_checkpoints() {
     manager.verify_and_release(63);
     manager.verify_and_release(127);
     manager.verify_and_release(191);
+    manager.verify_checkpoint_chain();
 
-    assert!(manager.verify_checkpoint_chain().is_empty());
+    assert!(manager.get_errors().is_empty());
 }
 
 #[test]
 fn test_verify_checkpoint_chain_empty_manager() {
     let manager = XdrVerificationManager::new();
-    assert!(manager.verify_checkpoint_chain().is_empty());
+    manager.verify_checkpoint_chain();
+    assert!(manager.get_errors().is_empty());
 }
 
 #[test]

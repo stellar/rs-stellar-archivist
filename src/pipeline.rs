@@ -53,6 +53,22 @@ const PROGRESS_REPORTING_FREQUENCY: usize = 100;
 // Operation trait
 // ============================================================================
 
+/// Non-error outcome of `Operation::process_object` / `process_buffer`.
+///
+/// Returned inside `Ok(_)`; the pipeline maps it to the matching
+/// `ArchiveStats` recorder: `Processed` → `record_success`,
+/// `Skipped` → `record_skipped`. Errors are signaled via `Err(_)` in the
+/// surrounding `Result` and recorded by the pipeline as `record_failure`
+/// (after retries exhaust).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessOutcome {
+    /// The operation did its work successfully.
+    Processed,
+    /// The operation deliberately did no work (e.g. mirror found the file
+    /// already present at dst).
+    Skipped,
+}
+
 /// Operation trait for scan, mirror, and repair.
 ///
 /// Pipeline owns `src_store`, `dst_store` (optional), `stats`, and handles
@@ -64,29 +80,25 @@ pub trait Operation: Send + Sync + 'static {
     /// Returns (`lower_bound`, `upper_bound`) checkpoints to process.
     async fn get_checkpoint_bounds(&self, source: &StorageRef) -> Result<(u32, u32), Error>;
 
-    /// Process a file from the source archive.
-    /// Each operation decides how to handle it (existence check, verify, copy, etc.).
+    /// Process a single file. Returns:
+    /// - `Ok(Processed)` — work succeeded.
+    /// - `Ok(Skipped)` — operation chose not to do the work (e.g. mirror when
+    ///   dst already has the file).
+    /// - `Err(_)` — wrapped by `with_retries`; final failure after retries
+    ///   exhaust is recorded by the pipeline.
+    ///
+    /// `checkpoint` is the context cp; for buckets, the discovering cp.
     async fn process_object(
         &self,
+        checkpoint: u32,
         path: &str,
         _src_store: &StorageRef,
-    ) -> Result<(), crate::storage::Error>;
+    ) -> Result<ProcessOutcome, crate::storage::Error>;
 
     /// Called when all work is complete. Pipeline passes stats for operations
     /// that need to check failure counts or record additional failures
     /// (e.g., cross-validation).
     async fn finalize(&self, highest_checkpoint: u32, stats: &ArchiveStats) -> Result<(), Error>;
-
-    /// Pre-check before hitting the source. Allows operations to skip files
-    /// without making a source request (e.g., if destination already exists).
-    ///
-    /// Returns:
-    /// - `Some(Ok(()))` to skip (file already handled)
-    /// - `Some(Err(e))` if pre-check failed
-    /// - `None` to proceed with fetching from source
-    async fn pre_check(&self, _path: &str) -> Option<Result<(), crate::storage::Error>> {
-        None
-    }
 
     /// Called when all files for a checkpoint have been processed.
     fn finalize_checkpoint(&self, _checkpoint: u32) {}
@@ -105,12 +117,17 @@ pub trait Operation: Send + Sync + 'static {
     }
 
     /// Write a fetched buffer (currently the history file) to the operation's
-    /// destination and record the outcome into `stats`.
+    /// destination.
     ///
-    /// Implementations diverge by mode: scan records success without writing;
-    /// mirror writes via `storage::write_buffer_with_cleanup`; repair skips the
-    /// write entirely in dry-run mode and otherwise writes like mirror.
-    async fn process_buffer(&self, path: &str, buffer: Buffer, stats: &ArchiveStats);
+    /// Implementations diverge by mode: scan returns `Processed` without
+    /// writing; mirror writes via `storage::write_buffer_with_cleanup`;
+    /// repair skips the write in dry-run mode and otherwise writes like mirror.
+    async fn process_buffer(
+        &self,
+        checkpoint: u32,
+        path: &str,
+        buffer: Buffer,
+    ) -> Result<ProcessOutcome, crate::storage::Error>;
 }
 
 // ============================================================================
@@ -211,23 +228,21 @@ impl<Op: Operation> Pipeline<Op> {
                 return;
             };
             let history_path = checkpoint_path("history", checkpoint);
-            let write_history_buffer =
-                self.operation
-                    .process_buffer(&history_path, buffer, &self.stats);
-            let buckets = self.process_buckets(state);
+            let write_history_buffer = self.process_history_file(checkpoint, &history_path, buffer);
+            let buckets = self.process_buckets(checkpoint, state);
             let _ = join(write_history_buffer, buckets).await;
         };
 
         let cats = join_all(["ledger", "transactions", "results"].map(|cat| {
             let path = checkpoint_path(cat, checkpoint);
-            self.process_file(path)
+            self.process_file(checkpoint, path)
         }));
 
         if self.config.skip_optional {
             let _ = join(history_work, cats).await;
         } else {
             let scp_path = checkpoint_path("scp", checkpoint);
-            let scp = self.process_file(scp_path);
+            let scp = self.process_file(checkpoint, scp_path);
             let _ = join3(history_work, cats, scp).await;
         }
 
@@ -264,7 +279,7 @@ impl<Op: Operation> Pipeline<Op> {
                  because {} could not be downloaded",
                 checkpoint, checkpoint, history_path
             );
-            self.stats.record_failure(&history_path).await;
+            self.stats.record_failure(checkpoint, &history_path).await;
             return None;
         };
 
@@ -280,7 +295,7 @@ impl<Op: Operation> Pipeline<Op> {
                      because {} could not be parsed",
                     checkpoint, checkpoint, history_path
                 );
-                self.stats.record_failure(&history_path).await;
+                self.stats.record_failure(checkpoint, &history_path).await;
                 None
             }
         }
@@ -291,7 +306,7 @@ impl<Op: Operation> Pipeline<Op> {
     /// → collect (CPU-only — `LruCache::put` returns `None` iff the key is
     /// new); each surviving `process_file` future then runs concurrently
     /// outside the lock.
-    async fn process_buckets(&self, state: HistoryFileState) {
+    async fn process_buckets(&self, checkpoint: u32, state: HistoryFileState) {
         let bucket_futures: Vec<_> = {
             let mut cache = self.bucket_lru.lock().unwrap();
             state
@@ -299,7 +314,9 @@ impl<Op: Operation> Pipeline<Op> {
                 .iter()
                 .filter_map(|bucket| {
                     if cache.put(bucket.clone(), ()).is_none() {
-                        bucket_path(bucket).ok().map(|path| self.process_file(path))
+                        bucket_path(bucket)
+                            .ok()
+                            .map(|path| self.process_file(checkpoint, path))
                     } else {
                         None
                     }
@@ -310,39 +327,65 @@ impl<Op: Operation> Pipeline<Op> {
         join_all(bucket_futures).await;
     }
 
-    /// Process a single file (bucket, ledger, transactions, results, scp).
-    async fn process_file(&self, path: String) {
-        // Pre-check: allow operation to skip without querying source
-        if let Some(result) = self.operation.pre_check(&path).await {
-            match result {
-                Ok(()) => {
-                    debug!("Skipping: {}", path);
-                    self.stats.record_skipped(&path);
-                }
-                Err(e) => {
-                    error!("Pre-check failed for {}: {}", path, e);
-                    self.stats.record_failure(&path).await;
-                }
-            }
-            return;
-        }
+    /// Dispatch a parsed history buffer to the operation and record the
+    /// outcome into stats. Mirrors `process_file`'s match pattern but for
+    /// `process_buffer`. Retries write failures on the destination side just
+    /// like `process_object` retries fetch failures on the source side;
+    /// `Buffer` is `Bytes`-backed so each attempt clones cheaply.
+    async fn process_history_file(&self, checkpoint: u32, path: &str, buffer: Buffer) {
+        let result = utils::with_retries(
+            self.config.storage_config.max_retries as u32,
+            self.config.storage_config.retry_min_delay.as_millis() as u64,
+            "process",
+            path,
+            || {
+                self.operation
+                    .process_buffer(checkpoint, path, buffer.clone())
+            },
+        )
+        .await;
 
+        match result {
+            Ok(ProcessOutcome::Processed) => {
+                debug!("Processed: {}", path);
+                self.stats.record_success(path);
+            }
+            Ok(ProcessOutcome::Skipped) => {
+                debug!("Skipped: {}", path);
+                self.stats.record_skipped(path);
+            }
+            Err(_) => {
+                self.stats.record_failure(checkpoint, path).await;
+            }
+        }
+    }
+
+    /// Process a single file (bucket, ledger, transactions, results, scp).
+    /// `checkpoint` is the cp context (for buckets, the discovering cp).
+    async fn process_file(&self, checkpoint: u32, path: String) {
         let result = utils::with_retries(
             self.config.storage_config.max_retries as u32,
             self.config.storage_config.retry_min_delay.as_millis() as u64,
             "process",
             &path,
-            || self.operation.process_object(&path, &self.src_store),
+            || {
+                self.operation
+                    .process_object(checkpoint, &path, &self.src_store)
+            },
         )
         .await;
 
         match result {
-            Ok(()) => {
+            Ok(ProcessOutcome::Processed) => {
                 debug!("Processed: {}", path);
                 self.stats.record_success(&path);
             }
+            Ok(ProcessOutcome::Skipped) => {
+                debug!("Skipped: {}", path);
+                self.stats.record_skipped(&path);
+            }
             Err(_) => {
-                self.stats.record_failure(&path).await;
+                self.stats.record_failure(checkpoint, &path).await;
             }
         }
     }

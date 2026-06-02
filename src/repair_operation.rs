@@ -25,7 +25,7 @@
 
 use crate::history_format;
 use crate::mirror_operation::MirrorOperation;
-use crate::pipeline::{self, async_trait, Operation, Pipeline, PipelineConfig};
+use crate::pipeline::{self, async_trait, Operation, Pipeline, PipelineConfig, ProcessOutcome};
 use crate::storage::{
     self, cleanup_partial_file, Error as StorageError, ErrorClass, StorageConfig, StorageRef,
 };
@@ -172,7 +172,8 @@ impl RepairOperation {
                         }
                         Err(e) => {
                             error!("Failed to repair {}: {}", path, e);
-                            stats.record_failure(path).await;
+                            let cp = history_format::checkpoint_from_path(path).unwrap_or(0);
+                            stats.record_failure(cp, path).await;
                         }
                     }
                     let done = completed.fetch_add(1, Ordering::Relaxed) + 1;
@@ -184,7 +185,7 @@ impl RepairOperation {
             .await;
 
         stats.report("repair").await;
-        if stats.has_failures() {
+        if stats.has_failures().await {
             return Err(Error::RepairFailed);
         }
         Ok(())
@@ -210,7 +211,10 @@ impl RepairOperation {
                 {
                     Ok(()) => Ok(None),
                     Err(e) => {
-                        cleanup_partial_file(&self.dst_store, path).await?;
+                        if let Err(cleanup_err) = cleanup_partial_file(&self.dst_store, path).await
+                        {
+                            error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
+                        }
                         Err(e)
                     }
                 };
@@ -223,7 +227,10 @@ impl RepairOperation {
                 return match xdr_verify::verify_and_write_xdr(path, reader, &self.dst_store).await {
                     Ok(result) => Ok(Some(result)),
                     Err(e) => {
-                        cleanup_partial_file(&self.dst_store, path).await?;
+                        if let Err(cleanup_err) = cleanup_partial_file(&self.dst_store, path).await
+                        {
+                            error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
+                        }
                         Err(e)
                     }
                 };
@@ -232,7 +239,9 @@ impl RepairOperation {
         match self.dst_store.copy_from_reader(path, reader).await {
             Ok(()) => Ok(None),
             Err(e) => {
-                cleanup_partial_file(&self.dst_store, path).await?;
+                if let Err(cleanup_err) = cleanup_partial_file(&self.dst_store, path).await {
+                    error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
+                }
                 Err(e)
             }
         }
@@ -469,21 +478,22 @@ impl Operation for RepairOperation {
     /// verification logic lives here, matching scan/mirror's pattern.
     async fn process_object(
         &self,
+        _checkpoint: u32,
         path: &str,
         _src_store: &StorageRef,
-    ) -> Result<(), StorageError> {
+    ) -> Result<ProcessOutcome, StorageError> {
         if self.verify_and_record_dst(path).await? {
-            return Ok(());
+            return Ok(ProcessOutcome::Processed);
         }
         if self.dry_run {
             self.note_dry_run(path);
-            return Ok(());
+            return Ok(ProcessOutcome::Processed);
         }
         let result = self.fetch_from_src(path).await?;
         if let Some(parsed) = result {
             self.record_result(path, parsed);
         }
-        Ok(())
+        Ok(ProcessOutcome::Processed)
     }
 
     /// Override history buffer sourcing: read from destination first, fall back to source.
@@ -515,10 +525,11 @@ impl Operation for RepairOperation {
 
     fn finalize_checkpoint(&self, checkpoint: u32) {
         if let Some(ref manager) = self.verification_manager {
-            let errors = manager.verify_and_release(checkpoint);
-            if !errors.is_empty() {
-                self.retry_checkpoints.lock().unwrap().insert(checkpoint);
-            }
+            manager.verify_and_release(checkpoint);
+            // TODO(repair-retry-redesign): `verify_and_release` no longer
+            // returns errors; they're now accumulated in the manager and the
+            // pipeline's `stats.failures.checkpoints` set. Drive the retry
+            // decision from `stats.failures.checkpoints` in a follow-up.
         }
     }
 
@@ -529,14 +540,13 @@ impl Operation for RepairOperation {
     ) -> Result<(), pipeline::Error> {
         // Step 1: cross-checkpoint chain check; both ends of any break go to retry.
         if let Some(ref manager) = self.verification_manager {
-            let chain_errors = manager.verify_checkpoint_chain();
-            let mut retry = self.retry_checkpoints.lock().unwrap();
-            for err in chain_errors {
-                retry.insert(err.checkpoint);
-                if err.checkpoint >= history_format::CHECKPOINT_FREQUENCY {
-                    retry.insert(err.checkpoint - history_format::CHECKPOINT_FREQUENCY);
-                }
-            }
+            manager.verify_checkpoint_chain();
+            // TODO(repair-retry-redesign): `verify_checkpoint_chain` no longer
+            // returns errors; they're now accumulated in the manager. With
+            // boundary failures already recording both flanking cps into
+            // `stats.failures.checkpoints`, drive retry directly from there in
+            // a follow-up. Until then, `retry_checkpoints` stays empty and the
+            // retry phase below is effectively a no-op.
         }
 
         let retry: Vec<u32> = std::mem::take(&mut *self.retry_checkpoints.lock().unwrap())
@@ -563,7 +573,7 @@ impl Operation for RepairOperation {
             );
         } else {
             stats.report("repair").await;
-            if stats.has_failures() {
+            if stats.has_failures().await {
                 return Err(Error::RepairFailed.into());
             }
         }
@@ -571,21 +581,21 @@ impl Operation for RepairOperation {
         Ok(())
     }
 
-    /// Repair writes the history buffer to its own dst, except in dry-run mode
-    /// where the write is skipped entirely (and stats are left untouched —
-    /// dry-run reports via `needs_repair_count`, populated in
-    /// `fetch_history_buffer`).
-    async fn process_buffer(&self, path: &str, buffer: Buffer, stats: &ArchiveStats) {
+    /// Repair writes the history buffer to its own dst. In dry-run mode the
+    /// write is skipped but the file is still reported as `Processed` (the
+    /// pipeline records it as a success — matching how repair's `process_object`
+    /// reports its dry-run no-op branches).
+    async fn process_buffer(
+        &self,
+        _checkpoint: u32,
+        path: &str,
+        buffer: Buffer,
+    ) -> Result<ProcessOutcome, StorageError> {
         if self.dry_run {
-            return;
+            return Ok(ProcessOutcome::Processed);
         }
-        match storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await {
-            Ok(()) => stats.record_success(path),
-            Err(e) => {
-                error!("Failed to write history file {}: {}", path, e);
-                stats.record_failure(path).await;
-            }
-        }
+        storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await?;
+        Ok(ProcessOutcome::Processed)
     }
 }
 

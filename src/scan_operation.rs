@@ -1,5 +1,5 @@
 use crate::history_format;
-use crate::pipeline::{async_trait, Operation};
+use crate::pipeline::{async_trait, Operation, ProcessOutcome};
 use crate::storage::{from_opendal_error, Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
@@ -93,40 +93,41 @@ impl Operation for ScanOperation {
             .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))
     }
 
-    async fn process_object(&self, path: &str, src_store: &StorageRef) -> Result<(), StorageError> {
+    async fn process_object(
+        &self,
+        _checkpoint: u32,
+        path: &str,
+        src_store: &StorageRef,
+    ) -> Result<ProcessOutcome, StorageError> {
         if let Some(ref manager) = self.verification_manager {
             // Verify mode: stream content and validate
             let reader = src_store.open_reader(path).await?;
             if crate::history_format::is_bucket_file(path) {
-                crate::verify::verify_bucket_stream(path, reader).await
+                crate::verify::verify_bucket_stream(path, reader).await?;
             } else if crate::history_format::is_ledger_header_file(path) {
                 let checkpoint = Self::checkpoint_from_verified_path(path)?;
                 let data = crate::xdr_verify::parse_ledger_header_stream(path, reader).await?;
                 manager.record_header_data(checkpoint, data);
-                Ok(())
             } else if crate::history_format::is_transactions_file(path) {
                 let checkpoint = Self::checkpoint_from_verified_path(path)?;
                 let hashes = crate::xdr_verify::parse_transactions_stream(path, reader).await?;
                 manager.record_tx_set_hashes(checkpoint, hashes);
-                Ok(())
             } else if crate::history_format::is_results_file(path) {
                 let checkpoint = Self::checkpoint_from_verified_path(path)?;
                 let hashes = crate::xdr_verify::parse_results_stream(path, reader).await?;
                 manager.record_result_hashes(checkpoint, hashes);
-                Ok(())
             } else if crate::history_format::is_scp_file(path) {
-                crate::xdr_verify::parse_scp_stream(path, reader).await
+                crate::xdr_verify::parse_scp_stream(path, reader).await?;
             } else {
-                self.consume_stream(path, reader).await
+                self.consume_stream(path, reader).await?;
             }
         } else {
             // Existence-only mode: just check if file exists (no streaming)
-            if src_store.exists(path).await? {
-                Ok(())
-            } else {
-                Err(StorageError::not_found())
+            if !src_store.exists(path).await? {
+                return Err(StorageError::not_found());
             }
         }
+        Ok(ProcessOutcome::Processed)
     }
 
     async fn finalize(
@@ -135,29 +136,23 @@ impl Operation for ScanOperation {
         stats: &ArchiveStats,
     ) -> Result<(), crate::pipeline::Error> {
         if let Some(ref manager) = self.verification_manager {
-            let chain_errors = manager.verify_checkpoint_chain();
-            for err in &chain_errors {
-                error!("Checkpoint {}: {}", err.checkpoint, err.message);
-                stats.record_failure("xdr-chain-verification").await;
+            manager.verify_checkpoint_chain();
+            let all_errors = manager.get_errors();
+            for err in &all_errors {
+                stats.record_verification_failure(&err.kind).await;
             }
 
-            let accumulated_errors = manager.get_errors();
-            for _ in &accumulated_errors {
-                stats.record_failure("xdr-cross-verification").await;
-            }
-
-            let total_errors = chain_errors.len() + accumulated_errors.len();
-            if total_errors > 0 {
+            if !all_errors.is_empty() {
                 error!(
                     "XDR verification found {} cross-file hash mismatches",
-                    total_errors
+                    all_errors.len()
                 );
             }
         }
 
         stats.report("scan").await;
 
-        if stats.has_failures() {
+        if stats.has_failures().await {
             return Err(Error::ScanFailed.into());
         }
 
@@ -170,8 +165,13 @@ impl Operation for ScanOperation {
         }
     }
 
-    /// Scan never writes — record success and discard the buffer.
-    async fn process_buffer(&self, path: &str, _buffer: Buffer, stats: &ArchiveStats) {
-        stats.record_success(path);
+    /// Scan never writes — return `Processed` and let the pipeline record it.
+    async fn process_buffer(
+        &self,
+        _checkpoint: u32,
+        _path: &str,
+        _buffer: Buffer,
+    ) -> Result<ProcessOutcome, StorageError> {
+        Ok(ProcessOutcome::Processed)
     }
 }

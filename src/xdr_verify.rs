@@ -108,10 +108,27 @@ struct PendingCheckpoint {
     result_hashes: Option<BTreeMap<u32, Hash>>,
 }
 
+/// First/last ledger-header hashes at a checkpoint boundary, used internally
+/// by [`XdrVerificationManager`] to verify hash continuity across
+/// consecutive checkpoints.
 #[derive(Debug, Clone)]
 struct CheckpointBoundary {
     first_prev_hash: Hash,
     last_computed_hash: Hash,
+}
+
+/// Kind of verification failure detected. The associated `u32` is the
+/// identifier most natural for that kind:
+/// - `Ledger`: the failing ledger sequence number (per-ledger failure).
+/// - `Checkpoint`: the checkpoint ledger number (cross-ledger failure
+///   contained within one checkpoint).
+/// - `Boundary`: the curr checkpoint ledger number (cross-checkpoint
+///   chain break between this cp and its previous cp).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerificationErrorType {
+    Ledger(u32),
+    Checkpoint(u32),
+    Boundary(u32),
 }
 
 /// A verification failure detected during cross-file or chain validation.
@@ -119,11 +136,20 @@ struct CheckpointBoundary {
 /// [`get_errors`](XdrVerificationManager::get_errors).
 #[derive(Debug, Clone)]
 pub struct VerificationError {
-    pub checkpoint: u32,
-    /// The specific ledger sequence that failed, or `None` for checkpoint-level errors
-    /// (e.g. missing ledger data, internal errors).
-    pub ledger_seq: Option<u32>,
+    pub kind: VerificationErrorType,
     pub message: String,
+}
+
+impl VerificationError {
+    /// The checkpoint this error pertains to, regardless of variant.
+    /// `Ledger(seq)` is mapped to its containing checkpoint via
+    /// `history_format::round_to_upper_checkpoint`.
+    pub fn checkpoint(&self) -> u32 {
+        match self.kind {
+            VerificationErrorType::Ledger(seq) => history_format::round_to_upper_checkpoint(seq),
+            VerificationErrorType::Checkpoint(cp) | VerificationErrorType::Boundary(cp) => cp,
+        }
+    }
 }
 
 /// Coordinates cross-file XDR verification across concurrent checkpoint processing.
@@ -190,65 +216,44 @@ impl XdrVerificationManager {
     /// Run all intra-checkpoint verifications and free the pending data.
     ///
     /// Runs (in order): completeness check, tx set hash cross-check, result hash
-    /// cross-check, internal hash chain, then stores the first/last boundary hashes
-    /// for later cross-checkpoint verification. Errors are accumulated in
-    /// [`get_errors`](Self::get_errors) **and** returned to the caller so they can
-    /// observe per-checkpoint outcomes (used by repair to drive its retry phase).
+    /// cross-check, internal hash chain, then stores the first/last boundary
+    /// hashes for later cross-checkpoint verification. All errors are accumulated
+    /// into `self.errors`; retrieve them via [`get_errors`](Self::get_errors).
     ///
-    /// No-op (returns empty Vec) if no data was recorded for this checkpoint.
-    /// If ledger data is missing but tx/result data exists, records a warning
-    /// error and returns it.
-    pub fn verify_and_release(&self, checkpoint: u32) -> Vec<VerificationError> {
+    /// No-op if no data was recorded for this checkpoint. If ledger data is
+    /// missing but tx/result data exists, records a warning error.
+    pub(crate) fn verify_and_release(&self, checkpoint: u32) {
         let data = {
             let mut pending = self.pending.lock().unwrap();
             pending.remove(&checkpoint)
         };
 
         let Some(data) = data else {
-            return Vec::new();
+            return;
         };
 
         let Some(header_data) = data.header_data else {
             let err_msg = "missing ledger verification data for checkpoint";
             warn!("Checkpoint {checkpoint}: skipping cross-verification because {err_msg}");
-            let err = VerificationError {
-                checkpoint,
-                ledger_seq: None,
+            self.errors.lock().unwrap().push(VerificationError {
+                kind: VerificationErrorType::Checkpoint(checkpoint),
                 message: err_msg.to_string(),
-            };
-            self.errors.lock().unwrap().push(err.clone());
-            return vec![err];
+            });
+            return;
         };
 
-        let mut errors = Vec::new();
-        errors.extend(Self::verify_checkpoint_completeness(
-            checkpoint,
-            &header_data,
-        ));
+        self.verify_checkpoint_completeness(checkpoint, &header_data);
 
         if let Some(tx_set_hashes) = data.tx_set_hashes {
-            errors.extend(Self::verify_tx_set_hashes_internal(
-                checkpoint,
-                &header_data,
-                &tx_set_hashes,
-            ));
+            self.verify_tx_set_hashes_internal(&header_data, &tx_set_hashes);
         }
 
         if let Some(result_hashes) = data.result_hashes {
-            errors.extend(Self::verify_result_hashes_internal(
-                checkpoint,
-                &header_data,
-                &result_hashes,
-            ));
+            self.verify_result_hashes_internal(&header_data, &result_hashes);
         }
 
-        errors.extend(Self::verify_internal_chain(checkpoint, &header_data));
+        self.verify_internal_chain(checkpoint, &header_data);
         self.store_boundary(checkpoint, &header_data);
-
-        if !errors.is_empty() {
-            self.errors.lock().unwrap().extend(errors.iter().cloned());
-        }
-        errors
     }
 
     /// Verify that `header_data` covers exactly the ledger sequences expected
@@ -259,9 +264,10 @@ impl XdrVerificationManager {
     /// - **Missing**: ledger sequences in the expected range with no header entry
     ///   (truncated to the first 5 + a count when more than 10 are missing)
     fn verify_checkpoint_completeness(
+        &self,
         checkpoint: u32,
         header_data: &BTreeMap<u32, LedgerHeaderVerificationData>,
-    ) -> Vec<VerificationError> {
+    ) {
         let mut errors = Vec::new();
         let (first_ledger, last_ledger) = expected_ledger_range(checkpoint);
         let range = first_ledger..=last_ledger;
@@ -285,8 +291,7 @@ impl XdrVerificationManager {
             );
             error!("Checkpoint {checkpoint}: {err_msg}");
             errors.push(VerificationError {
-                checkpoint,
-                ledger_seq: unexpected.first().copied(),
+                kind: VerificationErrorType::Checkpoint(checkpoint),
                 message: err_msg,
             });
         }
@@ -310,12 +315,13 @@ impl XdrVerificationManager {
             );
             error!("Checkpoint {checkpoint}: {err_msg}");
             errors.push(VerificationError {
-                checkpoint,
-                ledger_seq: missing.first().copied(),
+                kind: VerificationErrorType::Checkpoint(checkpoint),
                 message: err_msg,
             });
         }
-        errors
+        if !errors.is_empty() {
+            self.errors.lock().unwrap().extend(errors);
+        }
     }
 
     /// Cross-verify per-ledger tx-set hashes from the **transactions** file
@@ -330,10 +336,10 @@ impl XdrVerificationManager {
     ///   sentinels (see [`is_empty_tx_set_hash`]) — stellar-core omits empty
     ///   tx-set entries from the transactions file.
     fn verify_tx_set_hashes_internal(
-        checkpoint: u32,
+        &self,
         header_data: &BTreeMap<u32, LedgerHeaderVerificationData>,
         tx_set_hashes: &BTreeMap<u32, Hash>,
-    ) -> Vec<VerificationError> {
+    ) {
         let mut errors = Vec::new();
         for (&seq, data) in header_data {
             let expected = &data.expected_tx_set_hash;
@@ -362,13 +368,14 @@ impl XdrVerificationManager {
             if let Some(err_msg) = err_msg {
                 error!("Ledger {seq}: {err_msg}");
                 errors.push(VerificationError {
-                    checkpoint,
-                    ledger_seq: Some(seq),
+                    kind: VerificationErrorType::Ledger(seq),
                     message: err_msg,
                 });
             }
         }
-        errors
+        if !errors.is_empty() {
+            self.errors.lock().unwrap().extend(errors);
+        }
     }
 
     /// Cross-verify per-ledger result-set hashes from the **results** file
@@ -380,10 +387,10 @@ impl XdrVerificationManager {
     ///   is non-zero and not [`EMPTY_XDR_ARRAY_HASH`] (those two values mark
     ///   "no result entry expected" and are tolerated as missing).
     fn verify_result_hashes_internal(
-        checkpoint: u32,
+        &self,
         header_data: &BTreeMap<u32, LedgerHeaderVerificationData>,
         result_hashes: &BTreeMap<u32, Hash>,
-    ) -> Vec<VerificationError> {
+    ) {
         let mut errors = Vec::new();
         for (&seq, data) in header_data {
             let expected = &data.expected_result_hash;
@@ -410,13 +417,14 @@ impl XdrVerificationManager {
             if let Some(err_msg) = err_msg {
                 error!("Ledger {seq}: {err_msg}");
                 errors.push(VerificationError {
-                    checkpoint,
-                    ledger_seq: Some(seq),
+                    kind: VerificationErrorType::Ledger(seq),
                     message: err_msg,
                 });
             }
         }
-        errors
+        if !errors.is_empty() {
+            self.errors.lock().unwrap().extend(errors);
+        }
     }
 
     /// Verify the hash chain *within* a single checkpoint.
@@ -429,48 +437,47 @@ impl XdrVerificationManager {
     /// prior checkpoint's last) is handled separately by
     /// [`verify_checkpoint_chain`](Self::verify_checkpoint_chain).
     fn verify_internal_chain(
+        &self,
         checkpoint: u32,
         header_data: &BTreeMap<u32, LedgerHeaderVerificationData>,
-    ) -> Vec<VerificationError> {
+    ) {
         let mut errors = Vec::new();
         let entries: Vec<_> = header_data.iter().collect();
 
         for pair in entries.windows(2) {
-            let mut err_msg: Option<String> = None;
-            let mut ledger_seq: Option<u32> = None;
+            let mut kind_and_msg: Option<(VerificationErrorType, String)> = None;
 
             if let [(&prev_seq, prev_data), (&seq, data)] = pair {
                 if prev_seq.saturating_add(1) != seq {
-                    err_msg = Some(format!(
-                        "missing predecessor ledger {}",
-                        seq.saturating_sub(1),
-                    ));
-                    ledger_seq = Some(seq);
+                    let msg = format!("missing predecessor ledger {}", seq.saturating_sub(1),);
+                    kind_and_msg = Some((VerificationErrorType::Ledger(seq), msg));
                 } else if prev_data.computed_hash != data.prev_hash {
-                    err_msg = Some(format!(
+                    let msg = format!(
                         "hash chain break: previous_ledger_hash {} != computed hash of ledger {} ({})",
                         data.prev_hash.to_hex(),
                         prev_seq,
                         prev_data.computed_hash.to_hex(),
-                    ));
-                    ledger_seq = Some(seq);
+                    );
+                    kind_and_msg = Some((VerificationErrorType::Ledger(seq), msg));
                 }
             } else {
-                err_msg = Some(
+                kind_and_msg = Some((
+                    VerificationErrorType::Checkpoint(checkpoint),
                     "internal error: unexpected window size in chain verification".to_string(),
-                );
+                ));
             }
 
-            if let Some(err_msg) = err_msg {
+            if let Some((kind, err_msg)) = kind_and_msg {
                 error!("Checkpoint {checkpoint}: {err_msg}");
                 errors.push(VerificationError {
-                    checkpoint,
-                    ledger_seq,
+                    kind,
                     message: err_msg,
                 });
             }
         }
-        errors
+        if !errors.is_empty() {
+            self.errors.lock().unwrap().extend(errors);
+        }
     }
 
     /// Stash the first/last ledger hashes of this checkpoint into
@@ -505,12 +512,12 @@ impl XdrVerificationManager {
     }
 
     /// Verify hash chain continuity across consecutive checkpoint boundaries.
-    /// Returns errors directly (not accumulated in `get_errors`) since this runs
-    /// after all per-checkpoint verification is complete.
+    /// Detected errors are pushed into `self.errors`; retrieve via
+    /// [`get_errors`](Self::get_errors).
     ///
     /// Only checks adjacent checkpoints separated by exactly `CHECKPOINT_FREQUENCY` —
     /// non-consecutive checkpoints (from partial or bounded scans) are skipped.
-    pub fn verify_checkpoint_chain(&self) -> Vec<VerificationError> {
+    pub(crate) fn verify_checkpoint_chain(&self) {
         let boundaries = self.boundaries.lock().unwrap();
         let mut chain_errors = Vec::new();
 
@@ -534,14 +541,15 @@ impl XdrVerificationManager {
                 );
                 error!("{err_msg}");
                 chain_errors.push(VerificationError {
-                    checkpoint: curr_checkpoint,
-                    ledger_seq: Some(first_ledger),
+                    kind: VerificationErrorType::Boundary(curr_checkpoint),
                     message: err_msg,
                 });
             }
         }
 
-        chain_errors
+        if !chain_errors.is_empty() {
+            self.errors.lock().unwrap().extend(chain_errors);
+        }
     }
 
     /// Snapshot of all verification errors accumulated so far. Each call

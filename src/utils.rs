@@ -1,11 +1,14 @@
 use bytes::Buf;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
+use stellar_xdr::curr::Hash;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-use crate::history_format::{self, HistoryFileState};
+use crate::history_format::{self, HistoryFileState, ROOT_WELL_KNOWN_PATH};
 use crate::pipeline;
 use crate::storage::StorageRef;
+use crate::xdr_verify::VerificationErrorType;
 
 //=============================================================================
 // Retryable HTTP Error Codes
@@ -82,31 +85,155 @@ pub fn map_pipeline_error(err: pipeline::Error) -> crate::Error {
     }
 }
 
-/// Shared statistics tracking for archive operations
-/// for consistent reporting across scan and mirror operations
+//=============================================================================
+// FailureTracker — the deterministic source of truth for archive failures.
+//
+// Four orthogonal failure kinds, each indexable by its natural key:
+//   - well_known (singleton .well-known/stellar-history.json)
+//   - files      (per-checkpoint standard files: history/ledger/tx/results/scp)
+//   - buckets    (content-addressed; the same bucket may be referenced by
+//                 many checkpoints, but a failure is identified by its hash)
+//   - checkpoints (any checkpoint-level failure: cross-file verification,
+//                  within-cp chain break, or cross-cp chain break — for the
+//                  last, both cps flanking the break are inserted)
+//
+// Per-checkpoint "file" failures use a bitmask so a single cp can have
+// multiple file-type failures without duplicating the cp key.
+//=============================================================================
+
+/// Bitmask of per-checkpoint standard file types. Bit set = that file is
+/// missing or failed validation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct FileFlags(u8);
+
+impl FileFlags {
+    pub const HISTORY: u8 = 1 << 0;
+    pub const LEDGER: u8 = 1 << 1;
+    pub const TRANSACTIONS: u8 = 1 << 2;
+    pub const RESULTS: u8 = 1 << 3;
+    pub const SCP: u8 = 1 << 4;
+
+    #[must_use]
+    pub const fn new() -> Self {
+        Self(0)
+    }
+    pub fn set(&mut self, flag: u8) {
+        self.0 |= flag;
+    }
+    pub fn unset(&mut self, flag: u8) {
+        self.0 &= !flag;
+    }
+    #[must_use]
+    pub fn has(&self, flag: u8) -> bool {
+        (self.0 & flag) != 0
+    }
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0 == 0
+    }
+    #[must_use]
+    pub fn count(&self) -> u32 {
+        self.0.count_ones()
+    }
+}
+
+// detailed tracking of which files are broken. and which checkpoints are broken
+#[derive(Debug, Default, Clone)]
+pub struct FailureTracker {
+    pub well_known: bool,
+    pub files: BTreeMap<u32, FileFlags>,
+    pub buckets: BTreeSet<Hash>,
+    pub checkpoints: BTreeSet<u32>,
+}
+
+impl FailureTracker {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        !self.well_known
+            && self.files.is_empty()
+            && self.buckets.is_empty()
+            && self.checkpoints.is_empty()
+    }
+
+    pub fn record_well_known(&mut self) {
+        self.well_known = true;
+    }
+    pub fn unrecord_well_known(&mut self) {
+        self.well_known = false;
+    }
+
+    pub fn record_file(&mut self, cp: u32, flag: u8) {
+        self.files.entry(cp).or_default().set(flag);
+    }
+    pub fn unrecord_file(&mut self, cp: u32, flag: u8) {
+        if let Some(flags) = self.files.get_mut(&cp) {
+            flags.unset(flag);
+            if flags.is_empty() {
+                self.files.remove(&cp);
+            }
+        }
+    }
+
+    pub fn record_bucket(&mut self, hash: Hash) {
+        self.buckets.insert(hash);
+    }
+    pub fn unrecord_bucket(&mut self, hash: &Hash) {
+        self.buckets.remove(hash);
+    }
+
+    pub fn record_checkpoint(&mut self, cp: u32) {
+        self.checkpoints.insert(cp);
+    }
+    pub fn unrecord_checkpoint(&mut self, cp: u32) {
+        self.checkpoints.remove(&cp);
+    }
+
+    /// Number of checkpoints with the given file flag set.
+    #[must_use]
+    pub fn count_files(&self, flag: u8) -> u32 {
+        self.files.values().filter(|f| f.has(flag)).count() as u32
+    }
+
+    /// Total file-failure count across all checkpoints and all flags.
+    #[must_use]
+    pub fn total_file_failures(&self) -> u32 {
+        self.files.values().map(FileFlags::count).sum::<u32>()
+    }
+}
+
+/// Classify a path into a `FileFlags` constant, or `None` if not a recognized
+/// per-checkpoint standard-file path.
+fn path_to_file_flag(path: &str) -> Option<u8> {
+    if history_format::is_history_file(path) {
+        Some(FileFlags::HISTORY)
+    } else if history_format::is_ledger_header_file(path) {
+        Some(FileFlags::LEDGER)
+    } else if history_format::is_transactions_file(path) {
+        Some(FileFlags::TRANSACTIONS)
+    } else if history_format::is_results_file(path) {
+        Some(FileFlags::RESULTS)
+    } else if history_format::is_scp_file(path) {
+        Some(FileFlags::SCP)
+    } else {
+        None
+    }
+}
+
+/// Parse a hex bucket hash (as returned by `bucket_hash_from_path`) into a `Hash`.
+fn hex_to_hash(s: &str) -> Option<Hash> {
+    let bytes = hex::decode(s).ok()?;
+    let arr: [u8; 32] = bytes.try_into().ok()?;
+    Some(Hash(arr))
+}
+
+/// Shared archive operation statistics. The `failures` field is the
+/// deterministic source of truth for the operation's outcome and may be
+/// consulted to drive subsequent decisions (e.g. repair retry planning).
 pub struct ArchiveStats {
-    // Successfully processed files
     pub successful_files: AtomicU64,
-
-    // Failed files (any type of failure)
-    pub failed_files: AtomicU64,
-
-    // Skipped files (already exist in mirror mode)
     pub skipped_files: AtomicU64,
-
-    // Number of retry attempts (not unique files, but total retries)
     pub retry_count: AtomicU64,
-
-    pub missing_required: AtomicU64,
-    pub missing_history: AtomicU64,
-    pub missing_ledger: AtomicU64,
-    pub missing_transactions: AtomicU64,
-    pub missing_results: AtomicU64,
-    pub missing_buckets: AtomicU64,
-    pub missing_scp: AtomicU64,
-
-    // List of all failed/missing files for detailed reporting
-    pub failed_list: tokio::sync::Mutex<Vec<String>>,
+    pub failures: tokio::sync::Mutex<FailureTracker>,
 }
 
 impl Default for ArchiveStats {
@@ -120,17 +247,9 @@ impl ArchiveStats {
     pub fn new() -> Self {
         Self {
             successful_files: AtomicU64::new(0),
-            failed_files: AtomicU64::new(0),
             skipped_files: AtomicU64::new(0),
             retry_count: AtomicU64::new(0),
-            missing_required: AtomicU64::new(0),
-            missing_history: AtomicU64::new(0),
-            missing_ledger: AtomicU64::new(0),
-            missing_transactions: AtomicU64::new(0),
-            missing_results: AtomicU64::new(0),
-            missing_buckets: AtomicU64::new(0),
-            missing_scp: AtomicU64::new(0),
-            failed_list: tokio::sync::Mutex::new(Vec::new()),
+            failures: tokio::sync::Mutex::new(FailureTracker::default()),
         }
     }
 
@@ -138,105 +257,145 @@ impl ArchiveStats {
         self.successful_files.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a skipped file (already exists in mirror mode)
+    /// Record a skipped file (already exists in mirror mode).
     pub fn record_skipped(&self, _path: &str) {
         self.skipped_files.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record a retry attempt
+    /// Record a retry attempt.
     pub fn record_retry(&self) {
         self.retry_count.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub async fn record_failure(&self, path: &str) {
-        self.failed_files.fetch_add(1, Ordering::Relaxed);
-
-        if path.contains("history") {
-            self.missing_history.fetch_add(1, Ordering::Relaxed);
-        } else if path.contains("ledger") {
-            self.missing_ledger.fetch_add(1, Ordering::Relaxed);
-        } else if path.contains("transactions") {
-            self.missing_transactions.fetch_add(1, Ordering::Relaxed);
-        } else if path.contains("results") {
-            self.missing_results.fetch_add(1, Ordering::Relaxed);
-        } else if path.contains("bucket") {
-            self.missing_buckets.fetch_add(1, Ordering::Relaxed);
-        } else if path.contains("scp") {
-            self.missing_scp.fetch_add(1, Ordering::Relaxed);
+    /// Record a per-file failure, routing by path to the appropriate
+    /// `FailureTracker` slot. `cp` is the checkpoint context (used as the key
+    /// for per-checkpoint standard files; ignored for buckets and well-known).
+    /// Unrecognized paths are logged and not recorded.
+    pub async fn record_failure(&self, cp: u32, path: &str) {
+        let mut failures = self.failures.lock().await;
+        if path == ROOT_WELL_KNOWN_PATH {
+            failures.record_well_known();
+        } else if let Some(hash_str) = history_format::bucket_hash_from_path(path) {
+            if let Some(hash) = hex_to_hash(&hash_str) {
+                failures.record_bucket(hash);
+            } else {
+                warn!("record_failure: malformed bucket hash in path {path}");
+            }
+        } else if let Some(flag) = path_to_file_flag(path) {
+            failures.record_file(cp, flag);
+        } else {
+            warn!("record_failure: unrecognized path {path}");
         }
-
-        if !path.contains("scp") {
-            self.missing_required.fetch_add(1, Ordering::Relaxed);
-        }
-
-        let mut failed_list = self.failed_list.lock().await;
-        failed_list.push(path.to_string());
     }
 
-    /// Generate and log a complete report of the operation results
+    /// Remove a previously recorded per-file failure (e.g. when retry rescues
+    /// the file). No-op if the path was not present in the tracker.
+    pub async fn unrecord_failure(&self, cp: u32, path: &str) {
+        let mut failures = self.failures.lock().await;
+        if path == ROOT_WELL_KNOWN_PATH {
+            failures.unrecord_well_known();
+        } else if let Some(hash_str) = history_format::bucket_hash_from_path(path) {
+            if let Some(hash) = hex_to_hash(&hash_str) {
+                failures.unrecord_bucket(&hash);
+            }
+        } else if let Some(flag) = path_to_file_flag(path) {
+            failures.unrecord_file(cp, flag);
+        }
+    }
+
+    /// Record a verification failure, dispatching on its kind:
+    /// - `Ledger(seq)` and `Checkpoint(cp)` mark a single checkpoint as
+    ///   problematic.
+    /// - `Boundary(cp)` marks both `cp` and its previous checkpoint, since
+    ///   a chain break implicates both ends.
+    ///
+    /// Repair only needs cp granularity; all variants funnel into the same
+    /// `checkpoints` set in the FailureTracker.
+    pub async fn record_verification_failure(&self, kind: &VerificationErrorType) {
+        let mut failures = self.failures.lock().await;
+        match kind {
+            VerificationErrorType::Ledger(seq) => {
+                failures.record_checkpoint(history_format::round_to_upper_checkpoint(*seq));
+            }
+            VerificationErrorType::Checkpoint(cp) => {
+                failures.record_checkpoint(*cp);
+            }
+            VerificationErrorType::Boundary(cp) => {
+                failures.record_checkpoint(*cp);
+                // Genesis cp (63) has no previous; the chain check can't
+                // produce a boundary error with curr=63 in practice, but
+                // guarded defensively with checked_sub.
+                if let Some(prev) = cp.checked_sub(history_format::CHECKPOINT_FREQUENCY) {
+                    failures.record_checkpoint(prev);
+                }
+            }
+        }
+    }
+
+    /// True iff the tracker holds any failure of any kind.
+    pub async fn has_failures(&self) -> bool {
+        !self.failures.lock().await.is_empty()
+    }
+
+    /// Generate and log a complete report of the operation results.
     pub async fn report(&self, operation: &str) {
         let successful = self.successful_files.load(Ordering::Relaxed);
-        let failed = self.failed_files.load(Ordering::Relaxed);
         let skipped = self.skipped_files.load(Ordering::Relaxed);
         let retries = self.retry_count.load(Ordering::Relaxed);
 
-        if operation == "mirror" {
-            info!(
-                "Mirror completed: {} files copied, {} failed, {} skipped",
-                successful, failed, skipped
-            );
-        } else if operation == "repair" {
-            info!(
-                "Repair completed: {} files processed, {} failed",
-                successful, failed
-            );
-        } else {
-            let missing_required = self.missing_required.load(Ordering::Relaxed);
-            info!(
-                "Scan complete: {} files found, {} missing ({} required)",
-                successful, failed, missing_required
-            );
+        let failures = self.failures.lock().await;
+        let total_file_failures = failures.total_file_failures();
+        let total_bucket_failures = failures.buckets.len() as u32;
+        let checkpoint_failures = failures.checkpoints.len() as u32;
+        let total_failures = total_file_failures + total_bucket_failures;
+
+        match operation {
+            "mirror" => info!(
+                "Mirror completed: {successful} files copied, {total_failures} failed, {skipped} skipped"
+            ),
+            "repair" => info!(
+                "Repair completed: {successful} files processed, {total_failures} failed"
+            ),
+            _ => info!("Scan complete: {successful} files found, {total_failures} missing"),
         }
 
-        // Debug-level stats summary
         debug!(
-            "Stats: {} successful, {} failed, {} skipped, {} retries",
-            successful, failed, skipped, retries
+            "Stats: {successful} successful, {total_failures} failed, {skipped} skipped, {retries} retries"
         );
 
-        if failed == 0 {
+        if failures.is_empty() {
             return;
         }
 
-        let missing_history = self.missing_history.load(Ordering::Relaxed);
-        let missing_ledger = self.missing_ledger.load(Ordering::Relaxed);
-        let missing_transactions = self.missing_transactions.load(Ordering::Relaxed);
-        let missing_results = self.missing_results.load(Ordering::Relaxed);
-        let missing_buckets = self.missing_buckets.load(Ordering::Relaxed);
-        let missing_scp = self.missing_scp.load(Ordering::Relaxed);
-
+        if failures.well_known {
+            error!("Missing or unreadable .well-known/stellar-history.json");
+        }
+        let missing_history = failures.count_files(FileFlags::HISTORY);
+        let missing_ledger = failures.count_files(FileFlags::LEDGER);
+        let missing_transactions = failures.count_files(FileFlags::TRANSACTIONS);
+        let missing_results = failures.count_files(FileFlags::RESULTS);
+        let missing_scp = failures.count_files(FileFlags::SCP);
         if missing_history > 0 {
-            error!("Missing {} history files", missing_history);
+            error!("Missing {missing_history} history files");
         }
         if missing_ledger > 0 {
-            error!("Missing {} ledger files", missing_ledger);
+            error!("Missing {missing_ledger} ledger header files");
         }
         if missing_transactions > 0 {
-            error!("Missing {} transactions files", missing_transactions);
+            error!("Missing {missing_transactions} transactions files");
         }
         if missing_results > 0 {
-            error!("Missing {} results files", missing_results);
+            error!("Missing {missing_results} results files");
         }
-        if missing_buckets > 0 {
-            error!("Missing {} buckets", missing_buckets);
+        if total_bucket_failures > 0 {
+            error!("Missing {total_bucket_failures} bucket files");
         }
         if missing_scp > 0 {
-            warn!("Missing {} optional scp files", missing_scp);
+            warn!("Missing {missing_scp} optional scp files");
         }
-    }
-
-    pub fn has_failures(&self) -> bool {
-        self.failed_files.load(Ordering::Relaxed) > 0
+        if checkpoint_failures > 0 {
+            error!("{checkpoint_failures} checkpoint(s) failed verification (cross-file or chain)");
+        }
     }
 }
 

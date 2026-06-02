@@ -1,7 +1,7 @@
 //! Mirror operation - copies files from source to destination
 
 use crate::history_format;
-use crate::pipeline::{async_trait, Operation};
+use crate::pipeline::{async_trait, Operation, ProcessOutcome};
 use crate::storage::cleanup_partial_file;
 use crate::storage::{self, Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
@@ -208,7 +208,9 @@ impl MirrorOperation {
         match self.dst_store.copy_from_reader(path, reader).await {
             Ok(()) => Ok(()),
             Err(e) => {
-                cleanup_partial_file(&self.dst_store, path).await?;
+                if let Err(cleanup_err) = cleanup_partial_file(&self.dst_store, path).await {
+                    error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
+                }
                 Err(e)
             }
         }
@@ -356,40 +358,27 @@ impl Operation for MirrorOperation {
             .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))
     }
 
-    async fn pre_check(&self, path: &str) -> Option<Result<(), StorageError>> {
-        // Check destination before querying source, skip if file already exists
-        match self.dst_store.exists(path).await {
-            Ok(true) => {
-                // If file exists and we're not overwriting, skip it
-                if !self.overwrite {
-                    return Some(Ok(()));
-                }
-                // Overwrite mode - proceed to download
-                None
-            }
-            Ok(false) => {
-                // File doesn't exist - proceed to download
-                None
-            }
-            Err(e) => {
-                // Failed to check existence on destination
-                Some(Err(StorageError::fatal(format!(
-                    "Failed to check existence of destination {path}: {e}"
-                ))))
-            }
+    async fn process_object(
+        &self,
+        _checkpoint: u32,
+        path: &str,
+        src_store: &StorageRef,
+    ) -> Result<ProcessOutcome, StorageError> {
+        // Skip if dst already has the file and we're not overwriting.
+        if self.dst_store.exists(path).await? && !self.overwrite {
+            return Ok(ProcessOutcome::Skipped);
         }
-    }
 
-    async fn process_object(&self, path: &str, src_store: &StorageRef) -> Result<(), StorageError> {
         let reader = src_store.open_reader(path).await?;
         if let Some(ref manager) = self.verification_manager {
             if crate::history_format::is_bucket_file(path) {
-                match crate::verify::verify_and_write_bucket(path, reader, &self.dst_store).await {
-                    Ok(()) => Ok(()),
-                    Err(e) => {
-                        cleanup_partial_file(&self.dst_store, path).await?;
-                        Err(e)
+                if let Err(e) =
+                    crate::verify::verify_and_write_bucket(path, reader, &self.dst_store).await
+                {
+                    if let Err(cleanup_err) = cleanup_partial_file(&self.dst_store, path).await {
+                        error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
                     }
+                    return Err(e);
                 }
             } else if crate::history_format::is_ledger_header_file(path)
                 || crate::history_format::is_transactions_file(path)
@@ -403,7 +392,11 @@ impl Operation for MirrorOperation {
                     {
                         Ok(result) => result,
                         Err(e) => {
-                            cleanup_partial_file(&self.dst_store, path).await?;
+                            if let Err(cleanup_err) =
+                                cleanup_partial_file(&self.dst_store, path).await
+                            {
+                                error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
+                            }
                             return Err(e);
                         }
                     };
@@ -425,13 +418,13 @@ impl Operation for MirrorOperation {
                     }
                     XdrParseResult::None => {}
                 }
-                Ok(())
             } else {
-                self.copy_file(path, reader).await
+                self.copy_file(path, reader).await?;
             }
         } else {
-            self.copy_file(path, reader).await
+            self.copy_file(path, reader).await?;
         }
+        Ok(ProcessOutcome::Processed)
     }
 
     async fn finalize(
@@ -440,29 +433,23 @@ impl Operation for MirrorOperation {
         stats: &ArchiveStats,
     ) -> Result<(), crate::pipeline::Error> {
         if let Some(ref manager) = self.verification_manager {
-            let chain_errors = manager.verify_checkpoint_chain();
-            for err in &chain_errors {
-                error!("Checkpoint {}: {}", err.checkpoint, err.message);
-                stats.record_failure("xdr-chain-verification").await;
+            manager.verify_checkpoint_chain();
+            let all_errors = manager.get_errors();
+            for err in &all_errors {
+                stats.record_verification_failure(&err.kind).await;
             }
 
-            let accumulated_errors = manager.get_errors();
-            for _ in &accumulated_errors {
-                stats.record_failure("xdr-cross-verification").await;
-            }
-
-            let total_errors = chain_errors.len() + accumulated_errors.len();
-            if total_errors > 0 {
+            if !all_errors.is_empty() {
                 error!(
                     "XDR verification found {} cross-file hash mismatches",
-                    total_errors
+                    all_errors.len()
                 );
             }
         }
 
         stats.report("mirror").await;
 
-        if stats.has_failures() {
+        if stats.has_failures().await {
             return Err(Error::MirrorFailed.into());
         }
 
@@ -481,13 +468,13 @@ impl Operation for MirrorOperation {
     }
 
     /// Mirror writes the history buffer to its own dst.
-    async fn process_buffer(&self, path: &str, buffer: Buffer, stats: &ArchiveStats) {
-        match storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await {
-            Ok(()) => stats.record_success(path),
-            Err(e) => {
-                error!("Failed to write history file {}: {}", path, e);
-                stats.record_failure(path).await;
-            }
-        }
+    async fn process_buffer(
+        &self,
+        _checkpoint: u32,
+        path: &str,
+        buffer: Buffer,
+    ) -> Result<ProcessOutcome, StorageError> {
+        storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await?;
+        Ok(ProcessOutcome::Processed)
     }
 }
