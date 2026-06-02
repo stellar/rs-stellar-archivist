@@ -25,7 +25,9 @@
 
 use crate::history_format;
 use crate::mirror_operation::MirrorOperation;
-use crate::pipeline::{self, async_trait, Operation, Pipeline, PipelineConfig, ProcessOutcome};
+use crate::pipeline::{
+    self, async_trait, HistoryFetch, Operation, Pipeline, PipelineConfig, ProcessOutcome,
+};
 use crate::storage::{self, Error as StorageError, ErrorClass, StorageRef};
 use crate::utils::{self, ArchiveStats};
 use crate::xdr_verify::{self, XdrParseResult, XdrVerificationManager};
@@ -619,12 +621,12 @@ impl Operation for RepairOperation {
         history_path: &str,
         src_store: &StorageRef,
         dst_store: Option<&StorageRef>,
-    ) -> Result<Buffer, StorageError> {
+    ) -> Result<HistoryFetch, StorageError> {
         // Try reading from destination (local, cheap)
         if let Some(dst) = dst_store {
             if let Ok(buffer) = storage::download_buffer(dst, history_path).await {
                 if history_format::parse_history(&buffer, history_path).is_ok() {
-                    return Ok(buffer);
+                    return Ok(HistoryFetch::Available(buffer));
                 }
                 // Exists but corrupt — fall through to source
             }
@@ -637,7 +639,9 @@ impl Operation for RepairOperation {
         }
 
         // Download from source (pipeline will write to dst via process_buffer)
-        storage::download_buffer(src_store, history_path).await
+        Ok(HistoryFetch::Available(
+            storage::download_buffer(src_store, history_path).await?,
+        ))
     }
 
     async fn finalize(

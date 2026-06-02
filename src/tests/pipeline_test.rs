@@ -9,7 +9,9 @@
 //! Per-cp file count under `skip_optional=true`: 3 files (ledger,
 //! transactions, results) → 3 `process_object` calls per cp.
 
-use crate::pipeline::{async_trait, Operation, Pipeline, PipelineConfig, ProcessOutcome};
+use crate::pipeline::{
+    async_trait, HistoryFetch, Operation, Pipeline, PipelineConfig, ProcessOutcome,
+};
 use crate::storage::{Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::ArchiveStats;
 use opendal::{Buffer, Reader};
@@ -150,7 +152,7 @@ impl Operation for TestOperation {
         _history_path: &str,
         _src_store: &StorageRef,
         _dst_store: Option<&StorageRef>,
-    ) -> Result<Buffer, StorageError> {
+    ) -> Result<HistoryFetch, StorageError> {
         // Fatal so `with_retries` returns immediately; pipeline records HISTORY
         // failure and falls through to per-cp file processing.
         Err(StorageError::fatal("test stub: no history"))

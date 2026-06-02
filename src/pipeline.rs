@@ -58,9 +58,9 @@ const PROGRESS_REPORTING_FREQUENCY: usize = 100;
 ///
 /// Returned inside `Ok(_)`; the pipeline maps it to the matching
 /// `ArchiveStats` recorder: `Processed` → `record_success`,
-/// `Skipped` → `record_skipped`. Errors are signaled via `Err(_)` in the
-/// surrounding `Result` and recorded by the pipeline as `record_failure`
-/// (after retries exhaust).
+/// `Skipped` → `record_skipped`, `NeedsRepair` → `record_failure`. Errors are
+/// signaled via `Err(_)` in the surrounding `Result` and recorded by the
+/// pipeline as `record_failure` (after retries exhaust).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProcessOutcome {
     /// The operation did its work successfully.
@@ -68,6 +68,55 @@ pub enum ProcessOutcome {
     /// The operation deliberately did no work (e.g. mirror found the file
     /// already present at dst).
     Skipped,
+    /// The operation determined this object needs repair but performed no work
+    /// (e.g. repair dry-run). Recorded as a failure so it appears in
+    /// stats/report, without being an error. Scan/mirror never return this.
+    NeedsRepair,
+}
+
+/// Success outcome of [`Operation::fetch_history_buffer`].
+///
+/// `NeedsRepair` rides on the `Ok` side (not the error channel) so the retry
+/// layer never acts on it: repair uses it to signal "record this checkpoint's
+/// history and skip its bucket discovery" (dry-run), while genuine fetch
+/// failures stay in `Err(StorageError)`.
+pub enum HistoryFetch {
+    /// History downloaded and ready to parse/process.
+    Available(Buffer),
+    /// History needs repair; record it and skip bucket discovery for this cp.
+    NeedsRepair,
+}
+
+impl HistoryFetch {
+    /// Interpret a history-fetch result for checkpoint `cp`: return the buffer
+    /// to process, or `None` (logging why) when the history should be recorded
+    /// as a HISTORY failure and its buckets skipped. The caller does the
+    /// recording, since that needs async stats access.
+    fn buffer_or_skip(
+        result: Result<Self, crate::storage::Error>,
+        cp: u32,
+        history_path: &str,
+    ) -> Option<Buffer> {
+        match result {
+            Ok(HistoryFetch::Available(buf)) => Some(buf),
+            Ok(HistoryFetch::NeedsRepair) => {
+                // Not an error: repair signaled this history needs repair
+                // (dry-run). The actual repair re-fetches history + buckets.
+                debug!(
+                    "History for checkpoint {cp} (0x{cp:08x}) recorded for repair; \
+                     skipping bucket discovery"
+                );
+                None
+            }
+            Err(e) => {
+                warn!(
+                    "Bucket references for checkpoint {cp} (0x{cp:08x}) were not checked \
+                     because {history_path} could not be downloaded: {e}"
+                );
+                None
+            }
+        }
+    }
 }
 
 /// Operation trait for scan, mirror, and repair.
@@ -108,15 +157,21 @@ pub trait Operation: Send + Sync + 'static {
 
     /// Fetch the history buffer for a checkpoint.
     ///
-    /// Default implementation downloads from `src_store` (scan/mirror behavior).
-    /// Repair overrides this to read from destination first, falling back to source.
+    /// Returns `Ok(HistoryFetch::Available(buf))` to process the buffer,
+    /// `Ok(HistoryFetch::NeedsRepair)` to record the history as needing repair
+    /// and skip its bucket discovery (repair dry-run), or `Err(_)` on a genuine
+    /// fetch error. Default implementation downloads from `src_store`
+    /// (scan/mirror behavior). Repair overrides this to read from destination
+    /// first, falling back to source.
     async fn fetch_history_buffer(
         &self,
         history_path: &str,
         src_store: &StorageRef,
         _dst_store: Option<&StorageRef>,
-    ) -> Result<Buffer, crate::storage::Error> {
-        download_buffer(src_store, history_path).await
+    ) -> Result<HistoryFetch, crate::storage::Error> {
+        Ok(HistoryFetch::Available(
+            download_buffer(src_store, history_path).await?,
+        ))
     }
 
     /// Write a fetched buffer (currently the history file) to the operation's
@@ -349,7 +404,7 @@ impl<Op: Operation> Pipeline<Op> {
     ) -> Option<(HistoryFileState, Buffer)> {
         let history_path = checkpoint_path("history", checkpoint);
 
-        let Ok(buffer) = utils::with_retries(
+        let fetched = utils::with_retries(
             self.config.storage_config.max_retries as u32,
             self.config.storage_config.retry_min_delay.as_millis() as u64,
             "download history",
@@ -362,13 +417,11 @@ impl<Op: Operation> Pipeline<Op> {
                 )
             },
         )
-        .await
-        else {
-            warn!(
-                "Bucket references for checkpoint {} (0x{:08x}) were not checked \
-                 because {} could not be downloaded",
-                checkpoint, checkpoint, history_path
-            );
+        .await;
+
+        // `buffer_or_skip` classifies + logs; both skip cases (needs-repair and
+        // fetch error) record the HISTORY failure here and stop bucket discovery.
+        let Some(buffer) = HistoryFetch::buffer_or_skip(fetched, checkpoint, &history_path) else {
             self.stats.record_failure(checkpoint, &history_path).await;
             return None;
         };
@@ -441,6 +494,10 @@ impl<Op: Operation> Pipeline<Op> {
                 debug!("Skipped: {}", path);
                 self.stats.record_skipped(path);
             }
+            Ok(ProcessOutcome::NeedsRepair) => {
+                debug!("Needs repair: {}", path);
+                self.stats.record_failure(checkpoint, path).await;
+            }
             Err(_) => {
                 self.stats.record_failure(checkpoint, path).await;
             }
@@ -473,6 +530,10 @@ impl<Op: Operation> Pipeline<Op> {
             Ok(ProcessOutcome::Skipped) => {
                 debug!("Skipped: {}", path);
                 self.stats.record_skipped(&path);
+            }
+            Ok(ProcessOutcome::NeedsRepair) => {
+                debug!("Needs repair: {}", path);
+                self.stats.record_failure(checkpoint, &path).await;
             }
             Err(_) => {
                 self.stats.record_failure(checkpoint, &path).await;
