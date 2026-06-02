@@ -9,6 +9,8 @@ mod mirror_op_test;
 #[cfg(test)]
 mod path_normalization_test;
 #[cfg(test)]
+mod pipeline_test;
+#[cfg(test)]
 mod repair_op_test;
 #[cfg(test)]
 mod scan_op_test;

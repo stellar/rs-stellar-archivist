@@ -8,7 +8,6 @@ use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, Arc
 use crate::xdr_verify::XdrVerificationManager;
 use opendal::Buffer;
 use opendal::Reader;
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
@@ -54,8 +53,13 @@ pub struct MirrorOperation {
     // Cached destination checkpoint at start of operation (or None if destination doesn't exist)
     initial_dest_checkpoint: OnceCell<Option<u32>>,
 
-    // Populated if we should verify files, otherwise None
-    verification_manager: Option<Arc<XdrVerificationManager>>,
+    // Whether finalize should update the destination's .well-known file with
+    // the highest mirrored checkpoint. The top-level mirror operation (driven
+    // by `Pipeline::run` over a contiguous range) sets this to true. Sub-uses
+    // such as repair's retry pipeline — which re-mirror a disjoint subset and
+    // therefore cannot claim a contiguous "now mirrored up to" — set it to
+    // false to avoid advertising partial coverage in the dst archive.
+    update_well_known: bool,
 }
 
 impl MirrorOperation {
@@ -66,7 +70,7 @@ impl MirrorOperation {
         high: Option<u32>,
         allow_mirror_gaps: bool,
         storage_config: &StorageConfig,
-        verify: bool,
+        update_well_known: bool,
     ) -> Self {
         debug_assert!(
             dst_store.supports_writes(),
@@ -81,11 +85,7 @@ impl MirrorOperation {
             allow_mirror_gaps,
             storage_config: storage_config.clone(),
             initial_dest_checkpoint: OnceCell::new(),
-            verification_manager: if verify {
-                Some(Arc::new(XdrVerificationManager::new()))
-            } else {
-                None
-            },
+            update_well_known,
         }
     }
 
@@ -360,9 +360,9 @@ impl Operation for MirrorOperation {
 
     async fn process_object(
         &self,
-        _checkpoint: u32,
         path: &str,
         src_store: &StorageRef,
+        manager: Option<&XdrVerificationManager>,
     ) -> Result<ProcessOutcome, StorageError> {
         // Skip if dst already has the file and we're not overwriting.
         if self.dst_store.exists(path).await? && !self.overwrite {
@@ -370,7 +370,7 @@ impl Operation for MirrorOperation {
         }
 
         let reader = src_store.open_reader(path).await?;
-        if let Some(ref manager) = self.verification_manager {
+        if let Some(manager) = manager {
             if crate::history_format::is_bucket_file(path) {
                 if let Err(e) =
                     crate::verify::verify_and_write_bucket(path, reader, &self.dst_store).await
@@ -432,25 +432,14 @@ impl Operation for MirrorOperation {
         highest_checkpoint: u32,
         stats: &ArchiveStats,
     ) -> Result<(), crate::pipeline::Error> {
-        if let Some(ref manager) = self.verification_manager {
-            manager.verify_checkpoint_chain();
-            let all_errors = manager.get_errors();
-            for err in &all_errors {
-                stats.record_verification_failure(&err.kind).await;
-            }
-
-            if !all_errors.is_empty() {
-                error!(
-                    "XDR verification found {} cross-file hash mismatches",
-                    all_errors.len()
-                );
-            }
-        }
-
         stats.report("mirror").await;
 
         if stats.has_failures().await {
             return Err(Error::MirrorFailed.into());
+        }
+
+        if !self.update_well_known {
+            return Ok(());
         }
 
         if let Err(e) = self.maybe_update_well_known(highest_checkpoint).await {
@@ -461,16 +450,9 @@ impl Operation for MirrorOperation {
         Ok(())
     }
 
-    fn finalize_checkpoint(&self, checkpoint: u32) {
-        if let Some(ref manager) = self.verification_manager {
-            manager.verify_and_release(checkpoint);
-        }
-    }
-
     /// Mirror writes the history buffer to its own dst.
     async fn process_buffer(
         &self,
-        _checkpoint: u32,
         path: &str,
         buffer: Buffer,
     ) -> Result<ProcessOutcome, StorageError> {

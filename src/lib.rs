@@ -248,12 +248,7 @@ pub mod test_helpers {
     }
 
     pub async fn run_scan(config: ScanConfig) -> Result<(), crate::Error> {
-        let operation = ScanOperation::new(
-            config.low,
-            config.high,
-            &config.storage_config,
-            config.verify,
-        );
+        let operation = ScanOperation::new(config.low, config.high, &config.storage_config);
 
         let src_store =
             crate::storage::from_url_with_config(&config.archive, &config.storage_config).map_err(
@@ -263,6 +258,7 @@ pub mod test_helpers {
         let pipeline_config = PipelineConfig {
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
+            verify: config.verify,
             storage_config: config.storage_config,
         };
 
@@ -298,12 +294,13 @@ pub mod test_helpers {
             config.high,
             config.allow_mirror_gaps,
             &config.storage_config,
-            config.verify,
+            /*update_well_known=*/ true,
         );
 
         let pipeline_config = PipelineConfig {
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
+            verify: config.verify,
             storage_config: config.storage_config,
         };
 
@@ -432,6 +429,7 @@ pub mod test_helpers {
         let pipeline_config = PipelineConfig {
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
+            verify: config.verify,
             storage_config: config.storage_config,
         };
 

@@ -199,6 +199,28 @@ impl FailureTracker {
     pub fn total_file_failures(&self) -> u32 {
         self.files.values().map(FileFlags::count).sum::<u32>()
     }
+
+    /// Record a verification failure, dispatching on its kind:
+    /// - `Ledger(seq)` and `Checkpoint(cp)` mark a single checkpoint as
+    ///   problematic.
+    /// - `Boundary(cp)` marks both `cp` and its previous checkpoint, since
+    ///   a chain break implicates both ends.
+    pub fn record_verification_failure(&mut self, kind: &VerificationErrorType) {
+        match kind {
+            VerificationErrorType::Ledger(seq) => {
+                self.record_checkpoint(history_format::round_to_upper_checkpoint(*seq));
+            }
+            VerificationErrorType::Checkpoint(cp) => {
+                self.record_checkpoint(*cp);
+            }
+            VerificationErrorType::Boundary(cp) => {
+                self.record_checkpoint(*cp);
+                if let Some(prev) = cp.checked_sub(history_format::CHECKPOINT_FREQUENCY) {
+                    self.record_checkpoint(prev);
+                }
+            }
+        }
+    }
 }
 
 /// Classify a path into a `FileFlags` constant, or `None` if not a recognized
@@ -300,35 +322,6 @@ impl ArchiveStats {
             }
         } else if let Some(flag) = path_to_file_flag(path) {
             failures.unrecord_file(cp, flag);
-        }
-    }
-
-    /// Record a verification failure, dispatching on its kind:
-    /// - `Ledger(seq)` and `Checkpoint(cp)` mark a single checkpoint as
-    ///   problematic.
-    /// - `Boundary(cp)` marks both `cp` and its previous checkpoint, since
-    ///   a chain break implicates both ends.
-    ///
-    /// Repair only needs cp granularity; all variants funnel into the same
-    /// `checkpoints` set in the FailureTracker.
-    pub async fn record_verification_failure(&self, kind: &VerificationErrorType) {
-        let mut failures = self.failures.lock().await;
-        match kind {
-            VerificationErrorType::Ledger(seq) => {
-                failures.record_checkpoint(history_format::round_to_upper_checkpoint(*seq));
-            }
-            VerificationErrorType::Checkpoint(cp) => {
-                failures.record_checkpoint(*cp);
-            }
-            VerificationErrorType::Boundary(cp) => {
-                failures.record_checkpoint(*cp);
-                // Genesis cp (63) has no previous; the chain check can't
-                // produce a boundary error with curr=63 in practice, but
-                // guarded defensively with checked_sub.
-                if let Some(prev) = cp.checked_sub(history_format::CHECKPOINT_FREQUENCY) {
-                    failures.record_checkpoint(prev);
-                }
-            }
         }
     }
 

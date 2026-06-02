@@ -523,6 +523,7 @@ impl XdrVerificationManager {
 
         let entries: Vec<_> = boundaries.iter().collect();
 
+        // TODO: need to handle corner case of only 1 entry.
         for window in entries.windows(2) {
             let (&prev_checkpoint, prev_boundary) = window[0];
             let (&curr_checkpoint, curr_boundary) = window[1];
@@ -556,6 +557,28 @@ impl XdrVerificationManager {
     /// returns a fresh `Vec`; the manager retains the underlying state.
     pub fn get_errors(&self) -> Vec<VerificationError> {
         self.errors.lock().unwrap().clone()
+    }
+
+    /// Drain accumulated verification errors directly into the supplied
+    /// `FailureTracker` (which the caller already owns mutably — e.g. via
+    /// `stats.failures.get_mut()` inside `Operation::finalize`). All
+    /// variants funnel into the `checkpoints` slot — these are
+    /// cross-file/cross-cp inconsistencies, not per-file failures.
+    ///
+    /// Sync because the caller has exclusive `&mut` access and the
+    /// manager's std `Mutex` is held only briefly across the iteration.
+    /// No clone, no `.await`.
+    pub fn record_all_errors(&self, failures: &mut crate::utils::FailureTracker) {
+        let errors = self.errors.lock().unwrap();
+        for err in errors.iter() {
+            failures.record_verification_failure(&err.kind);
+        }
+        if !errors.is_empty() {
+            error!(
+                "XDR verification found {} cross-file or chain inconsistency error(s)",
+                errors.len()
+            );
+        }
     }
 }
 

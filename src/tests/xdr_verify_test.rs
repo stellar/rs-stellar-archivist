@@ -938,3 +938,105 @@ fn test_parse_rejects_ledger_outside_checkpoint_range(#[case] file_type: &str) {
     };
     assert!(err.message.contains("outside expected checkpoint range"));
 }
+
+//=============================================================================
+// record_all_errors — drains manager errors into ArchiveStats.failures.checkpoints
+//=============================================================================
+
+#[test]
+fn test_record_all_errors_empty_manager_is_noop() {
+    let manager = XdrVerificationManager::new();
+    let mut failures = crate::utils::FailureTracker::default();
+
+    manager.record_all_errors(&mut failures);
+
+    assert!(failures.is_empty());
+    assert!(failures.checkpoints.is_empty());
+    assert!(failures.files.is_empty());
+    assert!(failures.buckets.is_empty());
+    assert!(!failures.well_known);
+}
+
+#[test]
+fn test_record_all_errors_drains_each_variant() {
+    let manager = XdrVerificationManager::new();
+
+    // Trigger a `Checkpoint(cp)` error via a completeness failure.
+    manager.record_header_data(127, create_checkpoint_data_missing(127, &[100]));
+    manager.verify_and_release(127);
+
+    // Trigger a `Ledger(seq)` error via an internal chain break.
+    let mut chain_break_data = create_complete_checkpoint_data(191, [0; 32]);
+    chain_break_data.get_mut(&150).unwrap().prev_hash = Hash([0xff; 32]);
+    manager.record_header_data(191, chain_break_data);
+    manager.verify_and_release(191);
+
+    // Sanity: manager has accumulated errors.
+    assert!(!manager.get_errors().is_empty());
+
+    let mut failures = crate::utils::FailureTracker::default();
+    manager.record_all_errors(&mut failures);
+
+    // Checkpoint(127) → cp 127.
+    assert!(failures.checkpoints.contains(&127));
+    // Ledger(150) → round_to_upper_checkpoint(150) = 191.
+    assert!(failures.checkpoints.contains(&191));
+    // Nothing should land in files/buckets/well_known — all manager errors are
+    // cp-level cross-file/chain inconsistencies.
+    assert!(failures.files.is_empty());
+    assert!(failures.buckets.is_empty());
+    assert!(!failures.well_known);
+}
+
+#[test]
+fn test_record_all_errors_boundary_inserts_both_cps() {
+    let manager = XdrVerificationManager::new();
+
+    // Build two adjacent cps (127 and 191) where the boundary hash chain
+    // breaks: cp 127 ends with one computed hash, cp 191's first prev_hash
+    // doesn't match.
+    let data_127 = create_complete_checkpoint_data(127, [0; 32]);
+    manager.record_header_data(127, data_127);
+    manager.verify_and_release(127);
+
+    // cp 191's first ledger (128) has prev_hash that won't match cp 127's last
+    // computed_hash.
+    let mut data_191 = create_complete_checkpoint_data(191, [0xab; 32]);
+    // Make the internal chain self-consistent but mismatched with cp 127.
+    let mut prev_hash = [0xab; 32];
+    for (seq, entry) in &mut data_191 {
+        entry.prev_hash = Hash(prev_hash);
+        prev_hash = entry.computed_hash.0;
+        let _ = seq;
+    }
+    manager.record_header_data(191, data_191);
+    manager.verify_and_release(191);
+
+    manager.verify_checkpoint_chain();
+
+    let mut failures = crate::utils::FailureTracker::default();
+    manager.record_all_errors(&mut failures);
+
+    // Boundary(191) records both 191 and 191-64=127.
+    assert!(failures.checkpoints.contains(&191));
+    assert!(failures.checkpoints.contains(&127));
+}
+
+#[test]
+fn test_record_all_errors_idempotent() {
+    let manager = XdrVerificationManager::new();
+    manager.record_header_data(127, create_checkpoint_data_missing(127, &[100]));
+    manager.verify_and_release(127);
+
+    let mut failures = crate::utils::FailureTracker::default();
+    manager.record_all_errors(&mut failures);
+    let cps_after_first = failures.checkpoints.clone();
+
+    // Calling again should produce the same set (BTreeSet semantics + manager
+    // retains its accumulated state).
+    manager.record_all_errors(&mut failures);
+    let cps_after_second = failures.checkpoints.clone();
+
+    assert_eq!(cps_after_first, cps_after_second);
+    assert!(cps_after_first.contains(&127));
+}

@@ -8,6 +8,7 @@ use crate::{
     history_format::{self, bucket_path, checkpoint_path, HistoryFileState},
     storage::{download_buffer, StorageConfig, StorageRef},
     utils::{self, ArchiveStats},
+    xdr_verify::XdrVerificationManager,
 };
 use futures_util::{
     future::{join, join3, join_all},
@@ -88,20 +89,22 @@ pub trait Operation: Send + Sync + 'static {
     ///   exhaust is recorded by the pipeline.
     ///
     /// `checkpoint` is the context cp; for buckets, the discovering cp.
+    /// `manager` is `Some` iff the pipeline was constructed with
+    /// `PipelineConfig::verify = true` — operations should branch on it
+    /// to decide between verify-and-record vs existence-only / plain-copy
+    /// paths, and call `manager.record_*` to feed per-file XDR data into
+    /// the pipeline's manager.
     async fn process_object(
         &self,
-        checkpoint: u32,
         path: &str,
         _src_store: &StorageRef,
+        manager: Option<&XdrVerificationManager>,
     ) -> Result<ProcessOutcome, crate::storage::Error>;
 
-    /// Called when all work is complete. Pipeline passes stats for operations
-    /// that need to check failure counts or record additional failures
-    /// (e.g., cross-validation).
+    /// Called by `Pipeline::finish` after the manager (if any) has been
+    /// drained into `stats.failures`. The operation is responsible for
+    /// reporting and deciding `has_failures`-gated success.
     async fn finalize(&self, highest_checkpoint: u32, stats: &ArchiveStats) -> Result<(), Error>;
-
-    /// Called when all files for a checkpoint have been processed.
-    fn finalize_checkpoint(&self, _checkpoint: u32) {}
 
     /// Fetch the history buffer for a checkpoint.
     ///
@@ -124,7 +127,6 @@ pub trait Operation: Send + Sync + 'static {
     /// repair skips the write in dry-run mode and otherwise writes like mirror.
     async fn process_buffer(
         &self,
-        checkpoint: u32,
         path: &str,
         buffer: Buffer,
     ) -> Result<ProcessOutcome, crate::storage::Error>;
@@ -140,6 +142,11 @@ pub struct PipelineConfig {
     pub concurrency: usize,
     /// Whether to skip optional SCP files
     pub skip_optional: bool,
+    /// Whether to construct the pipeline's XDR verification manager. When
+    /// true, `process_object` receives `Some(&XdrVerificationManager)` and
+    /// the pipeline drives `verify_and_release` per cp + chain check + drain
+    /// at the end of `run_checkpoints`.
+    pub verify: bool,
     /// Storage layer configuration (retry, timeout, bandwidth, etc.)
     pub storage_config: StorageConfig,
 }
@@ -153,6 +160,12 @@ pub struct Pipeline<Op: Operation> {
     /// Hash → () presence cache used by `process_buckets` to skip buckets
     /// already seen elsewhere in this pipeline run.
     bucket_lru: Mutex<LruCache<String, ()>>,
+    /// XDR verification manager — `Some` iff `config.verify` is true.
+    /// Pipeline drives the full manager lifecycle (record-per-file via the
+    /// `process_object` parameter, `verify_and_release` per cp in
+    /// `process_checkpoint`, `verify_checkpoint_chain` + `record_all_errors`
+    /// drain at the end of `run_checkpoints`).
+    verification_manager: Option<XdrVerificationManager>,
 }
 
 impl<Op: Operation> Pipeline<Op> {
@@ -164,6 +177,7 @@ impl<Op: Operation> Pipeline<Op> {
         src_store: StorageRef,
         dst_store: Option<StorageRef>,
     ) -> Self {
+        let verification_manager = config.verify.then(XdrVerificationManager::new);
         let bucket_lru = Mutex::new(LruCache::new(
             std::num::NonZeroUsize::new(BUCKET_LRU_CACHE_SIZE).unwrap(),
         ));
@@ -175,39 +189,93 @@ impl<Op: Operation> Pipeline<Op> {
             dst_store,
             stats: ArchiveStats::new(),
             bucket_lru,
+            verification_manager,
         }
     }
 
-    pub async fn run(&self) -> Result<(), Error> {
+    /// Read-only handle to the pipeline's owned `ArchiveStats`. Use this when
+    /// a caller (e.g. repair's retry phase) needs to report or inspect the
+    /// pipeline's stats after `run_checkpoints` returns.
+    pub fn stats(&self) -> &ArchiveStats {
+        &self.stats
+    }
+
+    /// Full pipeline run — consumes the pipeline.
+    ///
+    /// Computes checkpoint bounds via the operation, drives the per-cp
+    /// loop, then hands off to [`Self::finish`].
+    pub async fn run(self) -> Result<(), Error> {
         let (lower_bound, upper_bound) = self
             .operation
             .get_checkpoint_bounds(&self.src_store)
             .await?;
 
         let total_count = history_format::count_checkpoints_in_range(lower_bound, upper_bound);
-        if total_count == 0 {
+        if total_count != 0 {
+            let checkpoints =
+                (lower_bound..=upper_bound).step_by(history_format::CHECKPOINT_FREQUENCY as usize);
+            self.run_checkpoints(checkpoints).await?;
+        } else {
             info!("No checkpoints to process");
+        }
+        self.finish(upper_bound).await
+    }
+
+    /// Run the pipeline over an explicit set of checkpoints (possibly
+    /// disjoint or non-consecutive). Each checkpoint is dispatched through
+    /// `process_checkpoint` and bounded by `config.concurrency`.
+    ///
+    /// Does **not** call `operation.finalize` — that's [`Self::finish`]'s job.
+    /// Callers that want the full lifecycle should use [`Self::run`] (or
+    /// pair `run_checkpoints` with an explicit `finish`).
+    /// An empty input is a no-op.
+    pub async fn run_checkpoints<I>(&self, cps: I) -> Result<(), Error>
+    where
+        I: IntoIterator<Item = u32>,
+    {
+        let cps: Vec<u32> = cps.into_iter().collect();
+        let total = cps.len();
+        if total == 0 {
             return Ok(());
         }
 
         let num_completed = std::sync::atomic::AtomicUsize::new(0);
         let completed_ref = &num_completed;
-        let checkpoints =
-            (lower_bound..=upper_bound).step_by(history_format::CHECKPOINT_FREQUENCY as usize);
 
-        stream::iter(checkpoints)
+        stream::iter(cps)
             .for_each_concurrent(self.config.concurrency, |ck| async move {
                 self.process_checkpoint(ck).await;
                 let done = completed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if done.is_multiple_of(PROGRESS_REPORTING_FREQUENCY) || done == total_count {
-                    info!("Progress: {}/{} checkpoints processed", done, total_count);
+                if done.is_multiple_of(PROGRESS_REPORTING_FREQUENCY) || done == total {
+                    info!("Progress: {}/{} checkpoints processed", done, total);
                 }
             })
             .await;
 
-        self.operation.finalize(upper_bound, &self.stats).await?;
+        // Batch-completion: run the cross-cp chain check and drain accumulated
+        // manager errors into `stats.failures`.
+        if let Some(manager) = &self.verification_manager {
+            manager.verify_checkpoint_chain();
+            manager.record_all_errors(&mut *self.stats.failures.lock().await);
+        }
 
         Ok(())
+    }
+
+    /// Consume the pipeline and run `operation.finalize` with `&stats` for
+    /// operation-specific wrap-up (report, has_failures gate, op-specific
+    /// side effects like well-known update.
+    pub async fn finish(self, highest_checkpoint: u32) -> Result<(), Error> {
+        let Self {
+            operation, stats, ..
+        } = self;
+        operation.finalize(highest_checkpoint, &stats).await
+    }
+
+    /// Consume the pipeline and return its `ArchiveStats`
+    pub fn into_stats(self) -> ArchiveStats {
+        let Self { stats, .. } = self;
+        stats
     }
 
     /// Process a single checkpoint: history+buckets concurrently with the
@@ -218,20 +286,12 @@ impl<Op: Operation> Pipeline<Op> {
     /// the pipeline machinery directly without `Pipeline::run`'s full bounds +
     /// iteration loop.
     pub async fn process_checkpoint(&self, checkpoint: u32) {
-        // History work: fetch + parse, then concurrently write the buffer to
-        // dst and process the buckets it references. Fetch/parse failures are
-        // logged and recorded inside `fetch_history_file_state`; on failure
-        // this future just returns early so the rest of the checkpoint's files
+        // History work fetches + parses + writes the history buffer and
+        // processes the bucket references it discovers. Fetch/parse failures
+        // are logged and recorded inside `fetch_history_file_state`; on
+        // failure the work returns early so the rest of the checkpoint's files
         // still get processed.
-        let history_work = async {
-            let Some((state, buffer)) = self.fetch_history_file_state(checkpoint).await else {
-                return;
-            };
-            let history_path = checkpoint_path("history", checkpoint);
-            let write_history_buffer = self.process_history_file(checkpoint, &history_path, buffer);
-            let buckets = self.process_buckets(checkpoint, state);
-            let _ = join(write_history_buffer, buckets).await;
-        };
+        let history_work = self.process_history_and_buckets(checkpoint);
 
         let cats = join_all(["ledger", "transactions", "results"].map(|cat| {
             let path = checkpoint_path(cat, checkpoint);
@@ -246,7 +306,28 @@ impl<Op: Operation> Pipeline<Op> {
             let _ = join3(history_work, cats, scp).await;
         }
 
-        self.operation.finalize_checkpoint(checkpoint);
+        // Per-cp manager release: drive `verify_and_release` for this cp's
+        // accumulated per-file data. Triggers intra-cp completeness, tx/result
+        // hash cross-checks, and the internal hash chain check.
+        if let Some(manager) = &self.verification_manager {
+            manager.verify_and_release(checkpoint);
+        }
+    }
+
+    /// Fetch + parse + write a checkpoint's history file, then process all the
+    /// bucket references it discovers.
+    ///
+    /// On history fetch/parse failure, `fetch_history_file_state` this method
+    /// returns early and buckets are not processed. On success, the history
+    /// buffer write and the bucket processing run concurrently.
+    pub(crate) async fn process_history_and_buckets(&self, checkpoint: u32) {
+        let Some((state, buffer)) = self.fetch_history_file_state(checkpoint).await else {
+            return;
+        };
+        let history_path = checkpoint_path("history", checkpoint);
+        let write_history_buffer = self.process_history_file(checkpoint, &history_path, buffer);
+        let buckets = self.process_buckets(checkpoint, state);
+        let _ = join(write_history_buffer, buckets).await;
     }
 
     /// Fetch and parse a checkpoint's history file. On download or parse
@@ -338,10 +419,7 @@ impl<Op: Operation> Pipeline<Op> {
             self.config.storage_config.retry_min_delay.as_millis() as u64,
             "process",
             path,
-            || {
-                self.operation
-                    .process_buffer(checkpoint, path, buffer.clone())
-            },
+            || self.operation.process_buffer(path, buffer.clone()),
         )
         .await;
 
@@ -362,15 +440,18 @@ impl<Op: Operation> Pipeline<Op> {
 
     /// Process a single file (bucket, ledger, transactions, results, scp).
     /// `checkpoint` is the cp context (for buckets, the discovering cp).
-    async fn process_file(&self, checkpoint: u32, path: String) {
+    pub(crate) async fn process_file(&self, checkpoint: u32, path: String) {
         let result = utils::with_retries(
             self.config.storage_config.max_retries as u32,
             self.config.storage_config.retry_min_delay.as_millis() as u64,
             "process",
             &path,
             || {
-                self.operation
-                    .process_object(checkpoint, &path, &self.src_store)
+                self.operation.process_object(
+                    &path,
+                    &self.src_store,
+                    self.verification_manager.as_ref(),
+                )
             },
         )
         .await;

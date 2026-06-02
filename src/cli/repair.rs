@@ -93,6 +93,7 @@ impl RepairCmd {
         let pipeline_config = PipelineConfig {
             concurrency: args.concurrency,
             skip_optional: args.skip_optional,
+            verify: args.verify,
             storage_config: args.storage_config,
         };
 

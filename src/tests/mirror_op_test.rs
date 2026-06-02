@@ -1032,3 +1032,68 @@ async fn test_mirror_verify_does_not_advance_well_known_on_verification_failure(
         baseline_ledger, after_ledger
     );
 }
+
+/// Mirror constructed with `update_well_known=false` must not write or advance
+/// the destination's `.well-known/stellar-history.json` even when it successfully
+/// mirrors checkpoint data. This is the contract repair's retry pipeline relies
+/// on: re-mirroring a disjoint subset of cps must not advertise partial coverage
+/// in the dst archive.
+#[tokio::test]
+async fn test_mirror_with_update_well_known_false_does_not_touch_well_known() {
+    use crate::mirror_operation::MirrorOperation;
+    use crate::pipeline::{Pipeline, PipelineConfig};
+    use crate::storage::from_url_with_config;
+
+    let src_archive = testnet_small_archive_path();
+    let src_url = file_url_from_path(&src_archive);
+
+    let temp_dir = TempDir::new().unwrap();
+    let dest_path = temp_dir.path().join("mirror_dest");
+    let dst_url = file_url_from_path(&dest_path);
+
+    let storage_config = test_storage_config();
+    let src_store = from_url_with_config(&src_url, &storage_config).unwrap();
+    let dst_store = from_url_with_config(&dst_url, &storage_config).unwrap();
+
+    let mirror_op = MirrorOperation::new(
+        dst_store.clone(),
+        /*overwrite=*/ true,
+        Some(64),
+        Some(127),
+        /*allow_mirror_gaps=*/ true,
+        &storage_config,
+        /*update_well_known=*/ false,
+    );
+
+    let pipeline = Pipeline::new(
+        mirror_op,
+        PipelineConfig {
+            concurrency: 4,
+            skip_optional: true,
+            verify: false,
+            storage_config: storage_config.clone(),
+        },
+        src_store,
+        Some(dst_store),
+    );
+
+    pipeline.run().await.expect("Mirror should succeed");
+
+    // At least one per-cp file must have been copied (proves the mirror actually ran).
+    let ledger_files: Vec<_> = WalkDir::new(&dest_path)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.file_type().is_file() && e.path().to_string_lossy().contains("ledger-"))
+        .collect();
+    assert!(
+        !ledger_files.is_empty(),
+        "expected ledger files to be mirrored to dst"
+    );
+
+    // But the .well-known file must NOT have been created.
+    let wellknown = dest_path.join(".well-known/stellar-history.json");
+    assert!(
+        !wellknown.exists(),
+        ".well-known should not be created when update_well_known=false"
+    );
+}

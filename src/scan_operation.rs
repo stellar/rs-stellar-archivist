@@ -5,9 +5,7 @@ use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, Arc
 use crate::xdr_verify::XdrVerificationManager;
 use opendal::Buffer;
 use opendal::Reader;
-use std::sync::Arc;
 use thiserror::Error;
-use tracing::error;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -31,27 +29,14 @@ pub struct ScanOperation {
 
     // Storage configuration (retry params for source fetches live here)
     storage_config: StorageConfig,
-
-    // Populated if we should verify files, otherwise None
-    verification_manager: Option<Arc<XdrVerificationManager>>,
 }
 
 impl ScanOperation {
-    pub fn new(
-        low: Option<u32>,
-        high: Option<u32>,
-        storage_config: &StorageConfig,
-        verify: bool,
-    ) -> Self {
+    pub fn new(low: Option<u32>, high: Option<u32>, storage_config: &StorageConfig) -> Self {
         Self {
             low,
             high,
             storage_config: storage_config.clone(),
-            verification_manager: if verify {
-                Some(Arc::new(XdrVerificationManager::new()))
-            } else {
-                None
-            },
         }
     }
 
@@ -95,11 +80,11 @@ impl Operation for ScanOperation {
 
     async fn process_object(
         &self,
-        _checkpoint: u32,
         path: &str,
         src_store: &StorageRef,
+        manager: Option<&XdrVerificationManager>,
     ) -> Result<ProcessOutcome, StorageError> {
-        if let Some(ref manager) = self.verification_manager {
+        if let Some(manager) = manager {
             // Verify mode: stream content and validate
             let reader = src_store.open_reader(path).await?;
             if crate::history_format::is_bucket_file(path) {
@@ -135,21 +120,6 @@ impl Operation for ScanOperation {
         _highest_checkpoint: u32,
         stats: &ArchiveStats,
     ) -> Result<(), crate::pipeline::Error> {
-        if let Some(ref manager) = self.verification_manager {
-            manager.verify_checkpoint_chain();
-            let all_errors = manager.get_errors();
-            for err in &all_errors {
-                stats.record_verification_failure(&err.kind).await;
-            }
-
-            if !all_errors.is_empty() {
-                error!(
-                    "XDR verification found {} cross-file hash mismatches",
-                    all_errors.len()
-                );
-            }
-        }
-
         stats.report("scan").await;
 
         if stats.has_failures().await {
@@ -159,16 +129,9 @@ impl Operation for ScanOperation {
         Ok(())
     }
 
-    fn finalize_checkpoint(&self, checkpoint: u32) {
-        if let Some(ref manager) = self.verification_manager {
-            manager.verify_and_release(checkpoint);
-        }
-    }
-
     /// Scan never writes — return `Processed` and let the pipeline record it.
     async fn process_buffer(
         &self,
-        _checkpoint: u32,
         _path: &str,
         _buffer: Buffer,
     ) -> Result<ProcessOutcome, StorageError> {

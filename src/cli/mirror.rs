@@ -59,12 +59,13 @@ impl MirrorCmd {
             self.high,
             self.allow_mirror_gaps,
             &args.storage_config,
-            args.verify,
+            /*update_well_known=*/ true,
         );
 
         let pipeline_config = PipelineConfig {
             concurrency: args.concurrency,
             skip_optional: args.skip_optional,
+            verify: args.verify,
             storage_config: args.storage_config,
         };
 

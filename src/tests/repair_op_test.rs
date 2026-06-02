@@ -788,7 +788,7 @@ async fn test_repair_http_source_to_filesystem() {
 }
 
 //=============================================================================
-// G. Download Verification (Phase 2 integrity)
+// G. Download Verification (checkpoint-retry integrity)
 //=============================================================================
 
 #[tokio::test]
@@ -1038,4 +1038,284 @@ async fn test_repair_wave1_failure_does_not_block_wave2() {
         !dest_dir.path().join(&deleted_ledger).exists(),
         "Ledger should still be missing (source doesn't have it)"
     );
+}
+
+//=============================================================================
+// M. File-retry HISTORY special case — re-fetches history file AND walks
+// referenced buckets to surface buckets the main pass never probed.
+//=============================================================================
+
+/// Build a `RepairOperation` directly (no pipeline) for in-isolation
+/// testing of `retry_failed_files` / `retry_failed_checkpoints`.
+fn build_repair_op(
+    src_url: &str,
+    dst_url: &str,
+    verify: bool,
+) -> crate::repair_operation::RepairOperation {
+    let storage_config = crate::test_helpers::test_storage_config();
+    let src_store = crate::storage::from_url_with_config(src_url, &storage_config).unwrap();
+    let dst_store = crate::storage::from_url_with_config(dst_url, &storage_config).unwrap();
+    crate::repair_operation::RepairOperation::new(
+        src_store,
+        dst_store,
+        /*low=*/ None,
+        /*high=*/ None,
+        verify,
+        /*dry_run=*/ false,
+        /*concurrency=*/ 4,
+        /*skip_optional=*/ false,
+        &storage_config,
+    )
+}
+
+/// Locate a history file in dst, return (its absolute path, cp, bucket-hashes
+/// it references, those bucket files' absolute paths).
+fn pick_history_with_buckets(
+    dst_dir: &Path,
+) -> (
+    std::path::PathBuf,
+    u32,
+    BTreeSet<String>,
+    Vec<std::path::PathBuf>,
+) {
+    let history_files: Vec<_> = get_files_by_pattern(dst_dir, "/history-")
+        .into_iter()
+        .filter(|p| !p.to_string_lossy().contains(".well-known"))
+        .collect();
+    assert!(
+        !history_files.is_empty(),
+        "need a non-well-known history file"
+    );
+
+    for hf in &history_files {
+        let hashes = buckets_from_history_file(hf);
+        if hashes.is_empty() {
+            continue;
+        }
+        let bucket_paths: Vec<_> = hashes
+            .iter()
+            .filter_map(|h| {
+                let matches = get_files_by_pattern(dst_dir, &format!("bucket-{h}"));
+                matches.into_iter().next()
+            })
+            .collect();
+        if bucket_paths.is_empty() {
+            continue;
+        }
+        let relative = hf
+            .strip_prefix(dst_dir)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let cp = history_format::checkpoint_from_path(&relative)
+            .expect("history path should encode a checkpoint");
+        return (hf.clone(), cp, hashes, bucket_paths);
+    }
+    panic!("no history file with discoverable bucket files found");
+}
+
+/// History was failed during main pass (manually marked) AND a referenced
+/// bucket is missing in dst. The file-retry path must:
+///   - re-fetch the history file from src,
+///   - parse it, walk bucket refs,
+///   - re-fetch the missing bucket,
+///   - clear both the HISTORY flag and any bucket failure entry from stats.
+#[tokio::test]
+async fn test_file_retry_history_repair_fetches_history_and_referenced_buckets() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    let (history_abs, cp, _bucket_hashes, bucket_abs) = pick_history_with_buckets(dest_dir.path());
+    let history_relative = history_abs
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let bucket_to_break = &bucket_abs[0];
+    let bucket_relative = bucket_to_break
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    // Setup the broken state: history + one referenced bucket gone from dst.
+    std::fs::remove_file(&history_abs).expect("delete history");
+    std::fs::remove_file(bucket_to_break).expect("delete bucket");
+
+    // Build a RepairOperation directly; populate a fresh ArchiveStats with
+    // the HISTORY failure (simulating the main pass's outcome).
+    let op = build_repair_op(&src_url, &dest_url, /*verify=*/ true);
+    let parent_stats = crate::utils::ArchiveStats::new();
+    parent_stats.record_failure(cp, &history_relative).await;
+
+    // Drive phase 1 in isolation.
+    let stats = op.retry_failed_files(&parent_stats).await;
+
+    // History file is back.
+    assert!(history_abs.exists(), "history file should be restored");
+    // The deleted bucket is back too (discovered transitively).
+    assert!(
+        bucket_to_break.exists(),
+        "referenced bucket should be restored"
+    );
+
+    // Stats should be clean: HISTORY flag cleared, no bucket failure recorded.
+    let f = stats.failures.lock().await;
+    assert!(!f.files.contains_key(&cp), "HISTORY flag should be cleared");
+    let _ = bucket_relative;
+    assert!(
+        f.buckets.is_empty(),
+        "no bucket failures should remain in stats"
+    );
+}
+
+/// History was failed (manually marked) but its referenced buckets are
+/// already present and valid in dst. The file-retry path re-fetches the history; the
+/// inner mirror also re-fetches the transitively-discovered buckets
+/// (mirror has no dst-first probe), which is wasted but correct work —
+/// `verify_and_write_bucket` hashes-verifies the new content before
+/// commit, so the buckets remain valid. End state: history restored, all
+/// buckets present and valid, phase 1 stats clean.
+#[tokio::test]
+async fn test_file_retry_history_repair_with_intact_buckets() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    let (history_abs, cp, _hashes, bucket_abs) = pick_history_with_buckets(dest_dir.path());
+    let history_relative = history_abs
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    // Break only the history file; leave buckets intact.
+    std::fs::remove_file(&history_abs).expect("delete history");
+
+    let op = build_repair_op(&src_url, &dest_url, /*verify=*/ true);
+    let parent_stats = crate::utils::ArchiveStats::new();
+    parent_stats.record_failure(cp, &history_relative).await;
+    let stats = op.retry_failed_files(&parent_stats).await;
+
+    assert!(history_abs.exists(), "history file should be restored");
+    for bucket in &bucket_abs {
+        assert!(bucket.exists(), "bucket {bucket:?} should remain present");
+    }
+
+    let f = stats.failures.lock().await;
+    assert!(!f.files.contains_key(&cp), "HISTORY flag should be cleared");
+    assert!(
+        f.buckets.is_empty(),
+        "no bucket failures should remain in stats"
+    );
+}
+
+/// History fetched OK but a referenced bucket can't be fetched (src 404s on
+/// that bucket). The file-retry path must: still restore the history file, record the
+/// bucket failure into stats, return the bucket as a failure for the caller.
+#[tokio::test]
+async fn test_file_retry_history_repair_fails_when_referenced_bucket_unavailable() {
+    // Build a separate src dir so we can selectively delete a bucket from src.
+    let src_dir = TempDir::new().unwrap();
+    copy_testnet_small_archive(src_dir.path()).unwrap();
+    let src_url = file_url_from_path(src_dir.path());
+
+    let dest_dir = TempDir::new().unwrap();
+    let dest_url = file_url_from_path(dest_dir.path());
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("mirror should succeed");
+
+    let (history_abs, cp, hashes, bucket_abs) = pick_history_with_buckets(dest_dir.path());
+    let history_relative = history_abs
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let bucket_to_kill = &bucket_abs[0];
+    let bucket_relative = bucket_to_kill
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let hash_to_kill = hashes.iter().next().unwrap();
+
+    // Delete the bucket from BOTH src and dst — phase 1 will try src and fail.
+    let src_bucket_files = get_files_by_pattern(src_dir.path(), &format!("bucket-{hash_to_kill}"));
+    assert!(!src_bucket_files.is_empty());
+    std::fs::remove_file(&src_bucket_files[0]).expect("delete src bucket");
+    std::fs::remove_file(bucket_to_kill).expect("delete dst bucket");
+    // Also delete dst's history so it's a phase 1 work item.
+    std::fs::remove_file(&history_abs).expect("delete dst history");
+
+    let op = build_repair_op(&src_url, &dest_url, /*verify=*/ true);
+    let parent_stats = crate::utils::ArchiveStats::new();
+    parent_stats.record_failure(cp, &history_relative).await;
+    let stats = op.retry_failed_files(&parent_stats).await;
+
+    // History file is back (src had it).
+    assert!(history_abs.exists(), "history should be restored");
+    // The bucket is still missing in dst.
+    assert!(
+        !bucket_to_kill.exists(),
+        "bucket can't be repaired (src also missing)"
+    );
+
+    // Stats: HISTORY flag cleared (file repair succeeded), bucket failure
+    // recorded so the user sees something is still broken.
+    let f = stats.failures.lock().await;
+    assert!(!f.files.contains_key(&cp));
+    assert!(
+        !f.buckets.is_empty(),
+        "the unrecoverable bucket should be recorded as a failure"
+    );
+    let _ = bucket_relative;
+}
+
+/// Src's history file is corrupt (not valid JSON). The file-retry path must NOT overwrite
+/// dst's history with the corrupt content, and HISTORY must remain in stats
+/// so the run reports failure.
+#[tokio::test]
+async fn test_file_retry_history_repair_corrupt_history_from_src() {
+    // Build separate src/dst so we can corrupt src's history file.
+    let src_dir = TempDir::new().unwrap();
+    copy_testnet_small_archive(src_dir.path()).unwrap();
+    let src_url = file_url_from_path(src_dir.path());
+
+    let dest_dir = TempDir::new().unwrap();
+    let dest_url = file_url_from_path(dest_dir.path());
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("mirror should succeed");
+
+    let (history_abs, cp, _, _) = pick_history_with_buckets(dest_dir.path());
+    let history_relative = history_abs
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let src_history = src_dir.path().join(&history_relative);
+
+    // Corrupt src's history with junk text (won't parse as JSON).
+    std::fs::write(&src_history, b"not valid json at all {").expect("write corrupt src history");
+    // Pre-remove dst's history so phase 1 has to fetch.
+    std::fs::remove_file(&history_abs).expect("delete dst history");
+
+    let op = build_repair_op(&src_url, &dest_url, /*verify=*/ true);
+    let parent_stats = crate::utils::ArchiveStats::new();
+    parent_stats.record_failure(cp, &history_relative).await;
+    let stats = op.retry_failed_files(&parent_stats).await;
+
+    // History file must NOT have been written (parse-before-write contract).
+    assert!(
+        !history_abs.exists(),
+        "dst history should not be overwritten with corrupt src content"
+    );
+
+    // HISTORY flag stays in stats because phase 1 failed.
+    let f = stats.failures.lock().await;
+    let flags = f
+        .files
+        .get(&cp)
+        .expect("HISTORY flag should remain in stats after a failed phase 1 repair");
+    assert!(flags.has(crate::utils::FileFlags::HISTORY));
+    // No buckets touched (we never got past parse).
+    assert!(f.buckets.is_empty());
 }
