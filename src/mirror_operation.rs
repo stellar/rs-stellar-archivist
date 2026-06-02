@@ -2,12 +2,10 @@
 
 use crate::history_format;
 use crate::pipeline::{async_trait, Operation, ProcessOutcome};
-use crate::storage::cleanup_partial_file;
 use crate::storage::{self, Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
 use opendal::Buffer;
-use opendal::Reader;
 use thiserror::Error;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
@@ -203,23 +201,6 @@ impl MirrorOperation {
 
         Ok(())
     }
-
-    async fn copy_file(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
-        match self.dst_store.copy_from_reader(path, reader).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                if let Err(cleanup_err) = cleanup_partial_file(&self.dst_store, path).await {
-                    error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
-                }
-                Err(e)
-            }
-        }
-    }
-
-    fn checkpoint_from_verified_path(path: &str) -> Result<u32, StorageError> {
-        crate::history_format::checkpoint_from_path(path)
-            .ok_or_else(|| StorageError::fatal(format!("invalid checkpoint path: {}", path)))
-    }
 }
 
 #[async_trait]
@@ -368,62 +349,8 @@ impl Operation for MirrorOperation {
         if self.dst_store.exists(path).await? && !self.overwrite {
             return Ok(ProcessOutcome::Skipped);
         }
-
-        let reader = src_store.open_reader(path).await?;
-        if let Some(manager) = manager {
-            if crate::history_format::is_bucket_file(path) {
-                if let Err(e) =
-                    crate::verify::verify_and_write_bucket(path, reader, &self.dst_store).await
-                {
-                    if let Err(cleanup_err) = cleanup_partial_file(&self.dst_store, path).await {
-                        error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
-                    }
-                    return Err(e);
-                }
-            } else if crate::history_format::is_ledger_header_file(path)
-                || crate::history_format::is_transactions_file(path)
-                || crate::history_format::is_results_file(path)
-                || crate::history_format::is_scp_file(path)
-            {
-                use crate::xdr_verify::XdrParseResult;
-                let result =
-                    match crate::xdr_verify::verify_and_write_xdr(path, reader, &self.dst_store)
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(e) => {
-                            if let Err(cleanup_err) =
-                                cleanup_partial_file(&self.dst_store, path).await
-                            {
-                                error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
-                            }
-                            return Err(e);
-                        }
-                    };
-
-                let checkpoint = if matches!(result, XdrParseResult::None) {
-                    None
-                } else {
-                    Some(Self::checkpoint_from_verified_path(path)?)
-                };
-                match result {
-                    XdrParseResult::Ledger(data) => {
-                        manager.record_header_data(checkpoint.unwrap(), data);
-                    }
-                    XdrParseResult::Transactions(hashes) => {
-                        manager.record_tx_set_hashes(checkpoint.unwrap(), hashes);
-                    }
-                    XdrParseResult::Results(hashes) => {
-                        manager.record_result_hashes(checkpoint.unwrap(), hashes);
-                    }
-                    XdrParseResult::None => {}
-                }
-            } else {
-                self.copy_file(path, reader).await?;
-            }
-        } else {
-            self.copy_file(path, reader).await?;
-        }
+        crate::xdr_verify::fetch_verify_and_write(src_store, &self.dst_store, path, manager)
+            .await?;
         Ok(ProcessOutcome::Processed)
     }
 

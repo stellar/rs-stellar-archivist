@@ -73,29 +73,25 @@ impl RepairCmd {
             )));
         }
 
-        let operation = RepairOperation::new(
-            src_store.clone(),
-            dst_store.clone(),
-            self.low,
-            self.high,
-            args.verify,
-            self.dry_run,
-            args.concurrency,
-            args.skip_optional,
-            &args.storage_config,
-        );
-
-        if let Some(files) = file_list {
-            operation.run_manual(&files).await?;
-            return Ok(());
-        }
-
         let pipeline_config = PipelineConfig {
             concurrency: args.concurrency,
             skip_optional: args.skip_optional,
             verify: args.verify,
             storage_config: args.storage_config,
         };
+        let operation = RepairOperation::new(
+            src_store.clone(),
+            dst_store.clone(),
+            self.low,
+            self.high,
+            self.dry_run,
+            pipeline_config.clone(),
+        );
+
+        if let Some(files) = file_list {
+            operation.run_manual(&files).await?;
+            return Ok(());
+        }
 
         let pipeline = Pipeline::new(operation, pipeline_config, src_store, Some(dst_store));
 

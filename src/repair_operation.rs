@@ -26,13 +26,11 @@
 use crate::history_format;
 use crate::mirror_operation::MirrorOperation;
 use crate::pipeline::{self, async_trait, Operation, Pipeline, PipelineConfig, ProcessOutcome};
-use crate::storage::{
-    self, cleanup_partial_file, Error as StorageError, ErrorClass, StorageConfig, StorageRef,
-};
+use crate::storage::{self, Error as StorageError, ErrorClass, StorageRef};
 use crate::utils::{self, ArchiveStats};
 use crate::xdr_verify::{self, XdrParseResult, XdrVerificationManager};
 use futures_util::{stream, StreamExt};
-use opendal::Buffer;
+use opendal::{Buffer, Reader};
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use thiserror::Error;
@@ -74,17 +72,14 @@ pub struct RepairOperation {
     dst_store: StorageRef,
     low: Option<u32>,
     high: Option<u32>,
-    /// Kept (despite the verification manager moving to Pipeline) because
-    /// `retry_failed_files` / `retry_failed_checkpoints` build inner
-    /// `Pipeline<MirrorOperation>` instances and need to set
-    /// `PipelineConfig::verify` on them. Repair's own `process_object`
-    /// doesn't read this field — it branches on whether the `manager`
-    /// parameter (from the outer pipeline) is `Some`.
-    verify: bool,
     dry_run: bool,
-    concurrency: usize,
-    skip_optional: bool,
-    storage_config: StorageConfig,
+    /// Outer pipeline's config — held so the retry-phase inner pipelines
+    /// (`retry_failed_files`, `retry_failed_checkpoints`) can be constructed
+    /// with the same concurrency / skip_optional / verify / storage_config.
+    /// Note: repair's own `process_object` does not read `pipeline_config.verify`;
+    /// it branches on whether the `manager` parameter (from the outer pipeline)
+    /// is `Some`.
+    pipeline_config: PipelineConfig,
     /// Set during get_checkpoint_bounds if dest .well-known needs repair
     well_known_needs_repair: AtomicBool,
     /// Dry-run counter: files that would be repaired
@@ -92,17 +87,13 @@ pub struct RepairOperation {
 }
 
 impl RepairOperation {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
         src_store: StorageRef,
         dst_store: StorageRef,
         low: Option<u32>,
         high: Option<u32>,
-        verify: bool,
         dry_run: bool,
-        concurrency: usize,
-        skip_optional: bool,
-        storage_config: &StorageConfig,
+        pipeline_config: PipelineConfig,
     ) -> Self {
         debug_assert!(
             dst_store.supports_writes(),
@@ -113,11 +104,8 @@ impl RepairOperation {
             dst_store,
             low,
             high,
-            verify,
             dry_run,
-            concurrency,
-            skip_optional,
-            storage_config: storage_config.clone(),
+            pipeline_config,
             well_known_needs_repair: AtomicBool::new(false),
             needs_repair_count: AtomicU64::new(0),
         }
@@ -144,18 +132,28 @@ impl RepairOperation {
         let total = files.len();
 
         stream::iter(files.iter())
-            .for_each_concurrent(self.concurrency, |path| {
+            .for_each_concurrent(self.pipeline_config.concurrency, |path| {
                 let stats = &stats;
                 let completed = &completed;
                 async move {
                     let result = utils::with_retries(
-                        self.storage_config.max_retries as u32,
-                        self.storage_config.retry_min_delay.as_millis() as u64,
+                        self.pipeline_config.storage_config.max_retries as u32,
+                        self.pipeline_config
+                            .storage_config
+                            .retry_min_delay
+                            .as_millis() as u64,
                         "repair",
                         path,
                         // Manual mode: no verification manager. Use plain
                         // src-fetch / dst-copy semantics.
-                        || async { self.fetch_from_src(path, None).await.map(|_| ()) },
+                        || {
+                            xdr_verify::fetch_verify_and_write(
+                                &self.src_store,
+                                &self.dst_store,
+                                path,
+                                None,
+                            )
+                        },
                     )
                     .await;
                     match result {
@@ -189,59 +187,6 @@ impl RepairOperation {
     fn note_dry_run(&self, path: &str) {
         self.needs_repair_count.fetch_add(1, Ordering::Relaxed);
         debug!("Dry run: would repair {}", path);
-    }
-
-    /// Fetch a file from src and write to dst with optional verification.
-    /// Returns the parsed XDR data (for XDR files when `verify` is on) so the
-    /// caller can record it into the manager. Returns `None` for buckets,
-    /// non-verified copies, and unrecognized file types.
-    async fn fetch_from_src(
-        &self,
-        path: &str,
-        manager: Option<&XdrVerificationManager>,
-    ) -> Result<Option<XdrParseResult>, StorageError> {
-        let reader = self.src_store.open_reader(path).await?;
-        if manager.is_some() {
-            if history_format::is_bucket_file(path) {
-                return match crate::verify::verify_and_write_bucket(path, reader, &self.dst_store)
-                    .await
-                {
-                    Ok(()) => Ok(None),
-                    Err(e) => {
-                        if let Err(cleanup_err) = cleanup_partial_file(&self.dst_store, path).await
-                        {
-                            error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
-                        }
-                        Err(e)
-                    }
-                };
-            }
-            if history_format::is_ledger_header_file(path)
-                || history_format::is_transactions_file(path)
-                || history_format::is_results_file(path)
-                || history_format::is_scp_file(path)
-            {
-                return match xdr_verify::verify_and_write_xdr(path, reader, &self.dst_store).await {
-                    Ok(result) => Ok(Some(result)),
-                    Err(e) => {
-                        if let Err(cleanup_err) = cleanup_partial_file(&self.dst_store, path).await
-                        {
-                            error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
-                        }
-                        Err(e)
-                    }
-                };
-            }
-        }
-        match self.dst_store.copy_from_reader(path, reader).await {
-            Ok(()) => Ok(None),
-            Err(e) => {
-                if let Err(cleanup_err) = cleanup_partial_file(&self.dst_store, path).await {
-                    error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
-                }
-                Err(e)
-            }
-        }
     }
 
     /// Check whether dst already has a good copy of `path` and (when verify
@@ -281,62 +226,61 @@ impl RepairOperation {
         // Buckets and SCP files have no per-checkpoint manager state — verify
         // structurally on dst, no recording.
         if history_format::is_bucket_file(path) {
-            return match self.dst_store.open_reader(path).await {
-                Ok(reader) => Ok(crate::verify::verify_bucket_stream(path, reader)
-                    .await
-                    .is_ok()),
-                Err(e) if e.class == ErrorClass::NotFound => Ok(false),
-                Err(e) => Err(e),
-            };
+            return self
+                .check_dst_or_missing(path, |reader| async move {
+                    crate::verify::verify_bucket_stream(path, reader)
+                        .await
+                        .is_ok()
+                })
+                .await;
         }
         if history_format::is_scp_file(path) {
-            return match self.dst_store.open_reader(path).await {
-                Ok(reader) => Ok(xdr_verify::parse_scp_stream(path, reader).await.is_ok()),
-                Err(e) if e.class == ErrorClass::NotFound => Ok(false),
-                Err(e) => Err(e),
-            };
+            return self
+                .check_dst_or_missing(path, |reader| async move {
+                    xdr_verify::parse_scp_stream(path, reader).await.is_ok()
+                })
+                .await;
         }
 
-        // XDR file types: open, parse, and route recording through the shared
-        // `record_result` helper inside the success arm.
+        // XDR file types: open, parse, and on success record into the manager.
         if history_format::is_ledger_header_file(path) {
-            return match self.dst_store.open_reader(path).await {
-                Ok(reader) => match xdr_verify::parse_ledger_header_stream(path, reader).await {
-                    Ok(data) => {
-                        record_result(manager, path, XdrParseResult::Ledger(data));
-                        Ok(true)
+            return self
+                .check_dst_or_missing(path, |reader| async move {
+                    match xdr_verify::parse_ledger_header_stream(path, reader).await {
+                        Ok(data) => {
+                            manager.record(path, XdrParseResult::Ledger(data));
+                            true
+                        }
+                        Err(_) => false,
                     }
-                    Err(_) => Ok(false),
-                },
-                Err(e) if e.class == ErrorClass::NotFound => Ok(false),
-                Err(e) => Err(e),
-            };
+                })
+                .await;
         }
         if history_format::is_transactions_file(path) {
-            return match self.dst_store.open_reader(path).await {
-                Ok(reader) => match xdr_verify::parse_transactions_stream(path, reader).await {
-                    Ok(hashes) => {
-                        record_result(manager, path, XdrParseResult::Transactions(hashes));
-                        Ok(true)
+            return self
+                .check_dst_or_missing(path, |reader| async move {
+                    match xdr_verify::parse_transactions_stream(path, reader).await {
+                        Ok(hashes) => {
+                            manager.record(path, XdrParseResult::Transactions(hashes));
+                            true
+                        }
+                        Err(_) => false,
                     }
-                    Err(_) => Ok(false),
-                },
-                Err(e) if e.class == ErrorClass::NotFound => Ok(false),
-                Err(e) => Err(e),
-            };
+                })
+                .await;
         }
         if history_format::is_results_file(path) {
-            return match self.dst_store.open_reader(path).await {
-                Ok(reader) => match xdr_verify::parse_results_stream(path, reader).await {
-                    Ok(hashes) => {
-                        record_result(manager, path, XdrParseResult::Results(hashes));
-                        Ok(true)
+            return self
+                .check_dst_or_missing(path, |reader| async move {
+                    match xdr_verify::parse_results_stream(path, reader).await {
+                        Ok(hashes) => {
+                            manager.record(path, XdrParseResult::Results(hashes));
+                            true
+                        }
+                        Err(_) => false,
                     }
-                    Err(_) => Ok(false),
-                },
-                Err(e) if e.class == ErrorClass::NotFound => Ok(false),
-                Err(e) => Err(e),
-            };
+                })
+                .await;
         }
 
         Err(StorageError::fatal(format!(
@@ -345,8 +289,55 @@ impl RepairOperation {
         )))
     }
 
+    /// Run a content check on the dst copy of `path`, treating a missing
+    /// dst file as the check failing.
+    ///
+    /// Returns:
+    /// - `Ok(true)` — dst file opened AND `f(reader)` returned `true`.
+    /// - `Ok(false)` — dst file is missing (`open_reader` returned `NotFound`),
+    ///   OR `f(reader)` returned `false`.
+    /// - `Err(_)` — any non-`NotFound` storage error from `open_reader`.
+    ///
+    /// `f` is typically a parse or hash verification that returns `true`
+    /// when the dst content is good.
+    async fn check_dst_or_missing<F, Fut>(&self, path: &str, f: F) -> Result<bool, StorageError>
+    where
+        F: FnOnce(Reader) -> Fut,
+        Fut: std::future::Future<Output = bool> + Send,
+    {
+        match self.dst_store.open_reader(path).await {
+            Ok(reader) => Ok(f(reader).await),
+            Err(e) if e.class == ErrorClass::NotFound => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Build a fresh `Pipeline<MirrorOperation>` configured for retry use:
+    /// overwrite=true, allow_mirror_gaps=true (the retry set is intentionally
+    /// disjoint), update_well_known=false (a partial-set retry can't claim
+    /// contiguous coverage), wired to repair's `src_store` and `dst_store`,
+    /// with the outer `pipeline_config` cloned verbatim.
+    fn build_retry_pipeline(&self) -> Pipeline<MirrorOperation> {
+        let mirror_op = MirrorOperation::new(
+            self.dst_store.clone(),
+            /*overwrite=*/ true,
+            None,
+            None,
+            /*allow_mirror_gaps=*/ true,
+            &self.pipeline_config.storage_config,
+            /*update_well_known=*/ false,
+        );
+        Pipeline::new(
+            mirror_op,
+            self.pipeline_config.clone(),
+            self.src_store.clone(),
+            Some(self.dst_store.clone()),
+        )
+    }
+
     /// Per-file retry — re-fetch individual files that the main pass failed
-    /// to repair, on a **fresh `Pipeline<MirrorOperation>`**.
+    /// to repair, on a **fresh `Pipeline<MirrorOperation>`** built by
+    /// [`Self::build_retry_pipeline`].
     ///
     /// For each broken file recorded in `parent_stats.failures` (per-cp file
     /// flags + bucket hashes), dispatch through the inner pipeline:
@@ -357,12 +348,10 @@ impl RepairOperation {
     ///   refs, covering buckets the main pass never probed when history
     ///   failed before bucket discovery).
     ///
-    /// The inner mirror is constructed with `overwrite=true` and
-    /// `update_well_known=false`. We don't run the full pipeline (no
-    /// `process_checkpoint`, no chain verification), only the per-item
-    /// primitives. Stats are extracted via `into_stats` (bypassing mirror's
-    /// `finalize` and its `has_failures` gate). Returns the inner's stats
-    /// directly — no merging into the parent.
+    /// We don't run the full pipeline (no `process_checkpoint`, no chain
+    /// verification), only the per-item primitives. Stats are extracted via
+    /// `into_stats` (bypassing mirror's `finalize` and its `has_failures`
+    /// gate). Returns the inner's stats directly — no merging into the parent.
     pub(crate) async fn retry_failed_files(&self, parent_stats: &ArchiveStats) -> ArchiveStats {
         if self.dry_run {
             return ArchiveStats::new();
@@ -375,46 +364,25 @@ impl RepairOperation {
 
         info!("Retrying {} failed file(s)", work.len());
 
-        let mirror_op = MirrorOperation::new(
-            self.dst_store.clone(),
-            /*overwrite=*/ true,
-            None,
-            None,
-            /*allow_mirror_gaps=*/ true,
-            &self.storage_config,
-            /*update_well_known=*/ false,
-        );
-        let file_retry_pipeline = Pipeline::new(
-            mirror_op,
-            PipelineConfig {
-                concurrency: self.concurrency,
-                skip_optional: self.skip_optional,
-                verify: self.verify,
-                storage_config: self.storage_config.clone(),
-            },
-            self.src_store.clone(),
-            Some(self.dst_store.clone()),
-        );
-
-        {
-            let pref = &file_retry_pipeline;
-            let cs = self.concurrency;
-            stream::iter(work.into_iter())
-                .for_each_concurrent(cs, |(cp, path)| async move {
+        let file_retry_pipeline = self.build_retry_pipeline();
+        stream::iter(work.into_iter())
+            .for_each_concurrent(self.pipeline_config.concurrency, |(cp, path)| {
+                let pipeline = &file_retry_pipeline;
+                async move {
                     if history_format::is_history_file(&path) {
-                        pref.process_history_and_buckets(cp).await;
+                        pipeline.process_history_and_buckets(cp).await;
                     } else {
-                        pref.process_file(cp, path).await;
+                        pipeline.process_file(cp, path).await;
                     }
-                })
-                .await;
-        }
-
+                }
+            })
+            .await;
         file_retry_pipeline.into_stats()
     }
 
     /// Per-checkpoint retry — re-mirror whole checkpoints flagged by cross-
-    /// file or cross-cp chain checks.
+    /// file or cross-cp chain checks, on a **fresh `Pipeline<MirrorOperation>`**
+    /// built by [`Self::build_retry_pipeline`].
     ///
     /// For each cp in `parent_stats.failures.checkpoints`, drive the inner
     /// pipeline's `run_checkpoints` to re-fetch every file in that cp from src
@@ -444,29 +412,8 @@ impl RepairOperation {
             retry_cps.len()
         );
 
-        let mirror_op = MirrorOperation::new(
-            self.dst_store.clone(),
-            /*overwrite=*/ true,
-            None,
-            None,
-            /*allow_mirror_gaps=*/ true,
-            &self.storage_config,
-            /*update_well_known=*/ false,
-        );
-        let checkpoint_retry_pipeline = Pipeline::new(
-            mirror_op,
-            PipelineConfig {
-                concurrency: self.concurrency,
-                skip_optional: self.skip_optional,
-                verify: self.verify,
-                storage_config: self.storage_config.clone(),
-            },
-            self.src_store.clone(),
-            Some(self.dst_store.clone()),
-        );
-
+        let checkpoint_retry_pipeline = self.build_retry_pipeline();
         let _ = checkpoint_retry_pipeline.run_checkpoints(retry_cps).await;
-
         checkpoint_retry_pipeline.into_stats()
     }
 
@@ -508,22 +455,6 @@ impl RepairOperation {
 // ============================================================================
 // Repair helpers (free functions)
 // ============================================================================
-
-/// Record a parsed XDR result into the verification manager. Used for both
-/// dst-side parses (via `verify_and_record_dst`) and src-side fetches (via
-/// `process_object` after `fetch_from_src`). No-op when the path doesn't
-/// carry a checkpoint number.
-fn record_result(manager: &XdrVerificationManager, path: &str, result: XdrParseResult) {
-    let Some(cp) = history_format::checkpoint_from_path(path) else {
-        return;
-    };
-    match result {
-        XdrParseResult::Ledger(data) => manager.record_header_data(cp, data),
-        XdrParseResult::Transactions(hashes) => manager.record_tx_set_hashes(cp, hashes),
-        XdrParseResult::Results(hashes) => manager.record_result_hashes(cp, hashes),
-        XdrParseResult::None => {}
-    }
-}
 
 /// Build a `(cp, path)` work list from the current state of the failure
 /// tracker. Read-only on `parent_stats` — no `mem::take`, no mutation. The
@@ -570,7 +501,10 @@ impl Operation for RepairOperation {
         let dst_result = utils::fetch_well_known_history_file(
             &self.dst_store,
             0, // no retries for local filesystem
-            self.storage_config.retry_min_delay.as_millis() as u64,
+            self.pipeline_config
+                .storage_config
+                .retry_min_delay
+                .as_millis() as u64,
         )
         .await;
 
@@ -586,8 +520,11 @@ impl Operation for RepairOperation {
                 // Fall back to source .well-known
                 let src_state = utils::fetch_well_known_history_file(
                     source,
-                    self.storage_config.max_retries as u32,
-                    self.storage_config.retry_min_delay.as_millis() as u64,
+                    self.pipeline_config.storage_config.max_retries as u32,
+                    self.pipeline_config
+                        .storage_config
+                        .retry_min_delay
+                        .as_millis() as u64,
                 )
                 .await
                 .map_err(|e| pipeline::Error::RepairOperation(Error::Utils(e)))?;
@@ -600,8 +537,8 @@ impl Operation for RepairOperation {
     }
 
     /// Process a file: try dst first (verify + record into manager), and on
-    /// missing/corrupt fetch from src (verify-and-write + record). All
-    /// verification logic lives here, matching scan/mirror's pattern.
+    /// missing/corrupt fetch from src and record the parsed XDR result into the
+    /// manager.
     async fn process_object(
         &self,
         path: &str,
@@ -615,10 +552,7 @@ impl Operation for RepairOperation {
             self.note_dry_run(path);
             return Ok(ProcessOutcome::Processed);
         }
-        let result = self.fetch_from_src(path, manager).await?;
-        if let (Some(parsed), Some(manager)) = (result, manager) {
-            record_result(manager, path, parsed);
-        }
+        xdr_verify::fetch_verify_and_write(&self.src_store, &self.dst_store, path, manager).await?;
         Ok(ProcessOutcome::Processed)
     }
 

@@ -17,7 +17,7 @@
 //! - Cross-checkpoint hash chain: first ledger's `prev_hash` matches prior checkpoint's last hash
 
 use crate::history_format::{self, CHECKPOINT_FREQUENCY, GENESIS_CHECKPOINT_LEDGER};
-use crate::storage::{from_opendal_error, Error as StorageError, StorageRef};
+use crate::storage::{cleanup_partial_file, from_opendal_error, Error as StorageError, StorageRef};
 use async_compression::tokio::bufread::GzipDecoder;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -211,6 +211,22 @@ impl XdrVerificationManager {
         let mut pending = self.pending.lock().unwrap();
         let entry = pending.entry(checkpoint).or_default();
         entry.result_hashes = Some(hashes);
+    }
+
+    /// Dispatch a parsed XDR result to the matching `record_*` method,
+    /// deriving the checkpoint from `path`. No-op when `path` doesn't carry
+    /// a checkpoint (e.g. unrecognized archive file) or the result is
+    /// [`XdrParseResult::None`] (SCP files).
+    pub fn record(&self, path: &str, result: XdrParseResult) {
+        let Some(cp) = history_format::checkpoint_from_path(path) else {
+            return;
+        };
+        match result {
+            XdrParseResult::Ledger(data) => self.record_header_data(cp, data),
+            XdrParseResult::Transactions(hashes) => self.record_tx_set_hashes(cp, hashes),
+            XdrParseResult::Results(hashes) => self.record_result_hashes(cp, hashes),
+            XdrParseResult::None => {}
+        }
     }
 
     /// Run all intra-checkpoint verifications and free the pending data.
@@ -1193,6 +1209,69 @@ pub async fn verify_and_write_xdr(
             // send() so clean up the partial file.
             cleanup_non_atomic_partial_write(&write_path, dst_store).await;
             Err(err)
+        }
+    }
+}
+
+/// Fetch `path` from `src_store`, write to `dst_store`, optionally verifying
+/// the content and recording XDR parse results into `manager`.
+///
+/// Used by mirror's `process_object` (always called) and repair's
+/// `process_object` (called when dst is missing or corrupt). The branching
+/// matches the trait's existing pattern:
+/// - bucket file + manager → [`crate::verify::verify_and_write_bucket`]
+/// - xdr per-cp file + manager → [`verify_and_write_xdr`] + record into manager
+/// - everything else (and the manager-off path) → plain
+///   [`crate::storage::Storage::copy_from_reader`]
+///
+/// On any write error, attempts [`cleanup_partial_file`] on `dst_store`
+/// (cleanup failures are logged at error level but not propagated).
+pub async fn fetch_verify_and_write(
+    src_store: &StorageRef,
+    dst_store: &StorageRef,
+    path: &str,
+    manager: Option<&XdrVerificationManager>,
+) -> Result<(), StorageError> {
+    let reader = src_store.open_reader(path).await?;
+
+    let write_result: Result<Option<XdrParseResult>, StorageError> = if manager.is_some() {
+        if history_format::is_bucket_file(path) {
+            crate::verify::verify_and_write_bucket(path, reader, dst_store)
+                .await
+                .map(|()| None)
+        } else if history_format::is_ledger_header_file(path)
+            || history_format::is_transactions_file(path)
+            || history_format::is_results_file(path)
+            || history_format::is_scp_file(path)
+        {
+            verify_and_write_xdr(path, reader, dst_store)
+                .await
+                .map(Some)
+        } else {
+            dst_store
+                .copy_from_reader(path, reader)
+                .await
+                .map(|()| None)
+        }
+    } else {
+        dst_store
+            .copy_from_reader(path, reader)
+            .await
+            .map(|()| None)
+    };
+
+    match write_result {
+        Ok(parsed) => {
+            if let (Some(parsed), Some(mgr)) = (parsed, manager) {
+                mgr.record(path, parsed);
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if let Err(cleanup_err) = cleanup_partial_file(dst_store, path).await {
+                error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
+            }
+            Err(e)
         }
     }
 }

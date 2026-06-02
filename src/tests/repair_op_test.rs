@@ -1055,16 +1055,19 @@ fn build_repair_op(
     let storage_config = crate::test_helpers::test_storage_config();
     let src_store = crate::storage::from_url_with_config(src_url, &storage_config).unwrap();
     let dst_store = crate::storage::from_url_with_config(dst_url, &storage_config).unwrap();
+    let pipeline_config = crate::pipeline::PipelineConfig {
+        concurrency: 4,
+        skip_optional: false,
+        verify,
+        storage_config,
+    };
     crate::repair_operation::RepairOperation::new(
         src_store,
         dst_store,
         /*low=*/ None,
         /*high=*/ None,
-        verify,
         /*dry_run=*/ false,
-        /*concurrency=*/ 4,
-        /*skip_optional=*/ false,
-        &storage_config,
+        pipeline_config,
     )
 }
 

@@ -407,16 +407,19 @@ pub mod test_helpers {
             )));
         }
 
+        let pipeline_config = PipelineConfig {
+            concurrency: config.concurrency,
+            skip_optional: config.skip_optional,
+            verify: config.verify,
+            storage_config: config.storage_config,
+        };
         let operation = RepairOperation::new(
             src_store.clone(),
             dst_store.clone(),
             config.low,
             config.high,
-            config.verify,
             config.dry_run,
-            config.concurrency,
-            config.skip_optional,
-            &config.storage_config,
+            pipeline_config.clone(),
         );
 
         if let Some(files) = config.file_list {
@@ -425,13 +428,6 @@ pub mod test_helpers {
                 .await
                 .map_err(crate::Error::from);
         }
-
-        let pipeline_config = PipelineConfig {
-            concurrency: config.concurrency,
-            skip_optional: config.skip_optional,
-            verify: config.verify,
-            storage_config: config.storage_config,
-        };
 
         let pipeline = Pipeline::new(operation, pipeline_config, src_store, Some(dst_store));
         pipeline
