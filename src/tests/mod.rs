@@ -13,6 +13,8 @@ mod pipeline_test;
 #[cfg(test)]
 mod repair_op_test;
 #[cfg(test)]
+mod report_test;
+#[cfg(test)]
 mod scan_op_test;
 #[cfg(test)]
 pub(crate) mod utils;

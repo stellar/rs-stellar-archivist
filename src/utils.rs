@@ -242,7 +242,7 @@ fn path_to_file_flag(path: &str) -> Option<u8> {
 }
 
 /// Parse a hex bucket hash (as returned by `bucket_hash_from_path`) into a `Hash`.
-fn hex_to_hash(s: &str) -> Option<Hash> {
+pub(crate) fn hex_to_hash(s: &str) -> Option<Hash> {
     let bytes = hex::decode(s).ok()?;
     let arr: [u8; 32] = bytes.try_into().ok()?;
     Some(Hash(arr))

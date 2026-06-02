@@ -34,6 +34,7 @@ pub mod history_format;
 pub mod mirror_operation;
 pub mod pipeline;
 pub mod repair_operation;
+pub mod report;
 pub mod scan_operation;
 pub mod storage;
 pub mod utils;
