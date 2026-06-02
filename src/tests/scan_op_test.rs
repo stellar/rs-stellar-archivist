@@ -97,6 +97,7 @@ async fn remove_bucket_and_verify_scan_fails(
             std::fs::remove_file(bucket_file).expect("Failed to remove bucket file");
 
             let scan_config = ScanConfig {
+                report_path: None,
                 archive: file_url_from_path(archive_path),
                 concurrency: 8,
                 skip_optional: false,
@@ -264,6 +265,7 @@ async fn test_scan_detects_corrupt_files(
     }
 
     let scan_config = ScanConfig {
+        report_path: None,
         archive: file_url_from_path(archive_path),
         concurrency: 8,
         skip_optional: false,
@@ -292,6 +294,7 @@ async fn test_scan_missing_scp_with_optional_flag() {
 
     // First scan with skip_optional: false - should fail
     let scan_required = ScanConfig {
+        report_path: None,
         archive: file_url_from_path(archive_path),
         concurrency: 8,
         skip_optional: false, // SCP files are required
@@ -307,6 +310,7 @@ async fn test_scan_missing_scp_with_optional_flag() {
 
     // Second scan with skip_optional: true - should succeed
     let scan_optional = ScanConfig {
+        report_path: None,
         archive: file_url_from_path(archive_path),
         concurrency: 8,
         skip_optional: true, // SCP files are optional
@@ -328,6 +332,7 @@ async fn test_scan_complete_archive() {
     let test_archive_path = testnet_small_archive_path();
 
     let scan_config = ScanConfig {
+        report_path: None,
         archive: file_url_from_path(&test_archive_path),
         concurrency: 8,
         skip_optional: false,
@@ -354,6 +359,7 @@ async fn test_scan_http_archive() {
     let (server_url, server_handle) = start_http_server(&archive_path).await;
 
     let scan_config = ScanConfig {
+        report_path: None,
         archive: server_url.clone(),
         concurrency: 4,
         skip_optional: false,
@@ -418,4 +424,27 @@ async fn smoke_live_stellar_archive_connection() {
         let buffer: Buffer = chunks.into_iter().flatten().collect();
         assert!(!buffer.is_empty(), "{url_str}: no data received");
     }
+}
+
+#[tokio::test]
+async fn test_scan_report_lists_missing_files() {
+    let dir = TempDir::new().unwrap();
+    copy_testnet_small_archive(dir.path()).unwrap();
+    let url = file_url_from_path(dir.path());
+
+    // Delete one ledger file so the scan reports a missing file.
+    let ledgers = get_files_by_pattern(dir.path(), "/ledger-");
+    std::fs::remove_file(&ledgers[0]).unwrap();
+
+    let report_path = dir.path().join("scan-report.json");
+    let result = run_scan(ScanConfig::new(&url).report(&report_path)).await;
+    assert!(result.is_err(), "scan should fail with a missing file");
+
+    let report = crate::report::read_from_path(&report_path).unwrap();
+    let summary = report.section.summary;
+    assert!(summary.failed >= 1, "summary should count the missing file");
+    assert!(
+        !report.section.files.is_empty(),
+        "report should list the missing ledger checkpoint"
+    );
 }

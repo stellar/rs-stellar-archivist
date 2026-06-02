@@ -954,7 +954,7 @@ fn test_record_all_errors_empty_manager_is_noop() {
     assert!(failures.checkpoints.is_empty());
     assert!(failures.files.is_empty());
     assert!(failures.buckets.is_empty());
-    assert!(!failures.well_known);
+    assert!(failures.well_known.is_none());
 }
 
 #[test]
@@ -985,7 +985,7 @@ fn test_record_all_errors_drains_each_variant() {
     // cp-level cross-file/chain inconsistencies.
     assert!(failures.files.is_empty());
     assert!(failures.buckets.is_empty());
-    assert!(!failures.well_known);
+    assert!(failures.well_known.is_none());
 }
 
 #[test]

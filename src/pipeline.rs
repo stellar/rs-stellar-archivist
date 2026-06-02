@@ -153,7 +153,12 @@ pub trait Operation: Send + Sync + 'static {
     /// Called by `Pipeline::finish` after the manager (if any) has been
     /// drained into `stats.failures`. The operation is responsible for
     /// reporting and deciding `has_failures`-gated success.
-    async fn finalize(&self, highest_checkpoint: u32, stats: &ArchiveStats) -> Result<(), Error>;
+    async fn finalize(
+        &self,
+        highest_checkpoint: u32,
+        stats: &ArchiveStats,
+        report_path: Option<&std::path::Path>,
+    ) -> Result<(), Error>;
 
     /// Fetch the history buffer for a checkpoint.
     ///
@@ -229,6 +234,10 @@ pub struct Pipeline<Op: Operation> {
     /// `process_checkpoint`, `verify_checkpoint_chain` + `record_all_errors`
     /// drain at the end of `run_checkpoints`).
     verification_manager: Option<XdrVerificationManager>,
+    /// Optional local path for the JSON status report, passed to
+    /// `operation.finalize`. Owned solely by the pipeline (not per-stats) so
+    /// sub-stats can't disagree about where the report goes.
+    report_path: Option<std::path::PathBuf>,
 }
 
 impl<Op: Operation> Pipeline<Op> {
@@ -239,6 +248,7 @@ impl<Op: Operation> Pipeline<Op> {
         config: PipelineConfig,
         src_store: StorageRef,
         dst_store: Option<StorageRef>,
+        report_path: Option<std::path::PathBuf>,
     ) -> Self {
         let verification_manager = config.verify.then(XdrVerificationManager::new);
         let bucket_lru = Mutex::new(LruCache::new(
@@ -253,6 +263,7 @@ impl<Op: Operation> Pipeline<Op> {
             stats: ArchiveStats::new(),
             bucket_lru,
             verification_manager,
+            report_path,
         }
     }
 
@@ -330,9 +341,14 @@ impl<Op: Operation> Pipeline<Op> {
     /// side effects like well-known update.
     pub async fn finish(self, highest_checkpoint: u32) -> Result<(), Error> {
         let Self {
-            operation, stats, ..
+            operation,
+            stats,
+            report_path,
+            ..
         } = self;
-        operation.finalize(highest_checkpoint, &stats).await
+        operation
+            .finalize(highest_checkpoint, &stats, report_path.as_deref())
+            .await
     }
 
     /// Consume the pipeline and return its `ArchiveStats`

@@ -70,7 +70,13 @@ impl MirrorCmd {
             storage_config: args.storage_config,
         };
 
-        let pipeline = Pipeline::new(operation, pipeline_config, src_store, Some(dst_store));
+        let pipeline = Pipeline::new(
+            operation,
+            pipeline_config,
+            src_store,
+            Some(dst_store),
+            args.report_path,
+        );
 
         pipeline.run().await.map_err(utils::map_pipeline_error)?;
 

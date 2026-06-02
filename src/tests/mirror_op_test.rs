@@ -192,6 +192,7 @@ async fn test_mirror_full_archive() {
     let src_url = file_url_from_path(&test_archive_path);
 
     let mirror_config = MirrorConfig {
+        report_path: None,
         src: src_url,
         dst: mirror_dest_url.clone(),
         concurrency: 20,
@@ -208,6 +209,7 @@ async fn test_mirror_full_archive() {
 
     // Verify with scan
     run_scan(ScanConfig {
+        report_path: None,
         archive: mirror_dest_url,
         concurrency: 4,
         skip_optional: false,
@@ -243,6 +245,7 @@ async fn test_mirror_bounded() {
     let src_url = file_url_from_path(&test_archive_path);
 
     let mirror_config = MirrorConfig {
+        report_path: None,
         src: src_url,
         dst: mirror_dest_url.clone(),
         concurrency: 20,
@@ -261,6 +264,7 @@ async fn test_mirror_bounded() {
 
     // Verify with scan
     run_scan(ScanConfig {
+        report_path: None,
         archive: mirror_dest_url,
         concurrency: 4,
         skip_optional: false,
@@ -295,6 +299,7 @@ async fn test_mirror_skip_optional() {
     let src_url = file_url_from_path(&test_archive_path);
 
     let mirror_config = MirrorConfig {
+        report_path: None,
         src: src_url,
         dst: mirror_dest_url.clone(),
         concurrency: 4,
@@ -316,6 +321,7 @@ async fn test_mirror_skip_optional() {
 
     // Verify with scan (must also skip optional)
     run_scan(ScanConfig {
+        report_path: None,
         archive: mirror_dest_url,
         concurrency: 4,
         skip_optional: true,
@@ -816,6 +822,7 @@ async fn test_mirror_http_to_filesystem() {
 
     // Mirror from HTTP to filesystem
     let mirror_config = MirrorConfig {
+        report_path: None,
         src: server_url.clone(),
         dst: mirror_dest_url.clone(),
         concurrency: 4,
@@ -835,6 +842,7 @@ async fn test_mirror_http_to_filesystem() {
 
     // Verify the mirrored archive
     let scan_config = ScanConfig {
+        report_path: None,
         archive: mirror_dest_url,
         concurrency: 4,
         skip_optional: false,
@@ -912,6 +920,7 @@ async fn test_mirror_race_condition_with_advancing_archive() {
     let mirror_dest_url = file_url_from_path(temp_dest.path());
 
     let mirror_config = MirrorConfig {
+        report_path: None,
         src: server_url.clone(),
         dst: mirror_dest_url,
         concurrency: 4,
@@ -1076,6 +1085,7 @@ async fn test_mirror_with_update_well_known_false_does_not_touch_well_known() {
         },
         src_store,
         Some(dst_store),
+        None,
     );
 
     pipeline.run().await.expect("Mirror should succeed");
@@ -1097,4 +1107,23 @@ async fn test_mirror_with_update_well_known_false_does_not_touch_well_known() {
         !wellknown.exists(),
         ".well-known should not be created when update_well_known=false"
     );
+}
+
+#[tokio::test]
+async fn test_mirror_report_summary_on_success() {
+    use super::utils::{file_url_from_path, testnet_small_archive_path};
+    let src_url = file_url_from_path(&testnet_small_archive_path());
+    let dir = TempDir::new().unwrap();
+    let dst_url = file_url_from_path(dir.path());
+    let report_path = dir.path().join("mirror-report.json");
+
+    run_mirror(MirrorConfig::new(&src_url, &dst_url).report(&report_path))
+        .await
+        .expect("mirror should succeed");
+
+    let report = crate::report::read_from_path(&report_path).unwrap();
+    let summary = report.section.summary;
+    assert_eq!(summary.failed, 0, "clean mirror has no failures");
+    assert!(summary.succeeded > 0, "mirror copied files");
+    assert!(report.section.files.is_empty() && report.section.buckets.is_empty());
 }

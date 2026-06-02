@@ -1391,7 +1391,7 @@ async fn test_well_known_restored_after_history_retry() {
     let parent_stats = crate::utils::ArchiveStats::new();
     parent_stats.record_failure(k, &history_rel).await;
 
-    op.finalize(k, &parent_stats)
+    op.finalize(k, &parent_stats, None)
         .await
         .expect("finalize should succeed once history-K is restored by retry");
 
@@ -1847,7 +1847,7 @@ async fn test_repair_dry_run_verify_surfaces_cross_file_failure() {
         verify: true,
         storage_config,
     };
-    let pipeline = Pipeline::new(op, config, src_store, Some(dst_store));
+    let pipeline = Pipeline::new(op, config, src_store, Some(dst_store), None);
     let cps = (low..=high).step_by(history_format::CHECKPOINT_FREQUENCY as usize);
     pipeline
         .run_checkpoints(cps)
@@ -1881,4 +1881,140 @@ async fn test_repair_dry_run_verify_surfaces_cross_file_failure() {
         corrupted_bytes,
         "dry-run must not modify dst"
     );
+}
+
+#[tokio::test]
+async fn test_repair_dry_run_report_lists_inventory() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    // Damage: delete a ledger, corrupt a bucket, delete .well-known.
+    let deleted_ledger = delete_first_file(dest_dir.path(), "/ledger-");
+    corrupt_bucket_invalid_gzip(dest_dir.path());
+    std::fs::remove_file(dest_dir.path().join(".well-known/stellar-history.json"))
+        .expect("delete .well-known");
+
+    let report_path = dest_dir.path().join("plan.json");
+    crate::test_helpers::run_repair(
+        crate::test_helpers::RepairConfig::new(&src_url, &dest_url)
+            .verify()
+            .dry_run()
+            .report(&report_path),
+    )
+    .await
+    .expect("dry-run should return Ok");
+
+    let report = crate::report::read_from_path(&report_path).unwrap();
+    assert!(
+        report.section.well_known.is_some(),
+        "missing .well-known should be in the plan"
+    );
+
+    let ledger_cp = history_format::checkpoint_from_path(&deleted_ledger).unwrap();
+    let listed = report
+        .section
+        .files
+        .get(&ledger_cp.to_string())
+        .is_some_and(|types| types.iter().any(|t| t == "ledger"));
+    assert!(
+        listed,
+        "deleted ledger should be in the plan: {:?}",
+        report.section.files
+    );
+    assert!(
+        !report.section.buckets.is_empty(),
+        "corrupt bucket should be in the plan"
+    );
+
+    // Dry-run must not modify dst: the deleted ledger is still gone.
+    assert!(
+        !dest_dir.path().join(&deleted_ledger).exists(),
+        "dry-run must not write to dst"
+    );
+}
+
+#[tokio::test]
+async fn test_repair_dry_run_well_known_records_high_checkpoint() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    // Break only the dst .well-known; everything else stays intact.
+    std::fs::remove_file(dest_dir.path().join(".well-known/stellar-history.json"))
+        .expect("delete .well-known");
+
+    let report_path = dest_dir.path().join("plan.json");
+    crate::test_helpers::run_repair(
+        RepairConfig::new(&src_url, &dest_url)
+            .dry_run()
+            .report(&report_path),
+    )
+    .await
+    .expect("dry-run should return Ok");
+
+    // The plan must carry the checkpoint to restore .well-known from — the
+    // archive's highest checkpoint, sourced from the (canonical) source archive.
+    let src_wk = std::fs::read_to_string(
+        testnet_small_archive_path().join(".well-known/stellar-history.json"),
+    )
+    .unwrap();
+    let src_current_ledger = serde_json::from_str::<serde_json::Value>(&src_wk).unwrap()
+        ["currentLedger"]
+        .as_u64()
+        .unwrap() as u32;
+    let expected_k = history_format::round_to_lower_checkpoint(src_current_ledger);
+
+    let report = crate::report::read_from_path(&report_path).unwrap();
+    assert_eq!(
+        report.section.well_known,
+        Some(expected_k),
+        "plan must record the archive's high checkpoint for .well-known"
+    );
+}
+
+#[tokio::test]
+async fn test_repair_dry_run_well_known_none_when_healthy() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    let report_path = dest_dir.path().join("plan.json");
+    crate::test_helpers::run_repair(
+        RepairConfig::new(&src_url, &dest_url)
+            .dry_run()
+            .report(&report_path),
+    )
+    .await
+    .expect("dry-run should return Ok");
+
+    let report = crate::report::read_from_path(&report_path).unwrap();
+    assert_eq!(
+        report.section.well_known, None,
+        "healthy .well-known must not be flagged"
+    );
+}
+
+#[tokio::test]
+async fn test_repair_report_three_sections_clean_on_success() {
+    use crate::report::MultiSectionReport;
+
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+    delete_first_file(dest_dir.path(), "/ledger-");
+
+    let report_path = dest_dir.path().join("done.json");
+    crate::test_helpers::run_repair(
+        crate::test_helpers::RepairConfig::new(&src_url, &dest_url)
+            .verify()
+            .report(&report_path),
+    )
+    .await
+    .expect("repair should succeed");
+
+    let json = std::fs::read_to_string(&report_path).unwrap();
+    let report: MultiSectionReport =
+        serde_json::from_str(&json).expect("multi-section report parses");
+    assert!(report.sections.contains_key("main_pass"));
+
+    // Retry stages cleared everything they attempted: empty bodies, no failures.
+    let fr = &report.sections["file_retry"];
+    let cr = &report.sections["checkpoint_retry"];
+    assert_eq!(fr.summary.failed, 0);
+    assert_eq!(cr.summary.failed, 0);
+    assert!(fr.files.is_empty() && fr.buckets.is_empty());
+    assert!(cr.checkpoints.is_empty());
 }

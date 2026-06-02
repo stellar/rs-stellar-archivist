@@ -20,6 +20,9 @@ pub enum Error {
 
     #[error("History format error: {0}")]
     HistoryFormat(#[from] crate::history_format::Error),
+
+    #[error("Report error: {0}")]
+    Report(#[from] crate::report::ReportError),
 }
 
 pub struct ScanOperation {
@@ -119,8 +122,18 @@ impl Operation for ScanOperation {
         &self,
         _highest_checkpoint: u32,
         stats: &ArchiveStats,
+        report_path: Option<&std::path::Path>,
     ) -> Result<(), crate::pipeline::Error> {
         stats.report("scan").await;
+
+        if let Some(path) = report_path {
+            let report = crate::report::ArchiveReport {
+                version: crate::report::REPORT_VERSION,
+                section: stats.report_section().await,
+            };
+            crate::report::write_to_path(path, &report)
+                .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Report(e)))?;
+        }
 
         if stats.has_failures().await {
             return Err(Error::ScanFailed.into());

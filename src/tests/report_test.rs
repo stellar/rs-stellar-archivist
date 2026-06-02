@@ -11,7 +11,7 @@ fn sample_tracker() -> FailureTracker {
     t.record_file(255, FileFlags::HISTORY);
     t.record_bucket(Hash([0xab; 32]));
     t.record_checkpoint(191);
-    t.well_known = true;
+    t.record_well_known(255);
     t
 }
 
@@ -19,7 +19,7 @@ fn sample_tracker() -> FailureTracker {
 fn test_from_failures_projects_all_kinds() {
     let report = ArchiveReport::from_failures_and_summary(&sample_tracker(), Summary::default());
     assert_eq!(report.version, REPORT_VERSION);
-    assert!(report.section.well_known);
+    assert_eq!(report.section.well_known, Some(255));
     assert_eq!(
         report.section.files.get("127").unwrap(),
         &["ledger", "transactions"]
@@ -141,4 +141,70 @@ fn test_section_computes_failed_and_summary() {
     assert_eq!(s.retries, 7);
     // sample_tracker has 3 file failures + 1 bucket = 4 (checkpoints excluded)
     assert_eq!(s.failed, 4);
+}
+
+#[test]
+fn test_record_well_known_stores_checkpoint() {
+    let mut t = FailureTracker::default();
+    assert!(t.is_empty());
+    t.record_well_known(127);
+    assert_eq!(t.well_known, Some(127));
+    assert!(!t.is_empty());
+    t.unrecord_well_known();
+    assert_eq!(t.well_known, None);
+    assert!(t.is_empty());
+}
+
+#[tokio::test]
+async fn test_record_failure_does_not_touch_well_known() {
+    // The root .well-known is no longer routed through record_failure; it is
+    // recorded explicitly via FailureTracker::record_well_known with the
+    // archive's high checkpoint. record_failure on that path is a no-op.
+    let stats = crate::utils::ArchiveStats::new();
+    stats
+        .record_failure(255, crate::history_format::ROOT_WELL_KNOWN_PATH)
+        .await;
+    assert_eq!(stats.failures.lock().await.well_known, None);
+}
+
+#[test]
+fn test_well_known_checkpoint_round_trips() {
+    for wk in [Some(191u32), None] {
+        let mut t = FailureTracker::default();
+        if let Some(cp) = wk {
+            t.record_well_known(cp);
+        }
+        let back = ArchiveReport::from_failures_and_summary(&t, Summary::default())
+            .into_failures()
+            .unwrap();
+        assert_eq!(back.well_known, wk);
+    }
+}
+
+#[test]
+fn test_into_failures_rejects_non_boundary_well_known() {
+    let mut r =
+        ArchiveReport::from_failures_and_summary(&FailureTracker::default(), Summary::default());
+    r.section.well_known = Some(100); // 100 is not a checkpoint boundary
+    let err = r.into_failures().unwrap_err().to_string();
+    assert!(err.contains("checkpoint"), "got: {err}");
+}
+
+#[test]
+fn test_well_known_serializes_as_number_or_null() {
+    let mut t = FailureTracker::default();
+    t.record_well_known(127);
+    let broken = serde_json::to_string(&ArchiveReport::from_failures_and_summary(
+        &t,
+        Summary::default(),
+    ))
+    .unwrap();
+    assert!(broken.contains("\"well_known\":127"), "got: {broken}");
+
+    let healthy = serde_json::to_string(&ArchiveReport::from_failures_and_summary(
+        &FailureTracker::default(),
+        Summary::default(),
+    ))
+    .unwrap();
+    assert!(healthy.contains("\"well_known\":null"), "got: {healthy}");
 }

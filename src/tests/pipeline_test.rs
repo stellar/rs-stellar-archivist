@@ -142,6 +142,7 @@ impl Operation for TestOperation {
         &self,
         highest_checkpoint: u32,
         _stats: &ArchiveStats,
+        _report_path: Option<&std::path::Path>,
     ) -> Result<(), crate::pipeline::Error> {
         self.state.lock().unwrap().finalize_highest_checkpoint = Some(highest_checkpoint);
         Ok(())
@@ -195,7 +196,7 @@ fn make_config(concurrency: usize) -> PipelineConfig {
 #[tokio::test]
 async fn test_run_checkpoints_empty_iter_is_noop() {
     let (op, state) = TestOperation::new((63, 63));
-    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None);
+    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None, None);
 
     pipeline
         .run_checkpoints(Vec::<u32>::new())
@@ -216,7 +217,7 @@ async fn test_run_checkpoints_empty_iter_is_noop() {
 #[tokio::test]
 async fn test_run_checkpoints_single_cp() {
     let (op, state) = TestOperation::new((63, 63));
-    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None);
+    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None, None);
 
     pipeline.run_checkpoints(vec![63]).await.unwrap();
 
@@ -240,7 +241,7 @@ async fn test_run_checkpoints_single_cp() {
 #[tokio::test]
 async fn test_run_checkpoints_disjoint_cps() {
     let (op, state) = TestOperation::new((0, 0)); // bounds unused by this test
-    let pipeline = Pipeline::new(op, make_config(2), stub_storage(), None);
+    let pipeline = Pipeline::new(op, make_config(2), stub_storage(), None, None);
 
     // Disjoint, non-consecutive cps.
     pipeline.run_checkpoints(vec![63, 575, 4095]).await.unwrap();
@@ -261,7 +262,7 @@ async fn test_run_checkpoints_disjoint_cps() {
 #[tokio::test]
 async fn test_run_checkpoints_does_not_call_finalize() {
     let (op, state) = TestOperation::new((0, 0));
-    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None);
+    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None, None);
 
     pipeline.run_checkpoints(vec![63, 127]).await.unwrap();
 
@@ -275,7 +276,7 @@ async fn test_run_checkpoints_does_not_call_finalize() {
 #[tokio::test]
 async fn test_pipeline_finish_calls_finalize_with_supplied_highest() {
     let (op, state) = TestOperation::new((0, 0));
-    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None);
+    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None, None);
 
     pipeline.finish(8191).await.expect("finish should succeed");
 
@@ -291,7 +292,7 @@ async fn test_pipeline_finish_calls_finalize_with_supplied_highest() {
 async fn test_run_checkpoints_respects_concurrency() {
     let (op, state) = TestOperation::new((0, 0));
     let op = op.with_delay(Duration::from_millis(50));
-    let pipeline = Pipeline::new(op, make_config(2), stub_storage(), None);
+    let pipeline = Pipeline::new(op, make_config(2), stub_storage(), None, None);
 
     // 4 cps with concurrency=2 → peak in-flight should be exactly 2.
     pipeline
@@ -309,7 +310,7 @@ async fn test_run_checkpoints_respects_concurrency() {
 #[tokio::test]
 async fn test_stats_accessor_returns_live_ref() {
     let (op, _state) = TestOperation::new((0, 0));
-    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None);
+    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None, None);
 
     // Mutations through the accessor must be visible on subsequent reads.
     pipeline.stats().record_success("foo");

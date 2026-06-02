@@ -58,7 +58,9 @@ pub struct Summary {
 /// one named section of a [`MultiSectionReport`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReportSection {
-    pub well_known: bool,
+    /// `Some(cp)` if the root `.well-known` is broken, carrying the checkpoint
+    /// to restore it from (the archive's highest checkpoint); `null` if healthy.
+    pub well_known: Option<u32>,
     /// checkpoint (decimal string) -> per-cp file type names
     pub files: BTreeMap<String, Vec<String>>,
     /// 64-hex bucket content hashes
@@ -164,6 +166,9 @@ impl ArchiveReport {
             )));
         }
 
+        if let Some(cp) = body.well_known {
+            validate_checkpoint(cp)?;
+        }
         let mut tracker = FailureTracker {
             well_known: body.well_known,
             ..FailureTracker::default()

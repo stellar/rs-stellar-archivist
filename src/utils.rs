@@ -5,7 +5,7 @@ use stellar_xdr::curr::Hash;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
-use crate::history_format::{self, HistoryFileState, ROOT_WELL_KNOWN_PATH};
+use crate::history_format::{self, HistoryFileState};
 use crate::pipeline;
 use crate::storage::StorageRef;
 use crate::xdr_verify::VerificationErrorType;
@@ -140,7 +140,10 @@ impl FileFlags {
 // detailed tracking of which files are broken. and which checkpoints are broken
 #[derive(Debug, Default, Clone)]
 pub struct FailureTracker {
-    pub well_known: bool,
+    /// `Some(cp)` when the root `.well-known/stellar-history.json` is broken,
+    /// carrying the checkpoint it should be restored from (the archive's
+    /// highest checkpoint). `None` when healthy.
+    pub well_known: Option<u32>,
     pub files: BTreeMap<u32, FileFlags>,
     pub buckets: BTreeSet<Hash>,
     pub checkpoints: BTreeSet<u32>,
@@ -149,17 +152,19 @@ pub struct FailureTracker {
 impl FailureTracker {
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        !self.well_known
+        self.well_known.is_none()
             && self.files.is_empty()
             && self.buckets.is_empty()
             && self.checkpoints.is_empty()
     }
 
-    pub fn record_well_known(&mut self) {
-        self.well_known = true;
+    /// Mark the root `.well-known` as needing restoration from checkpoint `cp`
+    /// (the archive's highest checkpoint, which is what `.well-known` advertises).
+    pub fn record_well_known(&mut self, cp: u32) {
+        self.well_known = Some(cp);
     }
     pub fn unrecord_well_known(&mut self) {
-        self.well_known = false;
+        self.well_known = None;
     }
 
     pub fn record_file(&mut self, cp: u32, flag: u8) {
@@ -275,6 +280,20 @@ impl ArchiveStats {
         }
     }
 
+    /// Snapshot this stats into a report section (locks failures once + reads
+    /// its counters). The single "stats → section" primitive: operations
+    /// assemble these into a single- or multi-section report and write it.
+    /// Logging is separate ([`report`](Self::report)).
+    pub async fn report_section(&self) -> crate::report::ReportSection {
+        let failures = self.failures.lock().await;
+        crate::report::section(
+            &failures,
+            self.successful_files.load(Ordering::Relaxed),
+            self.skipped_files.load(Ordering::Relaxed),
+            self.retry_count.load(Ordering::Relaxed),
+        )
+    }
+
     pub fn record_success(&self, _path: &str) {
         self.successful_files.fetch_add(1, Ordering::Relaxed);
     }
@@ -291,13 +310,13 @@ impl ArchiveStats {
 
     /// Record a per-file failure, routing by path to the appropriate
     /// `FailureTracker` slot. `cp` is the checkpoint context (used as the key
-    /// for per-checkpoint standard files; ignored for buckets and well-known).
+    /// for per-checkpoint standard files; ignored for buckets). The root
+    /// `.well-known` is not a per-file failure — it is recorded directly via
+    /// [`FailureTracker::record_well_known`] with the archive's high checkpoint.
     /// Unrecognized paths are logged and not recorded.
     pub async fn record_failure(&self, cp: u32, path: &str) {
         let mut failures = self.failures.lock().await;
-        if path == ROOT_WELL_KNOWN_PATH {
-            failures.record_well_known();
-        } else if let Some(hash_str) = history_format::bucket_hash_from_path(path) {
+        if let Some(hash_str) = history_format::bucket_hash_from_path(path) {
             if let Some(hash) = hex_to_hash(&hash_str) {
                 failures.record_bucket(hash);
             } else {
@@ -314,9 +333,7 @@ impl ArchiveStats {
     /// the file). No-op if the path was not present in the tracker.
     pub async fn unrecord_failure(&self, cp: u32, path: &str) {
         let mut failures = self.failures.lock().await;
-        if path == ROOT_WELL_KNOWN_PATH {
-            failures.unrecord_well_known();
-        } else if let Some(hash_str) = history_format::bucket_hash_from_path(path) {
+        if let Some(hash_str) = history_format::bucket_hash_from_path(path) {
             if let Some(hash) = hex_to_hash(&hash_str) {
                 failures.unrecord_bucket(&hash);
             }
@@ -360,8 +377,10 @@ impl ArchiveStats {
             return;
         }
 
-        if failures.well_known {
-            error!("Missing or unreadable .well-known/stellar-history.json");
+        if let Some(cp) = failures.well_known {
+            error!(
+                "Missing or unreadable .well-known/stellar-history.json (restore from checkpoint {cp} / 0x{cp:08x})"
+            );
         }
         let missing_history = failures.count_files(FileFlags::HISTORY);
         let missing_ledger = failures.count_files(FileFlags::LEDGER);

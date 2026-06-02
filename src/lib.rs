@@ -104,6 +104,7 @@ pub mod test_helpers {
         pub high: Option<u32>,
         pub storage_config: StorageConfig,
         pub verify: bool,
+        pub report_path: Option<std::path::PathBuf>,
     }
 
     impl ScanConfig {
@@ -117,7 +118,15 @@ pub mod test_helpers {
                 high: None,
                 storage_config: test_storage_config(),
                 verify: false,
+                report_path: None,
             }
+        }
+
+        /// Set a report path
+        #[must_use]
+        pub fn report(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+            self.report_path = Some(path.into());
+            self
         }
 
         /// Set concurrency level
@@ -173,6 +182,7 @@ pub mod test_helpers {
         pub allow_mirror_gaps: bool,
         pub storage_config: StorageConfig,
         pub verify: bool,
+        pub report_path: Option<std::path::PathBuf>,
     }
 
     impl MirrorConfig {
@@ -189,6 +199,7 @@ pub mod test_helpers {
                 allow_mirror_gaps: false,
                 storage_config: test_storage_config(),
                 verify: false,
+                report_path: None,
             }
         }
 
@@ -246,6 +257,13 @@ pub mod test_helpers {
             self.verify = true;
             self
         }
+
+        /// Set a report path
+        #[must_use]
+        pub fn report(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+            self.report_path = Some(path.into());
+            self
+        }
     }
 
     pub async fn run_scan(config: ScanConfig) -> Result<(), crate::Error> {
@@ -264,7 +282,13 @@ pub mod test_helpers {
             storage_config: config.storage_config,
         };
 
-        let pipeline = Pipeline::new(operation, pipeline_config, src_store, None);
+        let pipeline = Pipeline::new(
+            operation,
+            pipeline_config,
+            src_store,
+            None,
+            config.report_path,
+        );
         pipeline
             .run()
             .await
@@ -307,7 +331,13 @@ pub mod test_helpers {
             storage_config: config.storage_config,
         };
 
-        let pipeline = Pipeline::new(operation, pipeline_config, src_store, Some(dst_store));
+        let pipeline = Pipeline::new(
+            operation,
+            pipeline_config,
+            src_store,
+            Some(dst_store),
+            config.report_path,
+        );
         pipeline
             .run()
             .await
@@ -325,6 +355,7 @@ pub mod test_helpers {
         pub dry_run: bool,
         pub file_list: Option<Vec<String>>,
         pub storage_config: StorageConfig,
+        pub report_path: Option<std::path::PathBuf>,
     }
 
     impl RepairConfig {
@@ -340,7 +371,15 @@ pub mod test_helpers {
                 dry_run: false,
                 file_list: None,
                 storage_config: test_storage_config(),
+                report_path: None,
             }
+        }
+
+        /// Write a JSON status report (or, in dry-run, a repair plan) to this path
+        #[must_use]
+        pub fn report(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+            self.report_path = Some(path.into());
+            self
         }
 
         #[must_use]
@@ -433,7 +472,13 @@ pub mod test_helpers {
                 .map_err(crate::Error::from);
         }
 
-        let pipeline = Pipeline::new(operation, pipeline_config, src_store, Some(dst_store));
+        let pipeline = Pipeline::new(
+            operation,
+            pipeline_config,
+            src_store,
+            Some(dst_store),
+            config.report_path,
+        );
         pipeline
             .run()
             .await

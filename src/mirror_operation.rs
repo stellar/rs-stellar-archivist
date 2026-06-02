@@ -34,6 +34,9 @@ pub enum Error {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Report error: {0}")]
+    Report(#[from] crate::report::ReportError),
 }
 
 pub struct MirrorOperation {
@@ -358,8 +361,18 @@ impl Operation for MirrorOperation {
         &self,
         highest_checkpoint: u32,
         stats: &ArchiveStats,
+        report_path: Option<&std::path::Path>,
     ) -> Result<(), crate::pipeline::Error> {
         stats.report("mirror").await;
+
+        if let Some(path) = report_path {
+            let report = crate::report::ArchiveReport {
+                version: crate::report::REPORT_VERSION,
+                section: stats.report_section().await,
+            };
+            crate::report::write_to_path(path, &report)
+                .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Report(e)))?;
+        }
 
         if stats.has_failures().await {
             return Err(Error::MirrorFailed.into());

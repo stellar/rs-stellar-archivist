@@ -34,7 +34,7 @@ use crate::xdr_verify::{self, XdrParseResult, XdrVerificationManager};
 use futures_util::{stream, StreamExt};
 use opendal::{Buffer, Reader};
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 
@@ -60,6 +60,9 @@ pub enum Error {
 
     #[error("Scan operation error: {0}")]
     ScanOperation(#[from] crate::scan_operation::Error),
+
+    #[error("Report error: {0}")]
+    Report(#[from] crate::report::ReportError),
 }
 
 /// How often to report progress (every N files) in manual mode
@@ -84,8 +87,6 @@ pub struct RepairOperation {
     pipeline_config: PipelineConfig,
     /// Set during get_checkpoint_bounds if dest .well-known needs repair
     well_known_needs_repair: AtomicBool,
-    /// Dry-run counter: files that would be repaired
-    needs_repair_count: AtomicU64,
 }
 
 impl RepairOperation {
@@ -109,7 +110,6 @@ impl RepairOperation {
             dry_run,
             pipeline_config,
             well_known_needs_repair: AtomicBool::new(false),
-            needs_repair_count: AtomicU64::new(0),
         }
     }
 
@@ -182,13 +182,6 @@ impl RepairOperation {
             return Err(Error::RepairFailed);
         }
         Ok(())
-    }
-
-    /// Increment the dry-run counter (signalling "we'd repair this file but
-    /// did nothing"). Used when dst checks fail and we'd otherwise fetch from src.
-    fn note_dry_run(&self, path: &str) {
-        self.needs_repair_count.fetch_add(1, Ordering::Relaxed);
-        debug!("Dry run: would repair {}", path);
     }
 
     /// Check whether dst already has a good copy of `path` and (when verify
@@ -342,6 +335,7 @@ impl RepairOperation {
             retry_config,
             self.src_store.clone(),
             Some(self.dst_store.clone()),
+            /*report_path=*/ None,
         )
     }
 
@@ -608,8 +602,9 @@ impl Operation for RepairOperation {
             return Ok(ProcessOutcome::Processed);
         }
         if self.dry_run {
-            self.note_dry_run(path);
-            return Ok(ProcessOutcome::Processed);
+            // Record the broken file/bucket into the pipeline's stats (via the
+            // NeedsRepair recorder) without fetching or writing.
+            return Ok(ProcessOutcome::NeedsRepair);
         }
         xdr_verify::fetch_verify_and_write(&self.src_store, &self.dst_store, path, manager).await?;
         Ok(ProcessOutcome::Processed)
@@ -632,10 +627,12 @@ impl Operation for RepairOperation {
             }
         }
 
-        // Destination missing or corrupt — need from source
+        // Destination missing or corrupt.
         if self.dry_run {
-            self.needs_repair_count.fetch_add(1, Ordering::Relaxed);
-            debug!("Dry run: would repair {}", history_path);
+            // Signal "needs repair": the pipeline records the HISTORY failure and
+            // skips bucket discovery. No src fetch — the actual repair re-fetches
+            // history and its buckets together via process_history_and_buckets.
+            return Ok(HistoryFetch::NeedsRepair);
         }
 
         // Download from source (pipeline will write to dst via process_buffer)
@@ -648,25 +645,32 @@ impl Operation for RepairOperation {
         &self,
         highest_checkpoint: u32,
         stats: &ArchiveStats,
+        report_path: Option<&std::path::Path>,
     ) -> Result<(), pipeline::Error> {
         // Manager drain (verify_checkpoint_chain + record_all_errors) already
         // happened in `Pipeline::run_checkpoints`, so `stats.failures.checkpoints`
         // is already populated for `retry_failed_checkpoints` to consume.
 
         if self.dry_run {
-            let count = self.needs_repair_count.load(Ordering::Relaxed);
-            info!("Dry run: {} file(s) would be repaired", count);
-            // Cross-file and chain failures are found by the verification
-            // manager (drained into stats.failures before finalize) and are
-            // invisible to the per-file dst probe, so they aren't in the count
-            // above. Report them separately: a real run would re-fetch these
-            // whole checkpoints in the checkpoint-retry stage.
-            let checkpoint_failures = stats.failures.lock().await.checkpoints.len();
-            if checkpoint_failures > 0 {
-                info!(
-                    "Dry run: {} checkpoint(s) with cross-file/chain failures would be re-fetched",
-                    checkpoint_failures
-                );
+            // Reflect the well-known flag into stats so the plan includes it,
+            // then report: dry-run records the broken inventory into
+            // `stats.failures` (per-file/bucket via NeedsRepair, checkpoints via
+            // the manager), so logging + the JSON plan both read from it.
+            if self.well_known_needs_repair.load(Ordering::Relaxed) {
+                stats
+                    .failures
+                    .lock()
+                    .await
+                    .record_well_known(highest_checkpoint);
+            }
+            stats.report("repair").await;
+            if let Some(path) = report_path {
+                let report = crate::report::ArchiveReport {
+                    version: crate::report::REPORT_VERSION,
+                    section: stats.report_section().await,
+                };
+                crate::report::write_to_path(path, &report)
+                    .map_err(|e| pipeline::Error::RepairOperation(Error::Report(e)))?;
             }
             return Ok(());
         }
@@ -696,6 +700,29 @@ impl Operation for RepairOperation {
         // directory creation, or copy) feeds the success gate below directly.
         let well_known_failed = self.well_known_needs_repair.load(Ordering::Relaxed)
             && !self.repair_well_known(highest_checkpoint).await;
+
+        // Full-context report: one section per stage (main pass + both retries).
+        // Built and written once — all three stats are in hand here.
+        if let Some(path) = report_path {
+            let report = crate::report::MultiSectionReport {
+                version: crate::report::REPORT_VERSION,
+                sections: [
+                    ("main_pass".to_string(), stats.report_section().await),
+                    (
+                        "file_retry".to_string(),
+                        file_retry_stats.report_section().await,
+                    ),
+                    (
+                        "checkpoint_retry".to_string(),
+                        checkpoint_retry_stats.report_section().await,
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            };
+            crate::report::write_to_path(path, &report)
+                .map_err(|e| pipeline::Error::RepairOperation(Error::Report(e)))?;
+        }
 
         // Overall success = both retries recovered everything they attempted and
         // .well-known restoration (if needed) succeeded.
