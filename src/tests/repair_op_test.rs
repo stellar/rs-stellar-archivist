@@ -1324,3 +1324,465 @@ async fn test_file_retry_history_repair_corrupt_history_from_src() {
     // No buckets touched (we never got past parse).
     assert!(f.buckets.is_empty());
 }
+
+//=============================================================================
+// N. .well-known restoration ordering — restoration copies the highest
+// checkpoint's history file, which the file-retry stage may itself be what
+// restores. Restoration must therefore run after the retry stages.
+//=============================================================================
+
+/// Reproduces the ordering hazard: dst `.well-known` is missing AND the
+/// highest-checkpoint history file was not present after the main pass (as if
+/// its main-pass fetch failed), so it is only restored by the file-retry
+/// stage. Because `.well-known` is restored from that history file, restoration
+/// must run after the retry stage — otherwise it copies from an absent file,
+/// logs an error, and silently leaves `.well-known` missing while repair still
+/// reports success.
+#[tokio::test]
+async fn test_well_known_restored_after_history_retry() {
+    use crate::pipeline::Operation;
+
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    // K = highest checkpoint present on dst; its history file drives .well-known.
+    let (k, history_rel) = get_files_by_pattern(dest_dir.path(), "/history-")
+        .iter()
+        .filter(|p| !p.to_string_lossy().contains(".well-known"))
+        .filter_map(|p| {
+            let rel = p
+                .strip_prefix(dest_dir.path())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            history_format::checkpoint_from_path(&rel).map(|cp| (cp, rel))
+        })
+        .max_by_key(|(cp, _)| *cp)
+        .expect("need a non-well-known history file");
+
+    // Broken main-pass state: dst .well-known missing (so get_checkpoint_bounds
+    // flags it for repair) and dst history-K missing (as if its main-pass fetch
+    // failed and only the retry stage can restore it).
+    std::fs::remove_file(dest_dir.path().join(".well-known/stellar-history.json"))
+        .expect("delete .well-known");
+    std::fs::remove_file(dest_dir.path().join(&history_rel)).expect("delete history-K");
+
+    let op = build_repair_op(&src_url, &dest_url, /*verify=*/ true);
+
+    // Observe the missing dst .well-known so the needs-repair flag is set.
+    let src_store =
+        crate::storage::from_url_with_config(&src_url, &crate::test_helpers::test_storage_config())
+            .unwrap();
+    op.get_checkpoint_bounds(&src_store)
+        .await
+        .expect("bounds via src fallback");
+
+    // Simulate the main pass having recorded a HISTORY failure for K — this is
+    // the entry the retry stage acts on to restore history-K.
+    let parent_stats = crate::utils::ArchiveStats::new();
+    parent_stats.record_failure(k, &history_rel).await;
+
+    op.finalize(k, &parent_stats)
+        .await
+        .expect("finalize should succeed once history-K is restored by retry");
+
+    let wk = dest_dir.path().join(".well-known/stellar-history.json");
+    assert!(
+        wk.exists(),
+        ".well-known should be restored after the retry stage repairs history-K"
+    );
+    let wk_bytes = std::fs::read(&wk).unwrap();
+    let history_bytes = std::fs::read(dest_dir.path().join(&history_rel)).unwrap();
+    assert_eq!(
+        wk_bytes, history_bytes,
+        ".well-known must equal the repaired history-K byte-for-byte"
+    );
+}
+
+/// A `.well-known` restoration that fails for a reason other than a missing
+/// history file (here: the destination path is a directory, so the copy
+/// errors) must fail the run rather than reporting success with `.well-known`
+/// still broken. The highest history file stays healthy on dst, so this
+/// failure is NOT visible through the retry stages' stats — repair must surface
+/// it on its own.
+#[tokio::test]
+async fn test_repair_fails_when_well_known_restore_copy_fails() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    // Replace the .well-known file with a directory at the same path. The read
+    // in get_checkpoint_bounds fails (flagging .well-known for repair), every
+    // history file remains intact, and the restoring copy in finalize then
+    // fails because its destination is a directory.
+    let wk_path = dest_dir.path().join(".well-known/stellar-history.json");
+    std::fs::remove_file(&wk_path).expect("delete .well-known file");
+    std::fs::create_dir(&wk_path).expect("create .well-known directory");
+
+    let result = run_repair(RepairConfig::new(&src_url, &dest_url)).await;
+    assert!(
+        result.is_err(),
+        "repair must fail when .well-known restoration copy fails"
+    );
+}
+
+//=============================================================================
+// N. Two-stage retry partitioning — `build_failed_files_work_list` carve-out
+//
+// These exercise the load-bearing invariant of the two-stage retry design:
+// when a checkpoint is in BOTH `failures.files` and `failures.checkpoints`,
+// the file-retry stage keeps the HISTORY entry (it owns bucket discovery) but
+// drops non-HISTORY per-cp files (the checkpoint-retry stage re-mirrors those).
+//=============================================================================
+
+/// HISTORY carve-out: a checkpoint with a HISTORY failure in `failures.files`
+/// that is ALSO flagged in `failures.checkpoints` must still have its history
+/// file re-fetched (and its bucket refs walked) by the file-retry stage, not
+/// deferred entirely to the checkpoint-retry stage.
+#[tokio::test]
+async fn test_file_retry_keeps_history_when_cp_in_chain_retry() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    let (history_abs, cp, _hashes, bucket_abs) = pick_history_with_buckets(dest_dir.path());
+    let history_relative = history_abs
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    let bucket_to_break = &bucket_abs[0];
+
+    // Break the history file + one referenced bucket on dst.
+    std::fs::remove_file(&history_abs).expect("delete history");
+    std::fs::remove_file(bucket_to_break).expect("delete bucket");
+
+    // Simulate a main pass that recorded BOTH a HISTORY file failure AND a
+    // chain failure for the same checkpoint.
+    let op = build_repair_op(&src_url, &dest_url, /*verify=*/ true);
+    let parent_stats = crate::utils::ArchiveStats::new();
+    parent_stats.record_failure(cp, &history_relative).await;
+    {
+        let mut f = parent_stats.failures.lock().await;
+        f.record_checkpoint(cp);
+    }
+
+    let _stats = op.retry_failed_files(&parent_stats).await;
+
+    // Despite cp being in the chain-retry set, the file-retry stage repaired
+    // the history file and walked its bucket refs.
+    assert!(
+        history_abs.exists(),
+        "history must be repaired even though cp is in the chain-retry set"
+    );
+    assert!(
+        bucket_to_break.exists(),
+        "the referenced bucket must be repaired via the HISTORY bucket-walk"
+    );
+}
+
+/// Non-HISTORY carve-out: a checkpoint with a non-HISTORY per-cp file failure
+/// (LEDGER here) that is ALSO in `failures.checkpoints` must have that file
+/// SKIPPED by the file-retry stage — the checkpoint-retry stage re-mirrors the
+/// whole cp instead. Only the HISTORY entry survives the carve-out.
+#[tokio::test]
+async fn test_file_retry_skips_nonhistory_file_when_cp_in_chain_retry() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    let (history_abs, cp, _hashes, _bucket_abs) = pick_history_with_buckets(dest_dir.path());
+    let history_relative = history_abs
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    // Locate this checkpoint's ledger file.
+    let ledger_files = get_files_by_pattern(dest_dir.path(), &format!("ledger-{cp:08x}"));
+    assert!(
+        !ledger_files.is_empty(),
+        "cp {cp} should have a ledger file"
+    );
+    let ledger_abs = ledger_files[0].clone();
+    let ledger_relative = ledger_abs
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+
+    // Break the history + ledger on dst (leave buckets intact).
+    std::fs::remove_file(&history_abs).expect("delete history");
+    std::fs::remove_file(&ledger_abs).expect("delete ledger");
+
+    let op = build_repair_op(&src_url, &dest_url, /*verify=*/ true);
+    let parent_stats = crate::utils::ArchiveStats::new();
+    parent_stats.record_failure(cp, &history_relative).await;
+    parent_stats.record_failure(cp, &ledger_relative).await;
+    {
+        let mut f = parent_stats.failures.lock().await;
+        f.record_checkpoint(cp);
+    }
+
+    let _stats = op.retry_failed_files(&parent_stats).await;
+
+    // HISTORY is repaired (carve-out keeps it)...
+    assert!(history_abs.exists(), "history must be repaired");
+    // ...but the LEDGER is left for the checkpoint-retry stage.
+    assert!(
+        !ledger_abs.exists(),
+        "ledger must be skipped by file-retry when its cp is in the chain-retry set"
+    );
+}
+
+/// Checkpoint-retry skips HAS + buckets: the cp-retry inner pipeline is built
+/// with `skip_history_and_buckets=true`, so re-mirroring a flagged checkpoint
+/// re-fetches its per-cp xdr files (ledger/tx/results/scp) but NOT the history
+/// file or any bucket. A bucket missing from dst stays missing after cp-retry.
+#[tokio::test]
+async fn test_checkpoint_retry_skips_buckets_and_has() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    let (_history_abs, cp, _hashes, bucket_abs) = pick_history_with_buckets(dest_dir.path());
+    let bucket_to_break = &bucket_abs[0];
+
+    let ledger_files = get_files_by_pattern(dest_dir.path(), &format!("ledger-{cp:08x}"));
+    assert!(
+        !ledger_files.is_empty(),
+        "cp {cp} should have a ledger file"
+    );
+    let ledger_abs = ledger_files[0].clone();
+
+    // Delete the cp's ledger (a per-cp xdr file) AND one referenced bucket.
+    std::fs::remove_file(&ledger_abs).expect("delete ledger");
+    std::fs::remove_file(bucket_to_break).expect("delete bucket");
+
+    // Only a chain/cross-file failure is recorded for cp — no per-file, no
+    // bucket. This routes the work exclusively through `retry_failed_checkpoints`.
+    let op = build_repair_op(&src_url, &dest_url, /*verify=*/ false);
+    let parent_stats = crate::utils::ArchiveStats::new();
+    {
+        let mut f = parent_stats.failures.lock().await;
+        f.record_checkpoint(cp);
+    }
+
+    let _stats = op.retry_failed_checkpoints(&parent_stats).await;
+
+    // The per-cp ledger was re-mirrored...
+    assert!(
+        ledger_abs.exists(),
+        "checkpoint-retry must re-fetch the per-cp ledger file"
+    );
+    // ...but the bucket was NOT (HAS + bucket work is skipped in cp-retry).
+    assert!(
+        !bucket_to_break.exists(),
+        "checkpoint-retry must skip bucket fetches (skip_history_and_buckets)"
+    );
+}
+
+//=============================================================================
+// O. Pure chain failure (no coinciding per-file failure)
+//=============================================================================
+
+/// Tamper a ledger file so it breaks the intra-checkpoint hash chain while
+/// every per-file self-hash still verifies. We bump an innocuous header field
+/// (`total_coins`) on the checkpoint's first ledger and recompute that entry's
+/// self-hash, so the file parses cleanly but the *next* ledger's
+/// `previous_ledger_hash` no longer matches the (now-changed) computed hash.
+/// Returns the affected checkpoint.
+fn tamper_ledger_break_chain(archive_path: &Path) -> u32 {
+    use flate2::read::GzDecoder;
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    use stellar_xdr::curr::{
+        Frame, Hash, LedgerHeaderHistoryEntry, Limited, Limits, ReadXdr, WriteXdr,
+    };
+
+    let files = get_files_by_pattern(archive_path, "/ledger-");
+    assert!(!files.is_empty(), "no ledger files found");
+    let file = files[0].clone();
+    let relative = file
+        .strip_prefix(archive_path)
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let cp =
+        history_format::checkpoint_from_path(&relative).expect("ledger path encodes a checkpoint");
+
+    // Decompress.
+    let compressed = std::fs::read(&file).unwrap();
+    let mut decoder = GzDecoder::new(&compressed[..]);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed).unwrap();
+
+    // Parse every ledger-header entry, in file (ascending-seq) order.
+    let mut limited = Limited::new(std::io::Cursor::new(&decompressed[..]), Limits::none());
+    let mut entries: Vec<LedgerHeaderHistoryEntry> =
+        Frame::<LedgerHeaderHistoryEntry>::read_xdr_iter(&mut limited)
+            .map(|r| r.expect("parse ledger header entry").0)
+            .collect();
+    assert!(
+        entries.len() >= 2,
+        "need >= 2 ledgers for an intra-cp chain window"
+    );
+
+    // Mutate the first entry's header, then recompute its self-hash so the
+    // entry stays internally consistent (still passes the per-file hash check).
+    entries[0].header.total_coins = entries[0].header.total_coins.wrapping_add(1);
+    let header_xdr = entries[0].header.to_xdr(Limits::none()).unwrap();
+    entries[0].hash = Hash(Sha256::digest(&header_xdr).into());
+
+    // Re-encode with RFC 5531 record marking (high bit set + payload length).
+    let mut out = Vec::new();
+    for entry in &entries {
+        let payload = entry.to_xdr(Limits::none()).unwrap();
+        let marker = (payload.len() as u32 | 0x8000_0000).to_be_bytes();
+        out.extend_from_slice(&marker);
+        out.extend_from_slice(&payload);
+    }
+
+    // Recompress and write back.
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(&out).unwrap();
+    std::fs::write(&file, encoder.finish().unwrap()).unwrap();
+
+    cp
+}
+
+/// A pure hash-chain failure: the ledger file is structurally valid and
+/// self-consistent (so existence-only scan AND per-file verification both
+/// pass), but the chain is broken. This exercises the `finalize` →
+/// `retry_failed_checkpoints` path for a checkpoint that appears ONLY in
+/// `failures.checkpoints` (no `failures.files` / `failures.buckets` entry) —
+/// the case no byte-corruption test can produce, since corruption also breaks
+/// the file's own self-hash.
+#[tokio::test]
+async fn test_repair_pure_chain_failure() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    tamper_ledger_break_chain(dest_dir.path());
+
+    // Existence-only scan passes: the file is present and structurally valid.
+    run_scan(ScanConfig::new(&dest_url))
+        .await
+        .expect("existence-only scan should pass (file is structurally valid)");
+
+    // Verifying scan fails: the hash chain is broken.
+    run_scan(ScanConfig::new(&dest_url).verify())
+        .await
+        .expect_err("verifying scan should detect the chain break");
+
+    // Repair (with verify) must fix it via the checkpoint-retry stage.
+    run_repair(RepairConfig::new(&src_url, &dest_url).verify())
+        .await
+        .expect("repair --verify should fix a pure chain failure");
+
+    run_scan(ScanConfig::new(&dest_url).verify())
+        .await
+        .expect("verifying scan should pass after repair");
+}
+
+//=============================================================================
+// P. .well-known bounds + restoration failure paths
+//=============================================================================
+
+/// Both src and dst `.well-known` unreadable → `get_checkpoint_bounds` has no
+/// way to determine the range and must return an error.
+#[tokio::test]
+async fn test_repair_both_well_known_unreadable_errors() {
+    use crate::pipeline::Operation;
+
+    let src_dir = TempDir::new().unwrap();
+    copy_testnet_small_archive(src_dir.path()).unwrap();
+    let src_url = file_url_from_path(src_dir.path());
+    let dest_dir = TempDir::new().unwrap();
+    let dest_url = file_url_from_path(dest_dir.path());
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("mirror should succeed");
+
+    std::fs::remove_file(src_dir.path().join(".well-known/stellar-history.json")).unwrap();
+    std::fs::remove_file(dest_dir.path().join(".well-known/stellar-history.json")).unwrap();
+
+    let op = build_repair_op(&src_url, &dest_url, /*verify=*/ false);
+    let src_store =
+        crate::storage::from_url_with_config(&src_url, &crate::test_helpers::test_storage_config())
+            .unwrap();
+    let result = op.get_checkpoint_bounds(&src_store).await;
+    assert!(
+        result.is_err(),
+        "get_checkpoint_bounds must error when both .well-known are unreadable"
+    );
+}
+
+/// `repair_well_known` failure path: when the highest checkpoint's history file
+/// is itself unrecoverable (missing from both src and dst), repair must NOT
+/// fabricate a `.well-known` from a history file it could not restore.
+#[tokio::test]
+async fn test_repair_well_known_not_restored_when_history_missing() {
+    let src_dir = TempDir::new().unwrap();
+    copy_testnet_small_archive(src_dir.path()).unwrap();
+    let src_url = file_url_from_path(src_dir.path());
+    let dest_dir = TempDir::new().unwrap();
+    let dest_url = file_url_from_path(dest_dir.path());
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("mirror should succeed");
+
+    // Determine the highest checkpoint (the one repair_well_known copies from).
+    let wk =
+        std::fs::read_to_string(src_dir.path().join(".well-known/stellar-history.json")).unwrap();
+    let state: history_format::HistoryFileState = serde_json::from_str(&wk).unwrap();
+    let highest_cp = history_format::round_to_lower_checkpoint(state.current_ledger);
+    let history_rel = history_format::checkpoint_path("history", highest_cp);
+
+    // Make the highest history file unavailable in BOTH src and dst, and drop
+    // dst's .well-known so repair attempts to restore it.
+    std::fs::remove_file(src_dir.path().join(&history_rel)).expect("rm src history");
+    std::fs::remove_file(dest_dir.path().join(&history_rel)).expect("rm dst history");
+    std::fs::remove_file(dest_dir.path().join(".well-known/stellar-history.json"))
+        .expect("rm dst .well-known");
+
+    // Repair fails (highest history unrecoverable) and must not restore
+    // .well-known from a history file it couldn't repair.
+    let result = run_repair(RepairConfig::new(&src_url, &dest_url)).await;
+    assert!(
+        result.is_err(),
+        "repair should fail when the highest history file is unrecoverable"
+    );
+    assert!(
+        !dest_dir
+            .path()
+            .join(".well-known/stellar-history.json")
+            .exists(),
+        ".well-known must not be restored when its source history file is missing"
+    );
+}
+
+//=============================================================================
+// Q. Dry-run write suppression with --verify (corrupt history left untouched)
+//=============================================================================
+
+/// Dry-run + verify must detect a corrupt history file but leave it untouched
+/// on dst (the pipeline used to write the src buffer back via `process_buffer`
+/// even in dry-run). Complements `test_repair_dry_run_with_verify`, which only
+/// covered a corrupt bucket.
+#[tokio::test]
+async fn test_repair_dry_run_with_verify_leaves_corrupt_history_untouched() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    let history_files: Vec<_> = get_files_by_pattern(dest_dir.path(), "/history-")
+        .into_iter()
+        .filter(|p| !p.to_string_lossy().contains(".well-known"))
+        .collect();
+    assert!(!history_files.is_empty());
+    let corrupt_content: &[u8] = b"{ not valid history json }}";
+    std::fs::write(&history_files[0], corrupt_content).unwrap();
+
+    run_repair(RepairConfig::new(&src_url, &dest_url).verify().dry_run())
+        .await
+        .expect("dry-run + verify should succeed");
+
+    assert_eq!(
+        std::fs::read(&history_files[0]).unwrap(),
+        corrupt_content,
+        "dry-run + verify must not overwrite a corrupt history file"
+    );
+
+    run_scan(ScanConfig::new(&dest_url).verify())
+        .await
+        .expect_err("history should still be corrupt after dry-run");
+}

@@ -437,36 +437,53 @@ impl RepairOperation {
         checkpoint_retry_pipeline.into_stats()
     }
 
-    /// Repair .well-known by copying from highest checkpoint's history file.
-    async fn repair_well_known(&self, highest_checkpoint: u32) {
+    /// Restore `.well-known/stellar-history.json` by copying the highest
+    /// checkpoint's history file on the destination — a local dst-to-dst copy,
+    /// not a fetch from the source.
+    ///
+    /// Returns `true` if `.well-known` is in its intended state (restored, or a
+    /// no-op on a non-filesystem backend) and `false` if a needed restoration
+    /// failed, so the caller can fail the run rather than report success with
+    /// `.well-known` still broken.
+    async fn repair_well_known(&self, highest_checkpoint: u32) -> bool {
         let history_path = history_format::checkpoint_path("history", highest_checkpoint);
         let well_known_path = history_format::ROOT_WELL_KNOWN_PATH;
 
-        if let Some(base_path) = self.dst_store.get_base_path() {
-            let src_file = base_path.join(&history_path);
-            let dst_file = base_path.join(well_known_path);
+        let Some(base_path) = self.dst_store.get_base_path() else {
+            // Non-filesystem backend: nothing to copy locally. R-3.11 permits
+            // a silent no-op (no writable non-filesystem backend exists today).
+            return true;
+        };
 
-            if !tokio::fs::try_exists(&src_file).await.unwrap_or(false) {
-                error!(
-                    "Cannot repair .well-known: history file at checkpoint {} not found",
-                    highest_checkpoint
-                );
-                return;
+        let src_file = base_path.join(&history_path);
+        let dst_file = base_path.join(well_known_path);
+
+        if !tokio::fs::try_exists(&src_file).await.unwrap_or(false) {
+            error!(
+                "Cannot repair .well-known: history file at checkpoint {} not found",
+                highest_checkpoint
+            );
+            return false;
+        }
+
+        if let Some(parent) = dst_file.parent() {
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                error!("Failed to create .well-known directory: {}", e);
+                return false;
             }
+        }
 
-            if let Some(parent) = dst_file.parent() {
-                if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                    error!("Failed to create .well-known directory: {}", e);
-                    return;
-                }
-            }
-
-            match tokio::fs::copy(&src_file, &dst_file).await {
-                Ok(_) => info!(
+        match tokio::fs::copy(&src_file, &dst_file).await {
+            Ok(_) => {
+                info!(
                     "Restored .well-known from checkpoint {} (0x{:08x})",
                     highest_checkpoint, highest_checkpoint
-                ),
-                Err(e) => error!("Failed to restore .well-known: {}", e),
+                );
+                true
+            }
+            Err(e) => {
+                error!("Failed to restore .well-known: {}", e);
+                false
             }
         }
     }
@@ -638,13 +655,6 @@ impl Operation for RepairOperation {
             return Ok(());
         }
 
-        // .well-known restoration. Separate path from the two retry stages
-        // (a follow-up may fold it into `retry_failed_files`'s per-path
-        // repair flow).
-        if self.well_known_needs_repair.load(Ordering::Relaxed) {
-            self.repair_well_known(highest_checkpoint).await;
-        }
-
         stats.report("repair main").await;
 
         // Per-file retry: re-fetch every entry in failures.files /
@@ -660,13 +670,22 @@ impl Operation for RepairOperation {
             .report("repair checkpoint retry")
             .await;
 
-        // Overall success = both retries recovered everything they attempted.
-        // The parent's failures are expected — those are what we just tried
-        // to fix; the retries' own failure trackers are the ground truth for
-        // "what's still broken."
+        // .well-known restoration runs *after* the retry stages. It copies the
+        // highest checkpoint's history file on dst, and that history file may
+        // itself be what the file-retry stage just restored (when its main-pass
+        // fetch failed).
+        //
+        // `repair_well_known` returns whether .well-known ended up in its
+        // intended state; a restoration failure (missing history file,
+        // directory creation, or copy) feeds the success gate below directly.
+        let well_known_failed = self.well_known_needs_repair.load(Ordering::Relaxed)
+            && !self.repair_well_known(highest_checkpoint).await;
+
+        // Overall success = both retries recovered everything they attempted and
+        // .well-known restoration (if needed) succeeded.
         let file_retry_failed = file_retry_stats.has_failures().await;
         let checkpoint_retry_failed = checkpoint_retry_stats.has_failures().await;
-        if file_retry_failed || checkpoint_retry_failed {
+        if file_retry_failed || checkpoint_retry_failed || well_known_failed {
             return Err(Error::RepairFailed.into());
         }
 
