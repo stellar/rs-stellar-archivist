@@ -485,3 +485,93 @@ pub fn parse_transaction_entries(
 ) -> Result<BTreeMap<u32, Hash>, StorageError> {
     parse_transaction_entries_for_checkpoint(decompressed_data, None)
 }
+
+//=============================================================================
+// Ledger-header file corruption helpers
+//
+// Read/recompute/write a gzip'd ledger-header file at the XDR-entry level.
+// Used to construct files that pass per-entry and intra-checkpoint validation
+// but fail cross-file verification, exercising the manager's checkpoint-level
+// failure path.
+//=============================================================================
+
+pub(crate) fn read_and_parse_ledger_file(
+    path: &Path,
+) -> Vec<stellar_xdr::curr::LedgerHeaderHistoryEntry> {
+    use flate2::read::GzDecoder;
+    use std::io::Read as _;
+    use stellar_xdr::curr::{Frame, LedgerHeaderHistoryEntry, Limited, Limits, ReadXdr};
+
+    let data = std::fs::read(path).expect("Failed to read ledger file");
+    let mut decoder = GzDecoder::new(&data[..]);
+    let mut decompressed = Vec::new();
+    decoder
+        .read_to_end(&mut decompressed)
+        .expect("Failed to decompress");
+
+    let cursor = std::io::Cursor::new(&decompressed);
+    let mut limited = Limited::new(cursor, Limits::none());
+
+    Frame::<LedgerHeaderHistoryEntry>::read_xdr_iter(&mut limited)
+        .map(|r| r.expect("Failed to parse ledger-header entry").0)
+        .collect()
+}
+
+pub(crate) fn recompute_entry_hash(entry: &mut stellar_xdr::curr::LedgerHeaderHistoryEntry) {
+    use sha2::{Digest, Sha256};
+    use stellar_xdr::curr::{Limits, WriteXdr};
+
+    let header_xdr = entry
+        .header
+        .to_xdr(Limits::none())
+        .expect("Failed to serialize header");
+    entry.hash = Hash(Sha256::digest(&header_xdr).into());
+}
+
+pub(crate) fn write_ledger_header_entries_to_file(
+    path: &Path,
+    entries: &[stellar_xdr::curr::LedgerHeaderHistoryEntry],
+) {
+    use flate2::write::GzEncoder;
+    use flate2::Compression;
+    use std::io::Write as _;
+    use stellar_xdr::curr::{Limits, WriteXdr};
+
+    let mut data = Vec::new();
+    for entry in entries {
+        let entry_xdr = entry
+            .to_xdr(Limits::none())
+            .expect("Failed to serialize entry");
+        let frame_len = entry_xdr.len() as u32 | 0x8000_0000;
+        data.extend_from_slice(&frame_len.to_be_bytes());
+        data.extend_from_slice(&entry_xdr);
+    }
+
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&data)
+        .expect("Failed to write compressed data");
+    let compressed = encoder.finish().expect("Failed to finish compression");
+    std::fs::write(path, compressed).expect("Failed to write file");
+}
+
+/// Corrupt a single ledger-header file in place so that the named cross-file
+/// hash field (`"tx_set"` or `"result"`) is wrong on every entry, while each
+/// entry's own hash and the intra-checkpoint prev-hash chain are recomputed to
+/// stay valid. The result parses cleanly per-entry; the mismatch surfaces only
+/// during cross-file verification against the transactions/results files.
+pub(crate) fn corrupt_ledger_cross_file_hash(ledger_file: &Path, field: &str) {
+    let mut entries = read_and_parse_ledger_file(ledger_file);
+    for i in 0..entries.len() {
+        match field {
+            "tx_set" => entries[i].header.scp_value.tx_set_hash = Hash([0xDE; 32]),
+            "result" => entries[i].header.tx_set_result_hash = Hash([0xDE; 32]),
+            other => panic!("unknown cross-file hash field: {other}"),
+        }
+        if i > 0 {
+            entries[i].header.previous_ledger_hash = entries[i - 1].hash.clone();
+        }
+        recompute_entry_hash(&mut entries[i]);
+    }
+    write_ledger_header_entries_to_file(ledger_file, &entries);
+}

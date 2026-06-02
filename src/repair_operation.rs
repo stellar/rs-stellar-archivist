@@ -652,6 +652,18 @@ impl Operation for RepairOperation {
         if self.dry_run {
             let count = self.needs_repair_count.load(Ordering::Relaxed);
             info!("Dry run: {} file(s) would be repaired", count);
+            // Cross-file and chain failures are found by the verification
+            // manager (drained into stats.failures before finalize) and are
+            // invisible to the per-file dst probe, so they aren't in the count
+            // above. Report them separately: a real run would re-fetch these
+            // whole checkpoints in the checkpoint-retry stage.
+            let checkpoint_failures = stats.failures.lock().await.checkpoints.len();
+            if checkpoint_failures > 0 {
+                info!(
+                    "Dry run: {} checkpoint(s) with cross-file/chain failures would be re-fetched",
+                    checkpoint_failures
+                );
+            }
             return Ok(());
         }
 

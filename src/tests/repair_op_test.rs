@@ -4,8 +4,8 @@
 //! manual mode, dry run, error handling, idempotency, and CLI validation.
 
 use super::utils::{
-    copy_testnet_small_archive, file_url_from_path, get_files_by_pattern, start_http_server,
-    testnet_small_archive_path,
+    copy_testnet_small_archive, corrupt_ledger_cross_file_hash, file_url_from_path,
+    get_files_by_pattern, start_http_server, testnet_small_archive_path,
 };
 use crate::history_format;
 use crate::test_helpers::{
@@ -1052,6 +1052,16 @@ fn build_repair_op(
     dst_url: &str,
     verify: bool,
 ) -> crate::repair_operation::RepairOperation {
+    build_repair_op_full(src_url, dst_url, verify, /*dry_run=*/ false)
+}
+
+/// Like [`build_repair_op`], but with an explicit `dry_run` flag.
+fn build_repair_op_full(
+    src_url: &str,
+    dst_url: &str,
+    verify: bool,
+    dry_run: bool,
+) -> crate::repair_operation::RepairOperation {
     let storage_config = crate::test_helpers::test_storage_config();
     let src_store = crate::storage::from_url_with_config(src_url, &storage_config).unwrap();
     let dst_store = crate::storage::from_url_with_config(dst_url, &storage_config).unwrap();
@@ -1067,7 +1077,7 @@ fn build_repair_op(
         dst_store,
         /*low=*/ None,
         /*high=*/ None,
-        /*dry_run=*/ false,
+        dry_run,
         pipeline_config,
     )
 }
@@ -1785,4 +1795,90 @@ async fn test_repair_dry_run_with_verify_leaves_corrupt_history_untouched() {
     run_scan(ScanConfig::new(&dest_url).verify())
         .await
         .expect_err("history should still be corrupt after dry-run");
+}
+
+/// Dry-run + verify must account for cross-file/chain failures, not just the
+/// per-file dst probe. A ledger file is made wrong-but-well-formed: every entry
+/// parses and self-hashes correctly (so the dst probe accepts it and nothing is
+/// added to `needs_repair_count`), but its tx-set hash no longer matches the
+/// transactions file. That mismatch lands in the manager's checkpoint-level
+/// tracker — which `finalize`'s dry-run summary now reports — and a real run
+/// would re-fetch the checkpoint in the checkpoint-retry stage. Dry-run must not
+/// write.
+#[tokio::test]
+async fn test_repair_dry_run_verify_surfaces_cross_file_failure() {
+    use crate::pipeline::{Operation, Pipeline, PipelineConfig};
+
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    // Pick a non-genesis ledger file and break its tx-set hash cross-file.
+    let (ledger_abs, cp) = get_files_by_pattern(dest_dir.path(), "/ledger-")
+        .iter()
+        .filter_map(|p| {
+            let rel = p
+                .strip_prefix(dest_dir.path())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            history_format::checkpoint_from_path(&rel).map(|c| (p.clone(), c))
+        })
+        .find(|(_, c)| *c != history_format::GENESIS_CHECKPOINT_LEDGER)
+        .expect("need a non-genesis ledger file");
+
+    corrupt_ledger_cross_file_hash(&ledger_abs, "tx_set");
+    let corrupted_bytes = std::fs::read(&ledger_abs).unwrap();
+
+    let storage_config = crate::test_helpers::test_storage_config();
+    let src_store = crate::storage::from_url_with_config(&src_url, &storage_config).unwrap();
+    let dst_store = crate::storage::from_url_with_config(&dest_url, &storage_config).unwrap();
+
+    let op = build_repair_op_full(
+        &src_url, &dest_url, /*verify=*/ true, /*dry_run=*/ true,
+    );
+    let (low, high) = op
+        .get_checkpoint_bounds(&src_store)
+        .await
+        .expect("bounds from dst .well-known");
+
+    let config = PipelineConfig {
+        concurrency: 4,
+        skip_optional: false,
+        skip_history_and_buckets: false,
+        verify: true,
+        storage_config,
+    };
+    let pipeline = Pipeline::new(op, config, src_store, Some(dst_store));
+    let cps = (low..=high).step_by(history_format::CHECKPOINT_FREQUENCY as usize);
+    pipeline
+        .run_checkpoints(cps)
+        .await
+        .expect("run_checkpoints");
+
+    {
+        let f = pipeline.stats().failures.lock().await;
+        assert!(
+            f.checkpoints.contains(&cp),
+            "cross-file failure for checkpoint {cp} should be tracked at checkpoint level"
+        );
+        // The well-formed ledger was accepted by the per-file probe, so it is
+        // NOT recorded as a per-file failure — this is exactly why the per-file
+        // count alone misses it.
+        assert!(
+            f.files
+                .get(&cp)
+                .is_none_or(|flags| !flags.has(crate::utils::FileFlags::LEDGER)),
+            "wrong-but-well-formed ledger must not be recorded as a per-file failure"
+        );
+    }
+
+    pipeline
+        .finish(high)
+        .await
+        .expect("dry-run finalize should return Ok");
+
+    assert_eq!(
+        std::fs::read(&ledger_abs).unwrap(),
+        corrupted_bytes,
+        "dry-run must not modify dst"
+    );
 }
