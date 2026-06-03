@@ -571,21 +571,25 @@ impl XdrVerificationManager {
 
     /// Snapshot of all verification errors accumulated so far. Each call
     /// returns a fresh `Vec`; the manager retains the underlying state.
+    #[cfg(test)]
     pub fn get_errors(&self) -> Vec<VerificationError> {
         self.errors.lock().unwrap().clone()
     }
 
-    /// Drain accumulated verification errors directly into the supplied
-    /// `FailureTracker` (which the caller already owns mutably — e.g. via
-    /// `stats.failures.get_mut()` inside `Operation::finalize`). All
-    /// variants funnel into the `checkpoints` slot — these are
-    /// cross-file/cross-cp inconsistencies, not per-file failures.
+    /// Drain accumulated verification errors into the supplied `FailureTracker`
+    /// (which the caller already owns mutably — e.g. via `stats.failures`
+    /// inside `Operation::finalize`). All variants funnel into the
+    /// `checkpoints` slot — these are cross-file/cross-cp inconsistencies, not
+    /// per-file failures.
     ///
-    /// Sync because the caller has exclusive `&mut` access and the
-    /// manager's std `Mutex` is held only briefly across the iteration.
-    /// No clone, no `.await`.
-    pub fn record_all_errors(&self, failures: &mut crate::utils::FailureTracker) {
-        let errors = self.errors.lock().unwrap();
+    /// Clears the manager's error list at the end, so a subsequent call is a
+    /// true no-op (idempotent by draining, not by relying on the tracker's set).
+    ///
+    /// Sync because the caller has exclusive `&mut` access and the manager's
+    /// std `Mutex` is held only across the cheap iteration. No clone, no
+    /// `.await`.
+    pub fn drain_all_errors(&self, failures: &mut crate::utils::FailureTracker) {
+        let mut errors = self.errors.lock().unwrap();
         for err in errors.iter() {
             failures.record_verification_failure(&err.kind);
         }
@@ -595,6 +599,7 @@ impl XdrVerificationManager {
                 errors.len()
             );
         }
+        errors.clear();
     }
 }
 

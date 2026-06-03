@@ -307,9 +307,12 @@ impl<Op: Operation> Pipeline<Op> {
     where
         I: IntoIterator<Item = u32>,
     {
-        let cps: Vec<u32> = cps.into_iter().collect();
-        let total = cps.len();
-        if total == 0 {
+        let cps = cps.into_iter();
+        // size_hint's upper bound is the exact count for every caller's
+        // iterator (StepBy<RangeInclusive<u32>> on the main path, Vec/set
+        // elsewhere), and we only use it for status reporting.
+        let total = cps.size_hint().1;
+        if total == Some(0) {
             return Ok(());
         }
 
@@ -320,8 +323,12 @@ impl<Op: Operation> Pipeline<Op> {
             .for_each_concurrent(self.config.concurrency, |ck| async move {
                 self.process_checkpoint(ck).await;
                 let done = completed_ref.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if done.is_multiple_of(PROGRESS_REPORTING_FREQUENCY) || done == total {
-                    info!("Progress: {}/{} checkpoints processed", done, total);
+                if done.is_multiple_of(PROGRESS_REPORTING_FREQUENCY) || total == Some(done) {
+                    if let Some(total) = total {
+                        info!("Progress: {done}/{total} checkpoints processed");
+                    } else {
+                        info!("Progress: {done} checkpoints processed");
+                    }
                 }
             })
             .await;
@@ -330,7 +337,7 @@ impl<Op: Operation> Pipeline<Op> {
         // manager errors into `stats.failures`.
         if let Some(manager) = &self.verification_manager {
             manager.verify_checkpoint_chain();
-            manager.record_all_errors(&mut *self.stats.failures.lock().await);
+            manager.drain_all_errors(&mut *self.stats.failures.lock().await);
         }
 
         Ok(())

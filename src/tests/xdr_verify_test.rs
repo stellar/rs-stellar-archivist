@@ -948,7 +948,7 @@ fn test_record_all_errors_empty_manager_is_noop() {
     let manager = XdrVerificationManager::new();
     let mut failures = crate::utils::FailureTracker::default();
 
-    manager.record_all_errors(&mut failures);
+    manager.drain_all_errors(&mut failures);
 
     assert!(failures.is_empty());
     assert!(failures.checkpoints.is_empty());
@@ -975,7 +975,7 @@ fn test_record_all_errors_drains_each_variant() {
     assert!(!manager.get_errors().is_empty());
 
     let mut failures = crate::utils::FailureTracker::default();
-    manager.record_all_errors(&mut failures);
+    manager.drain_all_errors(&mut failures);
 
     // Checkpoint(127) → cp 127.
     assert!(failures.checkpoints.contains(&127));
@@ -1015,7 +1015,7 @@ fn test_record_all_errors_boundary_inserts_both_cps() {
     manager.verify_checkpoint_chain();
 
     let mut failures = crate::utils::FailureTracker::default();
-    manager.record_all_errors(&mut failures);
+    manager.drain_all_errors(&mut failures);
 
     // Boundary(191) records both 191 and 191-64=127.
     assert!(failures.checkpoints.contains(&191));
@@ -1029,12 +1029,12 @@ fn test_record_all_errors_idempotent() {
     manager.verify_and_release(127);
 
     let mut failures = crate::utils::FailureTracker::default();
-    manager.record_all_errors(&mut failures);
+    manager.drain_all_errors(&mut failures);
     let cps_after_first = failures.checkpoints.clone();
 
-    // Calling again should produce the same set (BTreeSet semantics + manager
-    // retains its accumulated state).
-    manager.record_all_errors(&mut failures);
+    // Calling again is a true no-op: the first call drained the manager's
+    // errors, so the second finds nothing to record and the set is unchanged.
+    manager.drain_all_errors(&mut failures);
     let cps_after_second = failures.checkpoints.clone();
 
     assert_eq!(cps_after_first, cps_after_second);

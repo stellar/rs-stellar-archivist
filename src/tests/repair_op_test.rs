@@ -1189,7 +1189,7 @@ async fn test_file_retry_history_repair_fetches_history_and_referenced_buckets()
         .strip_prefix(dest_dir.path())
         .unwrap()
         .to_string_lossy()
-        .to_string();
+        .replace('\\', "/");
     let bucket_to_break = &bucket_abs[0];
     let bucket_relative = bucket_to_break
         .strip_prefix(dest_dir.path())
@@ -1244,7 +1244,7 @@ async fn test_file_retry_history_repair_with_intact_buckets() {
         .strip_prefix(dest_dir.path())
         .unwrap()
         .to_string_lossy()
-        .to_string();
+        .replace('\\', "/");
 
     // Break only the history file; leave buckets intact.
     std::fs::remove_file(&history_abs).expect("delete history");
@@ -1288,7 +1288,7 @@ async fn test_file_retry_history_repair_fails_when_referenced_bucket_unavailable
         .strip_prefix(dest_dir.path())
         .unwrap()
         .to_string_lossy()
-        .to_string();
+        .replace('\\', "/");
     let bucket_to_kill = &bucket_abs[0];
     let bucket_relative = bucket_to_kill
         .strip_prefix(dest_dir.path())
@@ -1351,7 +1351,7 @@ async fn test_file_retry_history_repair_corrupt_history_from_src() {
         .strip_prefix(dest_dir.path())
         .unwrap()
         .to_string_lossy()
-        .to_string();
+        .replace('\\', "/");
     let src_history = src_dir.path().join(&history_relative);
 
     // Corrupt src's history with junk text (won't parse as JSON).
@@ -1501,7 +1501,7 @@ async fn test_file_retry_keeps_history_when_cp_in_chain_retry() {
         .strip_prefix(dest_dir.path())
         .unwrap()
         .to_string_lossy()
-        .to_string();
+        .replace('\\', "/");
     let bucket_to_break = &bucket_abs[0];
 
     // Break the history file + one referenced bucket on dst.
@@ -1545,7 +1545,7 @@ async fn test_file_retry_skips_nonhistory_file_when_cp_in_chain_retry() {
         .strip_prefix(dest_dir.path())
         .unwrap()
         .to_string_lossy()
-        .to_string();
+        .replace('\\', "/");
 
     // Locate this checkpoint's ledger file.
     let ledger_files = get_files_by_pattern(dest_dir.path(), &format!("ledger-{cp:08x}"));
@@ -1558,7 +1558,7 @@ async fn test_file_retry_skips_nonhistory_file_when_cp_in_chain_retry() {
         .strip_prefix(dest_dir.path())
         .unwrap()
         .to_string_lossy()
-        .to_string();
+        .replace('\\', "/");
 
     // Break the history + ledger on dst (leave buckets intact).
     std::fs::remove_file(&history_abs).expect("delete history");
