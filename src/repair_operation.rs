@@ -148,10 +148,11 @@ impl RepairOperation {
         // `.well_known` restoration runs after the retry stages because the
         // history file it copies may itself be one the file retry just
         // restored.
-        let well_known_failed = match well_known_cp {
-            Some(cp) => !self.repair_well_known(cp).await,
-            None => false,
-        };
+        if let Some(cp) = well_known_cp {
+            if !self.repair_well_known(cp).await {
+                file_retry_stats.failures.lock().await.record_well_known(cp);
+            }
+        }
 
         // Two sections — plan-driven repair has no main pass.
         if let Some(path) = report_path {
@@ -173,10 +174,7 @@ impl RepairOperation {
             crate::report::write_to_path(path, &out)?;
         }
 
-        if file_retry_stats.has_failures().await
-            || checkpoint_retry_stats.has_failures().await
-            || well_known_failed
-        {
+        if file_retry_stats.has_failures().await || checkpoint_retry_stats.has_failures().await {
             return Err(Error::RepairFailed);
         }
         Ok(())
@@ -645,22 +643,15 @@ impl Operation for RepairOperation {
         stats: &ArchiveStats,
         report_path: Option<&std::path::Path>,
     ) -> Result<(), pipeline::Error> {
-        // Manager drain (verify_checkpoint_chain + record_all_errors) already
-        // happened in `Pipeline::run_checkpoints`, so `stats.failures.checkpoints`
-        // is already populated for `retry_failed_checkpoints` to consume.
+        if self.well_known_needs_repair.load(Ordering::Relaxed) {
+            stats
+                .failures
+                .lock()
+                .await
+                .record_well_known(highest_checkpoint);
+        }
 
         if self.dry_run {
-            // Reflect the well-known flag into stats so the plan includes it,
-            // then report: dry-run records the broken inventory into
-            // `stats.failures` (per-file/bucket via NeedsRepair, checkpoints via
-            // the manager), so logging + the JSON plan both read from it.
-            if self.well_known_needs_repair.load(Ordering::Relaxed) {
-                stats
-                    .failures
-                    .lock()
-                    .await
-                    .record_well_known(highest_checkpoint);
-            }
             stats.report("repair").await;
             if let Some(path) = report_path {
                 let report = crate::report::ArchiveReport {
@@ -671,9 +662,9 @@ impl Operation for RepairOperation {
                     .map_err(|e| pipeline::Error::RepairOperation(Error::Report(e)))?;
             }
             return Ok(());
+        } else {
+            stats.report("repair main").await;
         }
-
-        stats.report("repair main").await;
 
         // Per-file retry: re-fetch every entry in failures.files /
         // failures.buckets. Returns its own stats — no merging.
@@ -692,12 +683,16 @@ impl Operation for RepairOperation {
         // highest checkpoint's history file on dst, and that history file may
         // itself be what the file-retry stage just restored (when its main-pass
         // fetch failed).
-        //
-        // `repair_well_known` returns whether .well-known ended up in its
-        // intended state; a restoration failure (missing history file,
-        // directory creation, or copy) feeds the success gate below directly.
-        let well_known_failed = self.well_known_needs_repair.load(Ordering::Relaxed)
-            && !self.repair_well_known(highest_checkpoint).await;
+        if self.well_known_needs_repair.load(Ordering::Relaxed) {
+            let repair_success = self.repair_well_known(highest_checkpoint).await;
+            if !repair_success {
+                file_retry_stats
+                    .failures
+                    .lock()
+                    .await
+                    .record_well_known(highest_checkpoint);
+            }
+        }
 
         // Full-context report: one section per stage (main pass + both retries).
         // Built and written once — all three stats are in hand here.
@@ -726,7 +721,7 @@ impl Operation for RepairOperation {
         // .well-known restoration (if needed) succeeded.
         let file_retry_failed = file_retry_stats.has_failures().await;
         let checkpoint_retry_failed = checkpoint_retry_stats.has_failures().await;
-        if file_retry_failed || checkpoint_retry_failed || well_known_failed {
+        if file_retry_failed || checkpoint_retry_failed {
             return Err(Error::RepairFailed.into());
         }
 

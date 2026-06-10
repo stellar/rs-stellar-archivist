@@ -2064,3 +2064,69 @@ async fn test_repair_report_three_sections_clean_on_success() {
     assert!(fr.files.is_empty() && fr.buckets.is_empty());
     assert!(cr.checkpoints.is_empty());
 }
+
+/// A non-dry-run repair whose `.well-known` restoration FAILS must surface that
+/// residual in the report — not just via the exit code. The run exits
+/// `RepairFailed`, but a consumer reading `--report` would otherwise see every
+/// section clean (`well_known: null`, `failed: 0`) with no indication of what
+/// broke. The failed restoration is recorded into the `file_retry` section.
+#[tokio::test]
+async fn test_repair_report_surfaces_failed_well_known_restoration() {
+    use crate::report::MultiSectionReport;
+
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    // Replace .well-known with a directory: discovery flags it for repair, and
+    // the restoring copy in finalize fails because its destination is a dir.
+    let wk_path = dest_dir.path().join(".well-known/stellar-history.json");
+    std::fs::remove_file(&wk_path).expect("delete .well-known file");
+    std::fs::create_dir(&wk_path).expect("create .well-known directory");
+
+    let report_path = dest_dir.path().join("report.json");
+    let result = run_repair(RepairConfig::new(&src_url, &dest_url).report(&report_path)).await;
+    assert!(
+        result.is_err(),
+        "repair must fail when .well-known restoration copy fails"
+    );
+
+    let json = std::fs::read_to_string(&report_path).unwrap();
+    let report: MultiSectionReport =
+        serde_json::from_str(&json).expect("multi-section report parses");
+    assert!(
+        report.sections["file_retry"].well_known.is_some(),
+        "a failed .well-known restoration must be surfaced in the report, got: {json}"
+    );
+}
+
+/// A non-dry-run repair that discovers a broken `.well-known` and successfully
+/// restores it must reflect that discovery in the `main_pass` section (parity
+/// with the dry-run plan, which already carries `well_known`), while the retry
+/// sections stay clean because there is no residual.
+#[tokio::test]
+async fn test_repair_report_records_well_known_discovery_in_main_pass() {
+    use crate::report::MultiSectionReport;
+
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    // Break only the dst .well-known; everything else is intact, so restoration
+    // succeeds.
+    std::fs::remove_file(dest_dir.path().join(".well-known/stellar-history.json"))
+        .expect("delete .well-known");
+
+    let report_path = dest_dir.path().join("report.json");
+    run_repair(RepairConfig::new(&src_url, &dest_url).report(&report_path))
+        .await
+        .expect("repair should succeed once .well-known is restored");
+
+    let json = std::fs::read_to_string(&report_path).unwrap();
+    let report: MultiSectionReport =
+        serde_json::from_str(&json).expect("multi-section report parses");
+
+    assert!(
+        report.sections["main_pass"].well_known.is_some(),
+        "main_pass should record the discovered .well-known break, got: {json}"
+    );
+    // Restoration succeeded → no residual in the retry sections.
+    assert!(report.sections["file_retry"].well_known.is_none());
+    assert!(report.sections["checkpoint_retry"].well_known.is_none());
+}
