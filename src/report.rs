@@ -1,9 +1,14 @@
 //! JSON plan/report schema for repair and status output.
 //!
-//! `ArchiveReport` is a versioned, deterministic serialization of an operation's
-//! `FailureTracker` plus an outcome `Summary`. It serves three roles: repair
-//! dry-run output (a "plan"), repair input (`--plan`), and status output for any
-//! operation (`--report`). It round-trips: `into_failures` is the inverse of the
+//! `ArchiveReport` is a versioned, deterministic serialization of an
+//! operation's `FailureTracker` plus an outcome `Summary`. It is the single
+//! shared schema for scan/mirror/repair-dry-run output and repair `--plan`
+//! input, so any `--report` can be replayed as a plan. On apply, every listed
+//! item is re-fetched from src; the CLI `--verify` works exactly as in regular
+//! repair (it governs validation of the src content and the dst probing of
+//! discovered bucket files). It serves three roles: repair dry-run output (a
+//! "plan"), repair input (`--plan`), and status output for any operation
+//! (`--report`). It round-trips: `into_failures` is the inverse of the
 //! `from_failures_and_summary` projection (modulo `summary`/`version`).
 //!
 //! Multi-stage runs (non-dry-run repair) use `MultiSectionReport` — one labeled
