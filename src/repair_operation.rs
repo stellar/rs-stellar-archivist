@@ -9,7 +9,9 @@
 //! XDR (or verify bucket hash), and on success record the parsed data into the
 //! verification manager and stop. On parse failure or missing dst file, fetch
 //! from src via `verify_and_write_xdr` (or `verify_and_write_bucket`) and record
-//! the result.
+//! the result. In **failed-list mode** (`known_broken` is `Some` — the retry
+//! stage and plan mode) a listed file skips the dst probe entirely and is
+//! fetched from src directly; only unlisted (discovered) files get the probe.
 //!
 //! **Retry phase** (in `finalize`): after the main pass completes, the manager
 //! has data for every file in the range. Run `verify_checkpoint_chain` (cross-
@@ -31,7 +33,7 @@ use crate::pipeline::{
     self, async_trait, HistoryFetch, Operation, Pipeline, PipelineConfig, ProcessOutcome,
 };
 use crate::storage::{self, Error as StorageError, ErrorClass, StorageRef};
-use crate::utils::{self, ArchiveStats};
+use crate::utils::{self, ArchiveStats, FailureTracker};
 use crate::xdr_verify::{self, XdrParseResult, XdrVerificationManager};
 use futures_util::{stream, StreamExt};
 use opendal::{Buffer, Reader};
@@ -85,6 +87,12 @@ pub struct RepairOperation {
     pipeline_config: PipelineConfig,
     /// Set during get_checkpoint_bounds if dest .well-known needs repair
     well_known_needs_repair: AtomicBool,
+    /// Failures already known broken — `Some` only in the failed-list pipelines
+    /// (the stage-2 file retry, which plan mode also drives), seeded from the
+    /// main pass's stats or the plan. A file in this set is fetched from src
+    /// directly, skipping the dst probe entirely. `None` (regular repair: main
+    /// pass, dry-run) probes dst-first for every file.
+    known_broken: Option<FailureTracker>,
 }
 
 impl RepairOperation {
@@ -108,24 +116,38 @@ impl RepairOperation {
             dry_run,
             pipeline_config,
             well_known_needs_repair: AtomicBool::new(false),
+            known_broken: None,
         }
+    }
+
+    /// Switch this operation into failed-list mode: every file in
+    /// `known_broken` is fetched from src directly (no dst probe); files not
+    /// in the set keep the regular dst-first probe.
+    #[must_use]
+    pub(crate) fn with_known_broken(mut self, known_broken: FailureTracker) -> Self {
+        debug_assert!(self.known_broken.is_none());
+        self.known_broken = Some(known_broken);
+        self
     }
 
     /// Manual repair driven by a plan: apply an `ArchiveReport` (typically
     /// produced by an earlier `--dry-run`) by seeding the failure set and
     /// running the same two-stage retry the main flow uses — phase 1 over
-    /// files/buckets, phase 2 over checkpoints. The plan is a directive: every
-    /// listed item is re-fetched from source unconditionally (the retry stages
-    /// overwrite).
+    /// files/buckets, phase 2 over checkpoints. The plan is trusted: every
+    /// listed item is re-fetched from source unconditionally (the destination
+    /// is not re-audited). Only buckets *discovered* by re-walking a listed
+    /// HISTORY are validated on dst and fetched just when missing or invalid.
+    /// `--verify` works exactly as in regular repair: it governs validation
+    /// of the downloaded source content and the probing of discovered files.
     ///
     /// `.well-known` is restored from the checkpoint carried in the plan, so no
     /// archive-bound recomputation is needed.
     pub async fn run_manual(
         &self,
-        report: crate::report::ArchiveReport,
+        plan: crate::report::ArchiveReport,
         report_path: Option<&std::path::Path>,
     ) -> Result<(), Error> {
-        let tracker = report
+        let tracker = plan
             .into_failures()
             .map_err(|e| Error::InvalidPlan(e.to_string()))?;
         if tracker.is_empty() {
@@ -185,7 +207,9 @@ impl RepairOperation {
     ///
     /// Returns:
     /// - `Ok(true)` — dst is acceptable; caller skips src fetch.
-    /// - `Ok(false)` — dst is missing or corrupt; caller should fetch from src.
+    /// - `Ok(false)` — dst is missing or corrupt, OR the file is in
+    ///   `known_broken` (failed-list mode: no dst probe at all); caller
+    ///   should fetch from src.
     ///   NotFound on `open_reader`/`exists()` is treated as "missing" so the
     ///   repair can fetch from src immediately. Same for parse failures on a
     ///   present-but-corrupt file.
@@ -206,6 +230,17 @@ impl RepairOperation {
         path: &str,
         manager: Option<&XdrVerificationManager>,
     ) -> Result<bool, StorageError> {
+        // Failed-list mode: a file already recorded broken is fetched from src
+        // directly to avoid the expensive verification (bucket decompress+hash,
+        // transactions parse). Files NOT in the list — e.g. buckets discovered
+        // by re-walking a listed HISTORY — are probed normally so a still-valid
+        // copy isn't re-downloaded.
+        if let Some(known_broken) = &self.known_broken {
+            if known_broken.contains_path(path) {
+                return Ok(false);
+            }
+        }
+
         let Some(manager) = manager else {
             return match self.dst_store.exists(path).await {
                 Ok(present) => Ok(present),
@@ -303,29 +338,25 @@ impl RepairOperation {
         }
     }
 
-    /// Build a fresh `Pipeline<MirrorOperation>` configured for retry use:
-    /// overwrite=true, allow_mirror_gaps=true (the retry set is intentionally
-    /// disjoint), update_well_known=false (a partial-set retry can't claim
-    /// contiguous coverage), wired to repair's `src_store` and `dst_store`,
-    /// with the outer `pipeline_config` cloned. The caller chooses whether
-    /// the inner pipeline's `process_checkpoint` should skip
-    /// history-and-bucket work: `retry_failed_checkpoints` sets it true
-    /// (chain repair needs only per-cp xdr files); `retry_failed_files`
-    /// leaves it false (it drives `process_file` /
-    /// `process_history_and_buckets` directly, but the flag is wired
-    /// through explicitly for clarity).
-    fn build_retry_pipeline(&self, skip_history_and_buckets: bool) -> Pipeline<MirrorOperation> {
+    /// Build a fresh `Pipeline<MirrorOperation>` for the per-checkpoint retry
+    /// stage: overwrite=true (re-mirror whole cps whose files are individually
+    /// valid but cross-file/chain inconsistent — a dst-first probe would wrongly
+    /// skip them), allow_mirror_gaps=true (the retry set is disjoint),
+    /// update_well_known=false (a partial-set retry can't claim contiguous
+    /// coverage). `skip_history_and_buckets=true` because chain repair needs only
+    /// the per-cp xdr files; bucket / HAS work is handled by the file-retry stage.
+    fn build_checkpoint_retry_pipeline(&self) -> Pipeline<MirrorOperation> {
+        let mut retry_config = self.pipeline_config.clone();
+        retry_config.skip_history_and_buckets = true;
         let mirror_op = MirrorOperation::new(
             self.dst_store.clone(),
             /*overwrite=*/ true,
             None,
             None,
             /*allow_mirror_gaps=*/ true,
-            &self.pipeline_config.storage_config,
+            retry_config.clone(),
             /*update_well_known=*/ false,
         );
-        let mut retry_config = self.pipeline_config.clone();
-        retry_config.skip_history_and_buckets = skip_history_and_buckets;
         Pipeline::new(
             mirror_op,
             retry_config,
@@ -335,9 +366,34 @@ impl RepairOperation {
         )
     }
 
+    /// Build a fresh `Pipeline<RepairOperation>` for the per-file retry stage.
+    /// Reuses repair's per-file logic (`process_object`) in failed-list mode:
+    /// seeded with `known_broken`, so every listed file (any type) skips the
+    /// dst probe and is re-fetched directly, while transitively-discovered
+    /// buckets are validated first. `dry_run` is always false here (the retry
+    /// stages early-return under dry_run).
+    fn build_file_retry_pipeline(&self, known_broken: FailureTracker) -> Pipeline<RepairOperation> {
+        let repair_op = RepairOperation::new(
+            self.src_store.clone(),
+            self.dst_store.clone(),
+            self.low,
+            self.high,
+            /*dry_run=*/ false,
+            self.pipeline_config.clone(),
+        )
+        .with_known_broken(known_broken);
+        Pipeline::new(
+            repair_op,
+            self.pipeline_config.clone(),
+            self.src_store.clone(),
+            Some(self.dst_store.clone()),
+            /*report_path=*/ None,
+        )
+    }
+
     /// Per-file retry — re-fetch individual files that the main pass failed
-    /// to repair, on a **fresh `Pipeline<MirrorOperation>`** built by
-    /// [`Self::build_retry_pipeline`].
+    /// to repair, on a **fresh `Pipeline<RepairOperation>`** built by
+    /// [`Self::build_file_retry_pipeline`].
     ///
     /// For each broken file recorded in `parent_stats.failures` (per-cp file
     /// flags + bucket hashes), dispatch through the inner pipeline:
@@ -352,24 +408,35 @@ impl RepairOperation {
     /// verification), only the per-item primitives. Stats are extracted via
     /// `into_stats` (bypassing mirror's `finalize` and its `has_failures`
     /// gate). Returns the inner's stats directly — no merging into the parent.
+    ///
+    /// Per-file validation still runs when `--verify` is on (the manager is
+    /// carried via `pipeline_config.verify`), so each re-fetched file is checked
+    /// before commit. Cross-file / chain checks don't run here and don't need
+    /// to: single-file retry has no siblings loaded to cross-check, and any cp
+    /// with a real cross-file/chain inconsistency is in `failures.checkpoints`,
+    /// handled by [`Self::retry_failed_checkpoints`].
     pub(crate) async fn retry_failed_files(&self, parent_stats: &ArchiveStats) -> ArchiveStats {
         if self.dry_run {
             return ArchiveStats::new();
         }
 
-        let work = build_failed_files_work_list(parent_stats).await;
+        // One snapshot of the main pass's failures drives both the work list
+        // (what to retry) and `known_broken` (which files to fetch directly vs.
+        // probe). `parent_stats` is not mutated during file-retry, so the
+        // snapshot stays consistent. The snapshot is stays read-only (built
+        // once).
+        let known_broken = parent_stats.failures.lock().await.clone();
+        let work = build_failed_files_work_list(&known_broken);
         if work.is_empty() {
             return ArchiveStats::new();
         }
 
         info!("Retrying {} failed file(s)", work.len());
 
-        // `retry_failed_files` drives `process_file` /
-        // `process_history_and_buckets` directly — these bypass
-        // `process_checkpoint`, so `skip_history_and_buckets` has no
-        // effect here. Passed `false` for clarity.
-        let file_retry_pipeline =
-            self.build_retry_pipeline(/*skip_history_and_buckets=*/ false);
+        // File-retry runs in failed-list mode: every listed file is fetched
+        // from src directly (no dst probe); transitively discovered buckets are
+        // validated on dst and re-fetched only if missing/invalid.
+        let file_retry_pipeline = self.build_file_retry_pipeline(known_broken);
         stream::iter(work.into_iter())
             .for_each_concurrent(self.pipeline_config.concurrency, |(cp, path)| {
                 let pipeline = &file_retry_pipeline;
@@ -387,7 +454,7 @@ impl RepairOperation {
 
     /// Per-checkpoint retry — re-mirror whole checkpoints flagged by cross-
     /// file or cross-cp chain checks, on a **fresh `Pipeline<MirrorOperation>`**
-    /// built by [`Self::build_retry_pipeline`].
+    /// built by [`Self::build_checkpoint_retry_pipeline`].
     ///
     /// For each cp in `parent_stats.failures.checkpoints`, drive the inner
     /// pipeline's `run_checkpoints` to re-fetch every file in that cp from src
@@ -422,9 +489,8 @@ impl RepairOperation {
         // covered by `retry_failed_files` (either via `failures.buckets`
         // direct fetches or via its HISTORY entries, which trigger
         // `process_history_and_buckets`). So skip HAS + bucket work in
-        // the inner `process_checkpoint`.
-        let checkpoint_retry_pipeline =
-            self.build_retry_pipeline(/*skip_history_and_buckets=*/ true);
+        // the inner `process_checkpoint` (the builder sets that).
+        let checkpoint_retry_pipeline = self.build_checkpoint_retry_pipeline();
         let _ = checkpoint_retry_pipeline.run_checkpoints(retry_cps).await;
         checkpoint_retry_pipeline.into_stats()
     }
@@ -485,12 +551,10 @@ impl RepairOperation {
 // Repair helpers (free functions)
 // ============================================================================
 
-/// Build a `(cp, path)` work list from the current state of the failure
-/// tracker. Read-only on `parent_stats` — no `mem::take`, no mutation. The
-/// work list captures every uniquely-identifiable failed file at the moment
-/// of the snapshot; concurrent writers (there shouldn't be any at this point,
-/// but the lock is taken regardless) are blocked only for the duration of
-/// the read.
+/// Build a `(cp, path)` work list from a snapshot of the failure tracker.
+/// Read-only — captures every uniquely-identifiable failed file in `failures`.
+/// The caller snapshots `parent_stats.failures` once and reuses it for both
+/// this work list and the inner pipeline's `known_broken`.
 ///
 /// Non-HISTORY per-cp file entries whose cp is also in `failures.checkpoints`
 /// are skipped — `retry_failed_checkpoints` will re-mirror the whole cp
@@ -502,12 +566,11 @@ impl RepairOperation {
 /// bucket refs were walked). Bucket entries are also kept unconditionally —
 /// they're content-addressed, not cp-keyed, and `retry_failed_files` is the
 /// only place that repairs `failures.buckets`.
-async fn build_failed_files_work_list(parent_stats: &ArchiveStats) -> Vec<(u32, String)> {
-    let f = parent_stats.failures.lock().await;
+fn build_failed_files_work_list(failures: &FailureTracker) -> Vec<(u32, String)> {
     let mut work = Vec::new();
 
-    for (&cp, flags) in &f.files {
-        let cp_in_chain_retry = f.checkpoints.contains(&cp);
+    for (&cp, flags) in &failures.files {
+        let cp_in_chain_retry = failures.checkpoints.contains(&cp);
         for (bit, prefix) in [
             (utils::FileFlags::HISTORY, "history"),
             (utils::FileFlags::LEDGER, "ledger"),
@@ -529,7 +592,7 @@ async fn build_failed_files_work_list(parent_stats: &ArchiveStats) -> Vec<(u32, 
         }
     }
 
-    for hash in &f.buckets {
+    for hash in &failures.buckets {
         if let Ok(path) = history_format::bucket_path(&hex::encode(hash.0)) {
             // cp context is 0 — buckets are content-addressed and
             // `record_failure`'s bucket-path dispatch ignores cp.
@@ -662,9 +725,9 @@ impl Operation for RepairOperation {
                     .map_err(|e| pipeline::Error::RepairOperation(Error::Report(e)))?;
             }
             return Ok(());
-        } else {
-            stats.report("repair main").await;
         }
+
+        stats.report("repair main").await;
 
         // Per-file retry: re-fetch every entry in failures.files /
         // failures.buckets. Returns its own stats — no merging.

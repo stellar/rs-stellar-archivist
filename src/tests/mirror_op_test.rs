@@ -1064,29 +1064,25 @@ async fn test_mirror_with_update_well_known_false_does_not_touch_well_known() {
     let src_store = from_url_with_config(&src_url, &storage_config).unwrap();
     let dst_store = from_url_with_config(&dst_url, &storage_config).unwrap();
 
+    let pipeline_config = PipelineConfig {
+        concurrency: 4,
+        skip_optional: true,
+        skip_history_and_buckets: false,
+        verify: false,
+        storage_config: storage_config.clone(),
+    };
+
     let mirror_op = MirrorOperation::new(
         dst_store.clone(),
         /*overwrite=*/ true,
         Some(64),
         Some(127),
         /*allow_mirror_gaps=*/ true,
-        &storage_config,
+        pipeline_config.clone(),
         /*update_well_known=*/ false,
     );
 
-    let pipeline = Pipeline::new(
-        mirror_op,
-        PipelineConfig {
-            concurrency: 4,
-            skip_optional: true,
-            skip_history_and_buckets: false,
-            verify: false,
-            storage_config: storage_config.clone(),
-        },
-        src_store,
-        Some(dst_store),
-        None,
-    );
+    let pipeline = Pipeline::new(mirror_op, pipeline_config, src_store, Some(dst_store), None);
 
     pipeline.run().await.expect("Mirror should succeed");
 

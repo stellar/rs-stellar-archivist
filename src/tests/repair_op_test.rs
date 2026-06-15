@@ -1228,13 +1228,12 @@ async fn test_file_retry_history_repair_fetches_history_and_referenced_buckets()
     );
 }
 
-/// History was failed (manually marked) but its referenced buckets are
-/// already present and valid in dst. The file-retry path re-fetches the history; the
-/// inner mirror also re-fetches the transitively-discovered buckets
-/// (mirror has no dst-first probe), which is wasted but correct work —
-/// `verify_and_write_bucket` hashes-verifies the new content before
-/// commit, so the buckets remain valid. End state: history restored, all
-/// buckets present and valid, `retry_failed_files` stats clean.
+/// History was failed (manually marked) but its referenced buckets are already
+/// present and valid in dst. The HISTORY-retry path re-fetches the history file,
+/// then probes each discovered bucket dst-first and finds them valid — so they
+/// are NOT re-fetched (see
+/// `test_file_retry_history_does_not_refetch_buckets_valid_on_dst`). End state:
+/// history restored, all buckets present and valid, stats clean.
 #[tokio::test]
 async fn test_file_retry_history_repair_with_intact_buckets() {
     let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
@@ -2129,4 +2128,389 @@ async fn test_repair_report_records_well_known_discovery_in_main_pass() {
     // Restoration succeeded → no residual in the retry sections.
     assert!(report.sections["file_retry"].well_known.is_none());
     assert!(report.sections["checkpoint_retry"].well_known.is_none());
+}
+
+/// HISTORY-retry must not re-download buckets already valid on dst. A bucket
+/// referenced by the retried history file is deleted from SRC only (it stays
+/// valid on dst). The old overwrite path would re-fetch it, hit a 404 on src,
+/// and spuriously record a bucket failure; the dst-first probe finds it valid
+/// on dst and skips it — no fetch, no failure.
+#[tokio::test]
+async fn test_file_retry_history_does_not_refetch_buckets_valid_on_dst() {
+    // Separate src dir so we can delete a bucket from src only.
+    let src_dir = TempDir::new().unwrap();
+    copy_testnet_small_archive(src_dir.path()).unwrap();
+    let src_url = file_url_from_path(src_dir.path());
+
+    let dest_dir = TempDir::new().unwrap();
+    let dest_url = file_url_from_path(dest_dir.path());
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("mirror should succeed");
+
+    let (history_abs, cp, hashes, _bucket_abs) = pick_history_with_buckets(dest_dir.path());
+    let history_relative = history_abs
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let hash = hashes.iter().next().unwrap();
+
+    // Delete that bucket from SRC only; dst keeps a valid copy.
+    let src_bucket = get_files_by_pattern(src_dir.path(), &format!("bucket-{hash}"));
+    assert!(!src_bucket.is_empty());
+    std::fs::remove_file(&src_bucket[0]).expect("delete src bucket");
+    // Delete dst history so it's a file-retry work item.
+    std::fs::remove_file(&history_abs).expect("delete dst history");
+
+    let op = build_repair_op(&src_url, &dest_url, /*verify=*/ true);
+    let parent_stats = crate::utils::ArchiveStats::new();
+    parent_stats.record_failure(cp, &history_relative).await;
+    let stats = op.retry_failed_files(&parent_stats).await;
+
+    assert!(history_abs.exists(), "history should be restored");
+    let dst_bucket = get_files_by_pattern(dest_dir.path(), &format!("bucket-{hash}"));
+    assert!(
+        !dst_bucket.is_empty(),
+        "valid dst bucket must remain present"
+    );
+    let f = stats.failures.lock().await;
+    assert!(
+        f.buckets.is_empty(),
+        "a bucket valid on dst must not be re-fetched or recorded as a failure, got: {:?}",
+        f.buckets
+    );
+}
+
+/// A bucket listed in `failures.buckets` (known broken) skips the dst probe and
+/// is fetched directly. We prove the probe was skipped by deleting the bucket
+/// from src while leaving a valid copy on dst: a direct fetch 404s and records a
+/// failure, whereas the dst-first probe (Task 1) would have skipped it. This is
+/// the deliberate inverse of `..._does_not_refetch_buckets_valid_on_dst`.
+#[tokio::test]
+async fn test_file_retry_known_broken_bucket_fetched_directly() {
+    let src_dir = TempDir::new().unwrap();
+    copy_testnet_small_archive(src_dir.path()).unwrap();
+    let src_url = file_url_from_path(src_dir.path());
+
+    let dest_dir = TempDir::new().unwrap();
+    let dest_url = file_url_from_path(dest_dir.path());
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("mirror should succeed");
+
+    let (_history_abs, _cp, hashes, bucket_abs) = pick_history_with_buckets(dest_dir.path());
+    let hash = hashes.iter().next().unwrap().clone();
+    let bucket_rel = bucket_abs[0]
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    // Delete the bucket from src only; dst keeps a valid copy.
+    let src_bucket = get_files_by_pattern(src_dir.path(), &format!("bucket-{hash}"));
+    std::fs::remove_file(&src_bucket[0]).expect("delete src bucket");
+
+    // Mark the bucket itself as broken (no history work item this time).
+    let op = build_repair_op(&src_url, &dest_url, /*verify=*/ true);
+    let parent_stats = crate::utils::ArchiveStats::new();
+    parent_stats.record_failure(0, &bucket_rel).await;
+    let stats = op.retry_failed_files(&parent_stats).await;
+
+    // The probe was skipped: a direct fetch was attempted, hit src's 404, and
+    // recorded a failure (rather than skipping the valid dst copy).
+    let f = stats.failures.lock().await;
+    assert!(
+        !f.buckets.is_empty(),
+        "a known-broken bucket should be fetched directly (probe skipped), failing on src 404"
+    );
+}
+
+/// HISTORY-retry under `--verify` repairs a referenced bucket that is
+/// present-but-invalid on dst and NOT pre-listed (discovered via the re-walk):
+/// the dst-first probe validates content, fails, and re-fetches from src.
+#[tokio::test]
+async fn test_file_retry_history_repairs_invalid_discovered_bucket_with_verify() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    let (history_abs, cp, _hashes, bucket_abs) = pick_history_with_buckets(dest_dir.path());
+    let history_relative = history_abs
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let bucket_to_corrupt = &bucket_abs[0];
+
+    // Corrupt the bucket on dst (invalid gzip) but keep it present; delete the
+    // dst history so it becomes a file-retry work item. The bucket is NOT in the
+    // failure set — it's discovered by re-walking the repaired history.
+    std::fs::write(bucket_to_corrupt, b"not a valid gzip bucket").expect("corrupt bucket");
+    std::fs::remove_file(&history_abs).expect("delete dst history");
+
+    let op = build_repair_op(&src_url, &dest_url, /*verify=*/ true);
+    let parent_stats = crate::utils::ArchiveStats::new();
+    parent_stats.record_failure(cp, &history_relative).await;
+    let stats = op.retry_failed_files(&parent_stats).await;
+
+    assert!(history_abs.exists(), "history should be restored");
+    run_scan(ScanConfig::new(&dest_url).verify())
+        .await
+        .expect("scan --verify should pass after the invalid bucket is repaired");
+    let f = stats.failures.lock().await;
+    assert!(
+        f.buckets.is_empty(),
+        "invalid discovered bucket should be repaired, not failed"
+    );
+}
+
+/// Plan mode trusts the plan: a listed item is fetched from src directly —
+/// never skipped because dst happens to have a (valid) copy, and never
+/// expensively re-verified on dst. Proven by deleting the listed file from
+/// src: the direct fetch 404s and the repair fails. The failed fetch must
+/// also leave the existing dst copy untouched.
+#[tokio::test]
+async fn test_repair_plan_listed_item_is_refetched_not_skipped() {
+    let src_dir = TempDir::new().unwrap();
+    copy_testnet_small_archive(src_dir.path()).unwrap();
+    let src_url = file_url_from_path(src_dir.path());
+
+    let dest_dir = TempDir::new().unwrap();
+    let dest_url = file_url_from_path(dest_dir.path());
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("mirror should succeed");
+
+    // A ledger that is valid on dst; delete it from src only.
+    let (ledger_abs, cp) = get_files_by_pattern(dest_dir.path(), "/ledger-")
+        .iter()
+        .find_map(|p| {
+            let rel = p
+                .strip_prefix(dest_dir.path())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            history_format::checkpoint_from_path(&rel).map(|c| (p.clone(), c))
+        })
+        .expect("a ledger file");
+    let ledger_rel = ledger_abs
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    std::fs::remove_file(src_dir.path().join(&ledger_rel)).expect("delete src ledger");
+
+    // A plan listing that (still-valid-on-dst) ledger.
+    let mut tracker = crate::utils::FailureTracker::default();
+    tracker.record_file(cp, crate::utils::FileFlags::LEDGER);
+    let plan = crate::report::ArchiveReport::from_failures_and_summary(
+        &tracker,
+        crate::report::Summary::default(),
+    );
+
+    // Failed-list mode: the listed ledger is fetched from src directly (no
+    // dst probe). src no longer has it, so the repair fails — a listed item
+    // is never silently skipped just because dst has a copy.
+    run_repair(RepairConfig::new(&src_url, &dest_url).verify().plan(plan))
+        .await
+        .expect_err("listed item is re-fetched; missing on src fails the repair");
+    assert!(
+        ledger_abs.exists(),
+        "failed re-fetch must not delete the existing dst copy"
+    );
+}
+
+/// A scan report feeds directly into repair: scan --verify lists a deleted
+/// file AND a corrupt-but-present bucket; applying that report with
+/// `repair --plan` and NO CLI --verify still repairs both, because every
+/// listed item is re-fetched unconditionally (the plan is fully respected —
+/// no mode needs to be carried in it).
+#[tokio::test]
+async fn test_scan_report_feeds_into_repair() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    // Damage dst: delete a ledger and corrupt a bucket (present-but-invalid).
+    delete_first_file(dest_dir.path(), "/ledger-");
+    corrupt_bucket_invalid_gzip(dest_dir.path());
+
+    // Scan --verify writes a report of what's broken.
+    let scan_json = dest_dir.path().join("findings.json");
+    run_scan(ScanConfig::new(&dest_url).verify().report(&scan_json))
+        .await
+        .expect_err("scan --verify should fail on the damaged archive");
+
+    let report = crate::report::read_from_path(&scan_json).unwrap();
+    assert!(
+        !report.section.files.is_empty() || !report.section.buckets.is_empty(),
+        "scan report should list the failures"
+    );
+
+    // Apply the scan report as a repair plan, WITHOUT a CLI --verify. Listed
+    // items are re-fetched unconditionally, so the corrupt-but-present bucket
+    // is repaired too.
+    run_repair(RepairConfig::new(&src_url, &dest_url).plan(report))
+        .await
+        .expect("repair --plan should fix every listed item");
+
+    run_scan(ScanConfig::new(&dest_url).verify())
+        .await
+        .expect("scan --verify should pass after plan-driven repair");
+}
+
+/// A mirror report feeds into repair: mirroring from an incomplete source
+/// records the un-copyable file (mirror writes its report before the failure
+/// gate); applying that report with `repair --plan` against a complete source
+/// restores the file. Confirms mirror output is a valid plan.
+#[tokio::test]
+async fn test_mirror_report_feeds_into_repair() {
+    // Incomplete source: a full archive minus one ledger file.
+    let src_incomplete = TempDir::new().unwrap();
+    copy_testnet_small_archive(src_incomplete.path()).unwrap();
+    let deleted = delete_first_file(src_incomplete.path(), "/ledger-");
+    let src_incomplete_url = file_url_from_path(src_incomplete.path());
+
+    // Complete source for the repair step.
+    let complete_src_url = file_url_from_path(&testnet_small_archive_path());
+
+    let dest_dir = TempDir::new().unwrap();
+    let dest_url = file_url_from_path(dest_dir.path());
+
+    // Mirror from the incomplete source → records the missing ledger; writes the
+    // report even though the run fails.
+    let mirror_json = dest_dir.path().join("mirror.json");
+    run_mirror(MirrorConfig::new(&src_incomplete_url, &dest_url).report(&mirror_json))
+        .await
+        .expect_err("mirror from an incomplete source should fail");
+
+    let report = crate::report::read_from_path(&mirror_json).unwrap();
+    let cp = history_format::checkpoint_from_path(&deleted).unwrap();
+    assert!(
+        report.section.files.contains_key(&cp.to_string()),
+        "mirror report should list the un-copyable ledger's checkpoint: {:?}",
+        report.section.files
+    );
+
+    // Apply the mirror report against the COMPLETE source → restores the ledger.
+    run_repair(RepairConfig::new(&complete_src_url, &dest_url).plan(report))
+        .await
+        .expect("repair --plan should restore the file from the complete source");
+
+    assert!(
+        dest_dir.path().join(&deleted).exists(),
+        "the ledger missing from mirror's source should be restored by repair"
+    );
+}
+
+/// CLI `--verify` works in plan mode exactly as in regular repair: the
+/// re-fetched content is validated before being written. Proven by corrupting
+/// the source copy of a listed-missing file: the verified re-fetch rejects
+/// the corrupt source and repair fails (without --verify it would have been
+/// blind-copied).
+#[tokio::test]
+async fn test_plan_apply_with_cli_verify_validates_source() {
+    // Separate src so we can corrupt it without touching the shared fixture.
+    let src_dir = TempDir::new().unwrap();
+    copy_testnet_small_archive(src_dir.path()).unwrap();
+    let src_url = file_url_from_path(src_dir.path());
+
+    let dest_dir = TempDir::new().unwrap();
+    let dest_url = file_url_from_path(dest_dir.path());
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("mirror should succeed");
+
+    // Delete a ledger on dst (missing → a no-verify scan would list it), then
+    // corrupt that same ledger's content in src so a verified re-fetch rejects it.
+    let deleted = delete_first_file(dest_dir.path(), "/ledger-");
+    let cp = history_format::checkpoint_from_path(&deleted).unwrap();
+    std::fs::write(src_dir.path().join(&deleted), b"not a valid gzip ledger")
+        .expect("corrupt src ledger");
+
+    // A plan listing that ledger.
+    let mut tracker = crate::utils::FailureTracker::default();
+    tracker.record_file(cp, crate::utils::FileFlags::LEDGER);
+    let plan = crate::report::ArchiveReport::from_failures_and_summary(
+        &tracker,
+        crate::report::Summary::default(),
+    );
+
+    // Apply WITH --verify: the corrupt src ledger is rejected on re-fetch and
+    // repair fails.
+    let result = run_repair(RepairConfig::new(&src_url, &dest_url).verify().plan(plan)).await;
+    assert!(
+        result.is_err(),
+        "--verify must validate re-fetched content; corrupt src should be rejected"
+    );
+}
+
+/// `FailureTracker::contains_path` matches per-cp files by (checkpoint, type)
+/// and buckets by content hash — the membership test behind repair's
+/// failed-list mode (listed files are fetched directly, skipping the dst probe).
+#[test]
+fn test_failure_tracker_contains_path() {
+    use crate::utils::{hex_to_hash, FailureTracker, FileFlags};
+
+    let mut t = FailureTracker::default();
+    t.record_file(127, FileFlags::LEDGER);
+
+    let ledger_127 = history_format::checkpoint_path("ledger", 127);
+    let tx_127 = history_format::checkpoint_path("transactions", 127);
+    let ledger_191 = history_format::checkpoint_path("ledger", 191);
+    assert!(t.contains_path(&ledger_127), "recorded (cp, flag) matches");
+    assert!(!t.contains_path(&tx_127), "same cp, different file type");
+    assert!(!t.contains_path(&ledger_191), "different cp");
+    assert!(!t.contains_path("not/an/archive/path"));
+
+    // Buckets are matched by content hash, independent of cp.
+    let hash_hex = "ab".repeat(32);
+    let bucket_path = history_format::bucket_path(&hash_hex).unwrap();
+    assert!(!t.contains_path(&bucket_path), "bucket not recorded yet");
+    t.record_bucket(hex_to_hash(&hash_hex).unwrap());
+    assert!(
+        t.contains_path(&bucket_path),
+        "recorded bucket hash matches"
+    );
+}
+
+/// Direct-fetch semantics: a listed file that is present-but-corrupt on dst is
+/// overwritten from src even when the plan and the CLI are both non-verify —
+/// listed items are re-fetched unconditionally, never existence-skipped.
+#[tokio::test]
+async fn test_plan_refetches_corrupt_present_file_without_verify() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    // Corrupt a transactions file on dst (present but invalid).
+    let (tx_abs, cp) = get_files_by_pattern(dest_dir.path(), "/transactions-")
+        .iter()
+        .find_map(|p| {
+            let rel = p
+                .strip_prefix(dest_dir.path())
+                .unwrap()
+                .to_string_lossy()
+                .replace('\\', "/");
+            history_format::checkpoint_from_path(&rel).map(|c| (p.clone(), c))
+        })
+        .expect("a transactions file");
+    std::fs::write(&tx_abs, b"garbage").expect("corrupt dst transactions");
+
+    // A plan listing it.
+    let mut tracker = crate::utils::FailureTracker::default();
+    tracker.record_file(cp, crate::utils::FileFlags::TRANSACTIONS);
+    let plan = crate::report::ArchiveReport::from_failures_and_summary(
+        &tracker,
+        crate::report::Summary::default(),
+    );
+
+    // No --verify anywhere — the listed file must still be re-fetched.
+    run_repair(RepairConfig::new(&src_url, &dest_url).plan(plan))
+        .await
+        .expect("listed corrupt-present file is re-fetched");
+
+    // The dst copy now matches src again.
+    let rel = tx_abs.strip_prefix(dest_dir.path()).unwrap();
+    let src_file = testnet_small_archive_path().join(rel);
+    assert_eq!(
+        std::fs::read(&tx_abs).unwrap(),
+        std::fs::read(&src_file).unwrap(),
+        "corrupt dst transactions file is overwritten with src content"
+    );
 }

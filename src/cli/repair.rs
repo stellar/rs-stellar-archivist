@@ -67,6 +67,27 @@ impl RepairCmd {
             verify: args.verify,
             storage_config: args.storage_config,
         };
+
+        // Read the plan up front (if any); the `Option` doubles as the mode flag
+        // below. `--verify` works exactly as in regular repair: it governs
+        // validation of downloaded content and the dst probing of discovered
+        // files (listed items are re-fetched unconditionally either way).
+        let plan = if let Some(ref plan_path) = self.plan {
+            info!("Plan mode: applying {}", plan_path.display());
+            let plan = crate::report::read_from_path(plan_path).map_err(|e| {
+                Error::Other(format!(
+                    "Failed to read plan from {}: {}",
+                    plan_path.display(),
+                    e
+                ))
+            })?;
+            Some(plan)
+        } else {
+            None
+        };
+
+        // Build the operation once; the pipeline path reuses the stores/config,
+        // so the operation takes clones.
         let operation = RepairOperation::new(
             src_store.clone(),
             dst_store.clone(),
@@ -76,30 +97,20 @@ impl RepairCmd {
             pipeline_config.clone(),
         );
 
-        if let Some(ref plan_path) = self.plan {
-            let report = crate::report::read_from_path(plan_path).map_err(|e| {
-                Error::Other(format!(
-                    "Failed to read plan from {}: {}",
-                    plan_path.display(),
-                    e
-                ))
-            })?;
-            info!("Plan mode: applying {}", plan_path.display());
+        if let Some(plan) = plan {
             operation
-                .run_manual(report, args.report_path.as_deref())
+                .run_manual(plan, args.report_path.as_deref())
                 .await?;
-            return Ok(());
+        } else {
+            let pipeline = Pipeline::new(
+                operation,
+                pipeline_config,
+                src_store,
+                Some(dst_store),
+                args.report_path,
+            );
+            pipeline.run().await.map_err(utils::map_pipeline_error)?;
         }
-
-        let pipeline = Pipeline::new(
-            operation,
-            pipeline_config,
-            src_store,
-            Some(dst_store),
-            args.report_path,
-        );
-
-        pipeline.run().await.map_err(utils::map_pipeline_error)?;
 
         Ok(())
     }

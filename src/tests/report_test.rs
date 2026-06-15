@@ -208,3 +208,22 @@ fn test_well_known_serializes_as_number_or_null() {
     .unwrap();
     assert!(healthy.contains("\"well_known\":null"), "got: {healthy}");
 }
+
+/// A scan/mirror-shaped report (well_known + files + buckets + checkpoints)
+/// is a valid repair plan: into_failures accepts it and reconstructs the
+/// tracker. Guards cross-operation compatibility.
+#[test]
+fn test_scan_shaped_report_is_valid_plan() {
+    let report = ArchiveReport::from_failures_and_summary(&sample_tracker(), Summary::default());
+    let json = serde_json::to_string(&report).unwrap();
+    let parsed: ArchiveReport = serde_json::from_str(&json).unwrap();
+    let tracker = parsed
+        .into_failures()
+        .expect("scan/mirror report must be a valid plan");
+    // FailureTracker is not PartialEq; compare fields (as test_round_trip_identity does).
+    let expected = sample_tracker();
+    assert_eq!(tracker.well_known, expected.well_known);
+    assert_eq!(tracker.files, expected.files);
+    assert_eq!(tracker.buckets, expected.buckets);
+    assert_eq!(tracker.checkpoints, expected.checkpoints);
+}

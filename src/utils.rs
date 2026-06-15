@@ -158,6 +158,24 @@ impl FailureTracker {
             && self.checkpoints.is_empty()
     }
 
+    /// True if `path` identifies a file already recorded as broken: a bucket
+    /// whose content hash is in `buckets`, or a per-checkpoint file whose
+    /// (cp, type) flag is set in `files`. Repair's failed-list mode uses this
+    /// to fetch known-broken files directly instead of probing the destination.
+    #[must_use]
+    pub fn contains_path(&self, path: &str) -> bool {
+        if let Some(hash_str) = history_format::bucket_hash_from_path(path) {
+            return hex_to_hash(&hash_str).is_some_and(|h| self.buckets.contains(&h));
+        }
+        match (
+            history_format::checkpoint_from_path(path),
+            path_to_file_flag(path),
+        ) {
+            (Some(cp), Some(flag)) => self.files.get(&cp).is_some_and(|f| f.has(flag)),
+            _ => false,
+        }
+    }
+
     /// Mark the root `.well-known` as needing restoration from checkpoint `cp`
     /// (the archive's highest checkpoint, which is what `.well-known` advertises).
     pub fn record_well_known(&mut self, cp: u32) {
@@ -345,6 +363,14 @@ impl ArchiveStats {
     /// True iff the tracker holds any failure of any kind.
     pub async fn has_failures(&self) -> bool {
         !self.failures.lock().await.is_empty()
+    }
+
+    /// Number of checkpoints flagged by cross-file or cross-checkpoint
+    /// verification. These are detected *after* the per-cp files are written, so
+    /// a non-zero count means individually-valid files were committed but are
+    /// mutually inconsistent.
+    pub async fn checkpoint_failure_count(&self) -> usize {
+        self.failures.lock().await.checkpoints.len()
     }
 
     /// Generate and log a complete report of the operation results.

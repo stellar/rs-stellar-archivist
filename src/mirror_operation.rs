@@ -1,8 +1,8 @@
 //! Mirror operation - copies files from source to destination
 
 use crate::history_format;
-use crate::pipeline::{async_trait, Operation, ProcessOutcome};
-use crate::storage::{self, Error as StorageError, StorageConfig, StorageRef};
+use crate::pipeline::{async_trait, Operation, PipelineConfig, ProcessOutcome};
+use crate::storage::{self, Error as StorageError, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
 use opendal::Buffer;
@@ -48,8 +48,8 @@ pub struct MirrorOperation {
     high: Option<u32>,
     allow_mirror_gaps: bool,
 
-    // Storage configuration (retry params for fetches live here)
-    storage_config: StorageConfig,
+    // Pipeline configuration (storage retry params + verify mode for the report)
+    pipeline_config: PipelineConfig,
 
     // Cached destination checkpoint at start of operation (or None if destination doesn't exist)
     initial_dest_checkpoint: OnceCell<Option<u32>>,
@@ -70,7 +70,7 @@ impl MirrorOperation {
         low: Option<u32>,
         high: Option<u32>,
         allow_mirror_gaps: bool,
-        storage_config: &StorageConfig,
+        pipeline_config: PipelineConfig,
         update_well_known: bool,
     ) -> Self {
         debug_assert!(
@@ -84,7 +84,7 @@ impl MirrorOperation {
             low,
             high,
             allow_mirror_gaps,
-            storage_config: storage_config.clone(),
+            pipeline_config,
             initial_dest_checkpoint: OnceCell::new(),
             update_well_known,
         }
@@ -99,8 +99,11 @@ impl MirrorOperation {
                 // Try to read the destination's .well-known file
                 match fetch_well_known_history_file(
                     &self.dst_store,
-                    self.storage_config.max_retries as u32,
-                    self.storage_config.retry_min_delay.as_millis() as u64,
+                    self.pipeline_config.storage_config.max_retries as u32,
+                    self.pipeline_config
+                        .storage_config
+                        .retry_min_delay
+                        .as_millis() as u64,
                 )
                 .await
                 {
@@ -227,8 +230,11 @@ impl Operation for MirrorOperation {
         // First, get the source's latest checkpoint to know what's available
         let source_state = fetch_well_known_history_file(
             source,
-            self.storage_config.max_retries as u32,
-            self.storage_config.retry_min_delay.as_millis() as u64,
+            self.pipeline_config.storage_config.max_retries as u32,
+            self.pipeline_config
+                .storage_config
+                .retry_min_delay
+                .as_millis() as u64,
         )
         .await
         .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
@@ -372,6 +378,19 @@ impl Operation for MirrorOperation {
             };
             crate::report::write_to_path(path, &report)
                 .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Report(e)))?;
+        }
+
+        // Cross-file/chain checks run after the per-cp files are written, so a
+        // checkpoint flagged here means individually-valid files were already
+        // committed to the destination but are mutually inconsistent.
+        let inconsistent = stats.checkpoint_failure_count().await;
+        if inconsistent > 0 {
+            error!(
+                "{inconsistent} checkpoint(s) passed per-file verification but failed \
+                 cross-file/chain checks; their files were written to the destination but are \
+                 mutually inconsistent. Re-run `repair --verify` against a known-good source to \
+                 reconcile them."
+            );
         }
 
         if stats.has_failures().await {

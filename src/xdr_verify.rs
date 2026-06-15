@@ -17,7 +17,7 @@
 //! - Cross-checkpoint hash chain: first ledger's `prev_hash` matches prior checkpoint's last hash
 
 use crate::history_format::{self, CHECKPOINT_FREQUENCY, GENESIS_CHECKPOINT_LEDGER};
-use crate::storage::{cleanup_partial_file, from_opendal_error, Error as StorageError, StorageRef};
+use crate::storage::{from_opendal_error, Error as StorageError, StorageRef};
 use async_compression::tokio::bufread::GzipDecoder;
 use bytes::Bytes;
 use futures_util::StreamExt;
@@ -1090,7 +1090,7 @@ async fn decompress_and_write_internal(
 ///   `NotFound` is silently tolerated; other errors are warned but not raised.
 ///
 /// Safe to call on backends without a base path (e.g. HTTP) — does nothing.
-async fn cleanup_non_atomic_partial_write(path: &str, dst_store: &StorageRef) {
+pub(crate) async fn cleanup_non_atomic_partial_write(path: &str, dst_store: &StorageRef) {
     if dst_store.uses_atomic_writes() {
         return;
     }
@@ -1106,6 +1106,38 @@ async fn cleanup_non_atomic_partial_write(path: &str, dst_store: &StorageRef) {
             }
         }
     }
+}
+
+/// Commit a verified write performed at `write_path` to its final `path`.
+///
+/// - **Atomic backends**: `write_path == path` (the backend already committed
+///   via its own temp-to-target rename on `close()`) — no-op.
+/// - **Non-atomic backends**: rename the `.tmp` sibling to the final path.
+///   The temp is removed on rename failure to avoid leaking `.tmp` files;
+///   the pre-existing file at `path` (if any) is only replaced by the rename,
+///   never deleted on failure.
+pub(crate) async fn commit_non_atomic_write(
+    dst_store: &StorageRef,
+    write_path: &str,
+    path: &str,
+) -> Result<(), StorageError> {
+    if write_path == path {
+        return Ok(());
+    }
+    if let Some(base) = dst_store.get_base_path() {
+        let tmp_full = base.join(write_path);
+        let final_full = base.join(path);
+        if let Err(e) = tokio::fs::rename(&tmp_full, &final_full).await {
+            let _ = tokio::fs::remove_file(&tmp_full).await;
+            return Err(StorageError::fatal(format!(
+                "failed to rename {} to {}: {}",
+                tmp_full.display(),
+                final_full.display(),
+                e
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Decompress, verify XDR structure, and write to destination in a single
@@ -1190,22 +1222,7 @@ pub async fn verify_and_write_xdr(
                 })?;
             }
             // Non-atomic FS backend: rename the temp to the final path.
-            // Removes the temp on rename failure to avoid leaking `.tmp` files.
-            if write_path != path {
-                if let Some(base) = dst_store.get_base_path() {
-                    let tmp_full = base.join(&write_path);
-                    let final_full = base.join(path);
-                    if let Err(e) = tokio::fs::rename(&tmp_full, &final_full).await {
-                        let _ = tokio::fs::remove_file(&tmp_full).await;
-                        return Err(StorageError::fatal(format!(
-                            "failed to rename {} to {}: {}",
-                            tmp_full.display(),
-                            final_full.display(),
-                            e
-                        )));
-                    }
-                }
-            }
+            commit_non_atomic_write(dst_store, &write_path, path).await?;
             Ok(result)
         }
         Err(err) => {
@@ -1229,8 +1246,12 @@ pub async fn verify_and_write_xdr(
 /// - everything else (and the manager-off path) → plain
 ///   [`crate::storage::Storage::copy_from_reader`]
 ///
-/// On any write error, attempts [`cleanup_partial_file`] on `dst_store`
-/// (cleanup failures are logged at error level but not propagated).
+/// Every branch writes via a temp artifact (`.tmp` sibling on non-atomic
+/// backends, the backend's own temp-to-target rename on atomic ones) and
+/// cleans up after itself on failure — a failed fetch never disturbs a
+/// pre-existing file at `path`. Repair's failed-list mode relies on this:
+/// it force-fetches listed files that may still be valid on dst, and a
+/// transient src failure must not destroy that copy.
 pub async fn fetch_verify_and_write(
     src_store: &StorageRef,
     dst_store: &StorageRef,
@@ -1265,18 +1286,8 @@ pub async fn fetch_verify_and_write(
             .map(|()| None)
     };
 
-    match write_result {
-        Ok(parsed) => {
-            if let (Some(parsed), Some(mgr)) = (parsed, manager) {
-                mgr.record(path, parsed);
-            }
-            Ok(())
-        }
-        Err(e) => {
-            if let Err(cleanup_err) = cleanup_partial_file(dst_store, path).await {
-                error!("Failed to cleanup partial file {}: {}", path, cleanup_err);
-            }
-            Err(e)
-        }
+    if let (Some(parsed), Some(mgr)) = (write_result?, manager) {
+        mgr.record(path, parsed);
     }
+    Ok(())
 }

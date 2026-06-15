@@ -52,16 +52,6 @@ impl MirrorCmd {
             )));
         }
 
-        let operation = MirrorOperation::new(
-            dst_store.clone(),
-            self.overwrite,
-            self.low,
-            self.high,
-            self.allow_mirror_gaps,
-            &args.storage_config,
-            /*update_well_known=*/ true,
-        );
-
         let pipeline_config = PipelineConfig {
             concurrency: args.concurrency,
             skip_optional: args.skip_optional,
@@ -69,6 +59,16 @@ impl MirrorCmd {
             verify: args.verify,
             storage_config: args.storage_config,
         };
+
+        let operation = MirrorOperation::new(
+            dst_store.clone(),
+            self.overwrite,
+            self.low,
+            self.high,
+            self.allow_mirror_gaps,
+            pipeline_config.clone(),
+            /*update_well_known=*/ true,
+        );
 
         let pipeline = Pipeline::new(
             operation,

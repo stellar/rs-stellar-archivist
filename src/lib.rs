@@ -267,8 +267,6 @@ pub mod test_helpers {
     }
 
     pub async fn run_scan(config: ScanConfig) -> Result<(), crate::Error> {
-        let operation = ScanOperation::new(config.low, config.high, &config.storage_config);
-
         let src_store =
             crate::storage::from_url_with_config(&config.archive, &config.storage_config).map_err(
                 |e| crate::Error::Other(format!("Failed to create source backend: {e}")),
@@ -281,6 +279,8 @@ pub mod test_helpers {
             verify: config.verify,
             storage_config: config.storage_config,
         };
+
+        let operation = ScanOperation::new(config.low, config.high, pipeline_config.clone());
 
         let pipeline = Pipeline::new(
             operation,
@@ -313,16 +313,6 @@ pub mod test_helpers {
             )));
         }
 
-        let operation = MirrorOperation::new(
-            dst_store.clone(),
-            config.overwrite,
-            config.low,
-            config.high,
-            config.allow_mirror_gaps,
-            &config.storage_config,
-            /*update_well_known=*/ true,
-        );
-
         let pipeline_config = PipelineConfig {
             concurrency: config.concurrency,
             skip_optional: config.skip_optional,
@@ -330,6 +320,16 @@ pub mod test_helpers {
             verify: config.verify,
             storage_config: config.storage_config,
         };
+
+        let operation = MirrorOperation::new(
+            dst_store.clone(),
+            config.overwrite,
+            config.low,
+            config.high,
+            config.allow_mirror_gaps,
+            pipeline_config.clone(),
+            /*update_well_known=*/ true,
+        );
 
         let pipeline = Pipeline::new(
             operation,
@@ -456,6 +456,22 @@ pub mod test_helpers {
             verify: config.verify,
             storage_config: config.storage_config,
         };
+
+        if let Some(plan) = config.plan {
+            let operation = RepairOperation::new(
+                src_store,
+                dst_store,
+                config.low,
+                config.high,
+                config.dry_run,
+                pipeline_config,
+            );
+            return operation
+                .run_manual(plan, config.report_path.as_deref())
+                .await
+                .map_err(crate::Error::from);
+        }
+
         let operation = RepairOperation::new(
             src_store.clone(),
             dst_store.clone(),
@@ -464,13 +480,6 @@ pub mod test_helpers {
             config.dry_run,
             pipeline_config.clone(),
         );
-
-        if let Some(plan) = config.plan {
-            return operation
-                .run_manual(plan, config.report_path.as_deref())
-                .await
-                .map_err(crate::Error::from);
-        }
 
         let pipeline = Pipeline::new(
             operation,

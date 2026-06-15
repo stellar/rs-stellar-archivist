@@ -18,7 +18,7 @@ const CHANNEL_CAPACITY: usize = 64;
 
 /// Decompress and hash the given reader's content and verify it against the expected hash.
 /// If `writer` is provided, compressed bytes are written to it while verifying.
-async fn verify_bucket_internal(
+async fn verify_bucket_maybe_write(
     path: &str,
     reader: Reader,
     writer: Option<Writer>,
@@ -127,17 +127,32 @@ async fn verify_bucket_internal(
 /// Verify a bucket file's hash (scan operation).
 pub async fn verify_bucket_stream(path: &str, reader: Reader) -> Result<(), StorageError> {
     debug!("Verifying bucket hash for {}", path);
-    verify_bucket_internal(path, reader, None).await
+    verify_bucket_maybe_write(path, reader, None).await
 }
 
 /// Verify and write a bucket file (mirror operation).
 /// Hash is verified before committing the write.
+///
+/// On non-atomic backends the compressed stream is written to a `.tmp`
+/// sibling and renamed to `path` only after the hash verifies — the same
+/// scheme as `verify_and_write_xdr` — so a failed or interrupted write never
+/// disturbs a pre-existing file at `path`. Atomic backends commit on
+/// `close()` internally.
 pub async fn verify_and_write_bucket(
     path: &str,
     reader: Reader,
     dst_store: &StorageRef,
 ) -> Result<(), StorageError> {
     debug!("Verifying and writing bucket {}", path);
-    let writer = dst_store.open_writer(path).await?;
-    verify_bucket_internal(path, reader, Some(writer)).await
+    let write_path: String = if dst_store.uses_atomic_writes() {
+        path.to_string()
+    } else {
+        format!("{path}.tmp")
+    };
+    let writer = dst_store.open_writer(&write_path).await?;
+    if let Err(e) = verify_bucket_maybe_write(path, reader, Some(writer)).await {
+        crate::xdr_verify::cleanup_non_atomic_partial_write(&write_path, dst_store).await;
+        return Err(e);
+    }
+    crate::xdr_verify::commit_non_atomic_write(dst_store, &write_path, path).await
 }

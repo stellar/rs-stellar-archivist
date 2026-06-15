@@ -1,11 +1,12 @@
 use crate::history_format;
-use crate::pipeline::{async_trait, Operation, ProcessOutcome};
-use crate::storage::{from_opendal_error, Error as StorageError, StorageConfig, StorageRef};
+use crate::pipeline::{async_trait, Operation, PipelineConfig, ProcessOutcome};
+use crate::storage::{from_opendal_error, Error as StorageError, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
 use opendal::Buffer;
 use opendal::Reader;
 use thiserror::Error;
+use tracing::error;
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -30,16 +31,16 @@ pub struct ScanOperation {
     low: Option<u32>,
     high: Option<u32>,
 
-    // Storage configuration (retry params for source fetches live here)
-    storage_config: StorageConfig,
+    // Pipeline configuration (storage retry params + verify mode for the report)
+    pipeline_config: PipelineConfig,
 }
 
 impl ScanOperation {
-    pub fn new(low: Option<u32>, high: Option<u32>, storage_config: &StorageConfig) -> Self {
+    pub fn new(low: Option<u32>, high: Option<u32>, pipeline_config: PipelineConfig) -> Self {
         Self {
             low,
             high,
-            storage_config: storage_config.clone(),
+            pipeline_config,
         }
     }
 
@@ -69,8 +70,11 @@ impl Operation for ScanOperation {
     ) -> Result<(u32, u32), crate::pipeline::Error> {
         let source_state = fetch_well_known_history_file(
             source,
-            self.storage_config.max_retries as u32,
-            self.storage_config.retry_min_delay.as_millis() as u64,
+            self.pipeline_config.storage_config.max_retries as u32,
+            self.pipeline_config
+                .storage_config
+                .retry_min_delay
+                .as_millis() as u64,
         )
         .await
         .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))?;
@@ -133,6 +137,17 @@ impl Operation for ScanOperation {
             };
             crate::report::write_to_path(path, &report)
                 .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Report(e)))?;
+        }
+
+        // Cross-file/chain checks compare files that each passed their own
+        // verification; a flagged checkpoint means they don't agree. Scan is
+        // read-only, so this only reports the inconsistency.
+        let inconsistent = stats.checkpoint_failure_count().await;
+        if inconsistent > 0 {
+            error!(
+                "{inconsistent} checkpoint(s) failed cross-file/chain verification: the files are \
+                 individually valid but mutually inconsistent (scan does not modify the archive)."
+            );
         }
 
         if stats.has_failures().await {
