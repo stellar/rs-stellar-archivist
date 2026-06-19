@@ -1551,10 +1551,7 @@ async fn test_well_known_restored_after_history_retry() {
     let op = build_repair_op(&src_url, &dest_url, /*verify=*/ true);
 
     // Observe the missing dst .well-known so the needs-repair flag is set.
-    let src_store =
-        crate::storage::from_url_with_config(&src_url, &crate::test_helpers::test_storage_config())
-            .unwrap();
-    op.get_checkpoint_bounds(&src_store)
+    op.get_checkpoint_bounds()
         .await
         .expect("bounds via src fallback");
 
@@ -1880,10 +1877,7 @@ async fn test_repair_both_well_known_unreadable_errors() {
     std::fs::remove_file(dest_dir.path().join(".well-known/stellar-history.json")).unwrap();
 
     let op = build_repair_op(&src_url, &dest_url, /*verify=*/ false);
-    let src_store =
-        crate::storage::from_url_with_config(&src_url, &crate::test_helpers::test_storage_config())
-            .unwrap();
-    let result = op.get_checkpoint_bounds(&src_store).await;
+    let result = op.get_checkpoint_bounds().await;
     assert!(
         result.is_err(),
         "get_checkpoint_bounds must error when both .well-known are unreadable"
@@ -2001,14 +1995,12 @@ async fn test_repair_dry_run_verify_surfaces_cross_file_failure() {
     let corrupted_bytes = std::fs::read(&ledger_abs).unwrap();
 
     let storage_config = crate::test_helpers::test_storage_config();
-    let src_store = crate::storage::from_url_with_config(&src_url, &storage_config).unwrap();
-    let dst_store = crate::storage::from_url_with_config(&dest_url, &storage_config).unwrap();
 
     let op = build_repair_op_full(
         &src_url, &dest_url, /*verify=*/ true, /*dry_run=*/ true,
     );
     let (low, high) = op
-        .get_checkpoint_bounds(&src_store)
+        .get_checkpoint_bounds()
         .await
         .expect("bounds from dst .well-known");
 
@@ -2019,7 +2011,7 @@ async fn test_repair_dry_run_verify_surfaces_cross_file_failure() {
         verify: true,
         storage_config,
     };
-    let pipeline = Pipeline::new(op, config, src_store, Some(dst_store), None);
+    let pipeline = Pipeline::new(op, config, None);
     let cps = (low..=high).step_by(history_format::CHECKPOINT_FREQUENCY as usize);
     pipeline
         .run_checkpoints(cps)

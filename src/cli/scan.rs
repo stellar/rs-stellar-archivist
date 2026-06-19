@@ -44,15 +44,9 @@ impl ScanCmd {
         };
 
         // Create the scan operation
-        let operation = ScanOperation::new(self.low, self.high, pipeline_config.clone());
+        let operation = ScanOperation::new(src_store, self.low, self.high, pipeline_config.clone());
 
-        let pipeline = Pipeline::new(
-            operation,
-            pipeline_config,
-            src_store,
-            None,
-            args.report_path,
-        );
+        let pipeline = Pipeline::new(operation, pipeline_config, args.report_path);
 
         pipeline.run().await.map_err(utils::map_pipeline_error)?;
 

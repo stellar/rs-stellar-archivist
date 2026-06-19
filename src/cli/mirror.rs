@@ -61,7 +61,8 @@ impl MirrorCmd {
         };
 
         let operation = MirrorOperation::new(
-            dst_store.clone(),
+            src_store,
+            dst_store,
             self.overwrite,
             self.low,
             self.high,
@@ -70,13 +71,7 @@ impl MirrorCmd {
             /*update_well_known=*/ true,
         );
 
-        let pipeline = Pipeline::new(
-            operation,
-            pipeline_config,
-            src_store,
-            Some(dst_store),
-            args.report_path,
-        );
+        let pipeline = Pipeline::new(operation, pipeline_config, args.report_path);
 
         pipeline.run().await.map_err(utils::map_pipeline_error)?;
 

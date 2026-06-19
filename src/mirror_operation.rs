@@ -39,6 +39,7 @@ pub enum Error {
 }
 
 pub struct MirrorOperation {
+    src_store: StorageRef,
     dst_store: StorageRef,
     overwrite: bool,
 
@@ -64,6 +65,7 @@ pub struct MirrorOperation {
 
 impl MirrorOperation {
     pub fn new(
+        src_store: StorageRef,
         dst_store: StorageRef,
         overwrite: bool,
         low: Option<u32>,
@@ -78,6 +80,7 @@ impl MirrorOperation {
         );
 
         Self {
+            src_store,
             dst_store,
             overwrite,
             low,
@@ -210,10 +213,7 @@ impl MirrorOperation {
 
 #[async_trait]
 impl Operation for MirrorOperation {
-    async fn get_checkpoint_bounds(
-        &self,
-        source: &StorageRef,
-    ) -> Result<(u32, u32), crate::pipeline::Error> {
+    async fn get_checkpoint_bounds(&self) -> Result<(u32, u32), crate::pipeline::Error> {
         // Determine the effective low checkpoint based on destination .well-known/stellar-history.json and flags
         //
         // Starting ledger logic:
@@ -228,7 +228,7 @@ impl Operation for MirrorOperation {
 
         // First, get the source's latest checkpoint to know what's available
         let source_state = fetch_well_known_history_file(
-            source,
+            &self.src_store,
             self.pipeline_config.storage_config.max_retries as u32,
             self.pipeline_config
                 .storage_config
@@ -350,14 +350,13 @@ impl Operation for MirrorOperation {
     async fn process_object(
         &self,
         path: &str,
-        src_store: &StorageRef,
         manager: Option<&XdrVerificationManager>,
     ) -> Result<ProcessOutcome, StorageError> {
         // Skip if dst already has the file and we're not overwriting.
         if self.dst_store.exists(path).await? && !self.overwrite {
             return Ok(ProcessOutcome::Skipped);
         }
-        crate::xdr_verify::fetch_verify_and_write(src_store, &self.dst_store, path, manager)
+        crate::xdr_verify::fetch_verify_and_write(&self.src_store, &self.dst_store, path, manager)
             .await?;
         Ok(ProcessOutcome::Processed)
     }
@@ -413,11 +412,7 @@ impl Operation for MirrorOperation {
     /// the destination already holds a valid copy, keep it (`Skipped`) and walk
     /// its buckets; otherwise fetch from source, parse (before writing), write,
     /// and report `Processed`.
-    async fn process_history(
-        &self,
-        path: &str,
-        src_store: &StorageRef,
-    ) -> Result<HistoryOutcome, StorageError> {
+    async fn process_history(&self, path: &str) -> Result<HistoryOutcome, StorageError> {
         // Symmetric with process_object's `exists && !overwrite => Skipped`.
         if !self.overwrite {
             if let Ok(buffer) = storage::download_buffer(&self.dst_store, path).await {
@@ -431,7 +426,7 @@ impl Operation for MirrorOperation {
             }
         }
 
-        let buffer = storage::download_buffer(src_store, path).await?;
+        let buffer = storage::download_buffer(&self.src_store, path).await?;
         // Parse-before-write: never commit an unparseable HAS to the destination.
         let state = history_format::parse_history(&buffer, path)
             .map_err(|e| StorageError::fatal(format!("failed to parse history {path}: {e}")))?;

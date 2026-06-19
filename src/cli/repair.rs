@@ -89,8 +89,8 @@ impl RepairCmd {
         // Build the operation once; the pipeline path reuses the stores/config,
         // so the operation takes clones.
         let operation = RepairOperation::new(
-            src_store.clone(),
-            dst_store.clone(),
+            src_store,
+            dst_store,
             self.low,
             self.high,
             self.dry_run,
@@ -102,13 +102,7 @@ impl RepairCmd {
                 .run_manual(plan, args.report_path.as_deref())
                 .await?;
         } else {
-            let pipeline = Pipeline::new(
-                operation,
-                pipeline_config,
-                src_store,
-                Some(dst_store),
-                args.report_path,
-            );
+            let pipeline = Pipeline::new(operation, pipeline_config, args.report_path);
             pipeline.run().await.map_err(utils::map_pipeline_error)?;
         }
 

@@ -280,15 +280,10 @@ pub mod test_helpers {
             storage_config: config.storage_config,
         };
 
-        let operation = ScanOperation::new(config.low, config.high, pipeline_config.clone());
+        let operation =
+            ScanOperation::new(src_store, config.low, config.high, pipeline_config.clone());
 
-        let pipeline = Pipeline::new(
-            operation,
-            pipeline_config,
-            src_store,
-            None,
-            config.report_path,
-        );
+        let pipeline = Pipeline::new(operation, pipeline_config, config.report_path);
         pipeline
             .run()
             .await
@@ -322,7 +317,8 @@ pub mod test_helpers {
         };
 
         let operation = MirrorOperation::new(
-            dst_store.clone(),
+            src_store,
+            dst_store,
             config.overwrite,
             config.low,
             config.high,
@@ -331,13 +327,7 @@ pub mod test_helpers {
             /*update_well_known=*/ true,
         );
 
-        let pipeline = Pipeline::new(
-            operation,
-            pipeline_config,
-            src_store,
-            Some(dst_store),
-            config.report_path,
-        );
+        let pipeline = Pipeline::new(operation, pipeline_config, config.report_path);
         pipeline
             .run()
             .await
@@ -473,21 +463,15 @@ pub mod test_helpers {
         }
 
         let operation = RepairOperation::new(
-            src_store.clone(),
-            dst_store.clone(),
+            src_store,
+            dst_store,
             config.low,
             config.high,
             config.dry_run,
             pipeline_config.clone(),
         );
 
-        let pipeline = Pipeline::new(
-            operation,
-            pipeline_config,
-            src_store,
-            Some(dst_store),
-            config.report_path,
-        );
+        let pipeline = Pipeline::new(operation, pipeline_config, config.report_path);
         pipeline
             .run()
             .await

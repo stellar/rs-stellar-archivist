@@ -349,6 +349,7 @@ impl RepairOperation {
         let mut retry_config = self.pipeline_config.clone();
         retry_config.skip_history_and_buckets = true;
         let mirror_op = MirrorOperation::new(
+            self.src_store.clone(),
             self.dst_store.clone(),
             /*overwrite=*/ true,
             None,
@@ -360,8 +361,6 @@ impl RepairOperation {
         Pipeline::new(
             mirror_op,
             retry_config,
-            self.src_store.clone(),
-            Some(self.dst_store.clone()),
             /*report_path=*/ None,
         )
     }
@@ -385,8 +384,6 @@ impl RepairOperation {
         Pipeline::new(
             repair_op,
             self.pipeline_config.clone(),
-            self.src_store.clone(),
-            Some(self.dst_store.clone()),
             /*report_path=*/ None,
         )
     }
@@ -605,10 +602,7 @@ fn build_failed_files_work_list(failures: &FailureTracker) -> Vec<(u32, String)>
 
 #[async_trait]
 impl Operation for RepairOperation {
-    async fn get_checkpoint_bounds(
-        &self,
-        source: &StorageRef,
-    ) -> Result<(u32, u32), pipeline::Error> {
+    async fn get_checkpoint_bounds(&self) -> Result<(u32, u32), pipeline::Error> {
         // Try destination .well-known first (determines what range to repair)
         let dst_result = utils::fetch_well_known_history_file(
             &self.dst_store,
@@ -631,7 +625,7 @@ impl Operation for RepairOperation {
 
                 // Fall back to source .well-known
                 let src_state = utils::fetch_well_known_history_file(
-                    source,
+                    &self.src_store,
                     self.pipeline_config.storage_config.max_retries as u32,
                     self.pipeline_config
                         .storage_config
@@ -654,7 +648,6 @@ impl Operation for RepairOperation {
     async fn process_object(
         &self,
         path: &str,
-        _src_store: &StorageRef,
         manager: Option<&XdrVerificationManager>,
     ) -> Result<ProcessOutcome, StorageError> {
         if self.verify_and_record_dst(path, manager).await? {
@@ -674,11 +667,7 @@ impl Operation for RepairOperation {
     /// fetch from source only when the dst copy is missing/corrupt or the file
     /// is on the known-broken list. Returns the parsed state so the pipeline can
     /// walk bucket references.
-    async fn process_history(
-        &self,
-        path: &str,
-        src_store: &StorageRef,
-    ) -> Result<HistoryOutcome, StorageError> {
+    async fn process_history(&self, path: &str) -> Result<HistoryOutcome, StorageError> {
         // Failed-list mode: a listed file is fetched from source directly (no dst
         // probe), honoring `known_broken` exactly as verify_and_record_dst does.
         let listed = self
@@ -709,7 +698,7 @@ impl Operation for RepairOperation {
         }
 
         // Fetch from source, parse (before writing), then write to destination.
-        let buffer = storage::download_buffer(src_store, path).await?;
+        let buffer = storage::download_buffer(&self.src_store, path).await?;
         let state = history_format::parse_history(&buffer, path)
             .map_err(|e| StorageError::fatal(format!("failed to parse history {path}: {e}")))?;
         storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await?;

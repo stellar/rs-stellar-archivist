@@ -1073,7 +1073,8 @@ async fn test_mirror_with_update_well_known_false_does_not_touch_well_known() {
     };
 
     let mirror_op = MirrorOperation::new(
-        dst_store.clone(),
+        src_store,
+        dst_store,
         /*overwrite=*/ true,
         Some(64),
         Some(127),
@@ -1082,7 +1083,7 @@ async fn test_mirror_with_update_well_known_false_does_not_touch_well_known() {
         /*update_well_known=*/ false,
     );
 
-    let pipeline = Pipeline::new(mirror_op, pipeline_config, src_store, Some(dst_store), None);
+    let pipeline = Pipeline::new(mirror_op, pipeline_config, None);
 
     pipeline.run().await.expect("Mirror should succeed");
 

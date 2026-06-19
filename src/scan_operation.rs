@@ -26,6 +26,9 @@ pub enum Error {
 }
 
 pub struct ScanOperation {
+    // The source archive being scanned.
+    src_store: StorageRef,
+
     // User-specified arguments from CLI
     low: Option<u32>,
     high: Option<u32>,
@@ -35,8 +38,14 @@ pub struct ScanOperation {
 }
 
 impl ScanOperation {
-    pub fn new(low: Option<u32>, high: Option<u32>, pipeline_config: PipelineConfig) -> Self {
+    pub fn new(
+        src_store: StorageRef,
+        low: Option<u32>,
+        high: Option<u32>,
+        pipeline_config: PipelineConfig,
+    ) -> Self {
         Self {
+            src_store,
             low,
             high,
             pipeline_config,
@@ -63,12 +72,9 @@ impl ScanOperation {
 
 #[async_trait]
 impl Operation for ScanOperation {
-    async fn get_checkpoint_bounds(
-        &self,
-        source: &StorageRef,
-    ) -> Result<(u32, u32), crate::pipeline::Error> {
+    async fn get_checkpoint_bounds(&self) -> Result<(u32, u32), crate::pipeline::Error> {
         let source_state = fetch_well_known_history_file(
-            source,
+            &self.src_store,
             self.pipeline_config.storage_config.max_retries as u32,
             self.pipeline_config
                 .storage_config
@@ -87,12 +93,11 @@ impl Operation for ScanOperation {
     async fn process_object(
         &self,
         path: &str,
-        src_store: &StorageRef,
         manager: Option<&XdrVerificationManager>,
     ) -> Result<ProcessOutcome, StorageError> {
         if let Some(manager) = manager {
             // Verify mode: stream content and validate
-            let reader = src_store.open_reader(path).await?;
+            let reader = self.src_store.open_reader(path).await?;
             if crate::history_format::is_bucket_file(path) {
                 crate::verify::verify_bucket_stream(path, reader).await?;
             } else if crate::history_format::is_ledger_header_file(path) {
@@ -114,7 +119,7 @@ impl Operation for ScanOperation {
             }
         } else {
             // Existence-only mode: just check if file exists (no streaming)
-            if !src_store.exists(path).await? {
+            if !self.src_store.exists(path).await? {
                 return Err(StorageError::not_found());
             }
         }
@@ -158,12 +163,8 @@ impl Operation for ScanOperation {
 
     /// Scan reads the history file from the source and parses it for bucket
     /// discovery; it never writes.
-    async fn process_history(
-        &self,
-        path: &str,
-        src_store: &StorageRef,
-    ) -> Result<HistoryOutcome, StorageError> {
-        let buffer = crate::storage::download_buffer(src_store, path).await?;
+    async fn process_history(&self, path: &str) -> Result<HistoryOutcome, StorageError> {
+        let buffer = crate::storage::download_buffer(&self.src_store, path).await?;
         let state = crate::history_format::parse_history(&buffer, path)
             .map_err(|e| StorageError::fatal(format!("failed to parse history {path}: {e}")))?;
         Ok(HistoryOutcome {

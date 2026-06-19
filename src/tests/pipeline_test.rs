@@ -12,33 +12,12 @@
 use crate::pipeline::{
     async_trait, HistoryOutcome, Operation, Pipeline, PipelineConfig, ProcessOutcome,
 };
-use crate::storage::{Error as StorageError, StorageConfig, StorageRef};
+use crate::storage::{Error as StorageError, StorageConfig};
 use crate::utils::ArchiveStats;
-use opendal::Reader;
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-//=============================================================================
-// Stub storage — fills the StorageRef slot; never actually used by TestOperation
-//=============================================================================
-
-struct StubStorage;
-
-#[async_trait::async_trait]
-impl crate::storage::Storage for StubStorage {
-    async fn open_reader(&self, _object: &str) -> Result<Reader, StorageError> {
-        Err(StorageError::not_found())
-    }
-    async fn exists(&self, _object: &str) -> Result<bool, StorageError> {
-        Ok(false)
-    }
-}
-
-fn stub_storage() -> StorageRef {
-    Arc::new(StubStorage)
-}
 
 //=============================================================================
 // TestOperation
@@ -86,17 +65,13 @@ impl TestOperation {
 
 #[async_trait]
 impl Operation for TestOperation {
-    async fn get_checkpoint_bounds(
-        &self,
-        _source: &StorageRef,
-    ) -> Result<(u32, u32), crate::pipeline::Error> {
+    async fn get_checkpoint_bounds(&self) -> Result<(u32, u32), crate::pipeline::Error> {
         Ok(self.bounds)
     }
 
     async fn process_object(
         &self,
         path: &str,
-        _src_store: &StorageRef,
         _manager: Option<&crate::xdr_verify::XdrVerificationManager>,
     ) -> Result<ProcessOutcome, StorageError> {
         // `skip_optional=true` in `make_config` => 3 per-cp files. First call
@@ -148,11 +123,7 @@ impl Operation for TestOperation {
         Ok(())
     }
 
-    async fn process_history(
-        &self,
-        _path: &str,
-        _src_store: &StorageRef,
-    ) -> Result<HistoryOutcome, StorageError> {
+    async fn process_history(&self, _path: &str) -> Result<HistoryOutcome, StorageError> {
         // Fatal so `with_retries` returns immediately; the pipeline records the
         // HISTORY failure and per-cp file processing still runs via process_object.
         Err(StorageError::fatal("test stub: no history"))
@@ -186,7 +157,7 @@ fn make_config(concurrency: usize) -> PipelineConfig {
 #[tokio::test]
 async fn test_run_checkpoints_empty_iter_is_noop() {
     let (op, state) = TestOperation::new((63, 63));
-    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None, None);
+    let pipeline = Pipeline::new(op, make_config(1), None);
 
     pipeline
         .run_checkpoints(Vec::<u32>::new())
@@ -207,7 +178,7 @@ async fn test_run_checkpoints_empty_iter_is_noop() {
 #[tokio::test]
 async fn test_run_checkpoints_single_cp() {
     let (op, state) = TestOperation::new((63, 63));
-    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None, None);
+    let pipeline = Pipeline::new(op, make_config(1), None);
 
     pipeline.run_checkpoints(vec![63]).await.unwrap();
 
@@ -231,7 +202,7 @@ async fn test_run_checkpoints_single_cp() {
 #[tokio::test]
 async fn test_run_checkpoints_disjoint_cps() {
     let (op, state) = TestOperation::new((0, 0)); // bounds unused by this test
-    let pipeline = Pipeline::new(op, make_config(2), stub_storage(), None, None);
+    let pipeline = Pipeline::new(op, make_config(2), None);
 
     // Disjoint, non-consecutive cps.
     pipeline.run_checkpoints(vec![63, 575, 4095]).await.unwrap();
@@ -252,7 +223,7 @@ async fn test_run_checkpoints_disjoint_cps() {
 #[tokio::test]
 async fn test_run_checkpoints_does_not_call_finalize() {
     let (op, state) = TestOperation::new((0, 0));
-    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None, None);
+    let pipeline = Pipeline::new(op, make_config(1), None);
 
     pipeline.run_checkpoints(vec![63, 127]).await.unwrap();
 
@@ -266,7 +237,7 @@ async fn test_run_checkpoints_does_not_call_finalize() {
 #[tokio::test]
 async fn test_pipeline_finish_calls_finalize_with_supplied_highest() {
     let (op, state) = TestOperation::new((0, 0));
-    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None, None);
+    let pipeline = Pipeline::new(op, make_config(1), None);
 
     pipeline.finish(8191).await.expect("finish should succeed");
 
@@ -282,7 +253,7 @@ async fn test_pipeline_finish_calls_finalize_with_supplied_highest() {
 async fn test_run_checkpoints_respects_concurrency() {
     let (op, state) = TestOperation::new((0, 0));
     let op = op.with_delay(Duration::from_millis(50));
-    let pipeline = Pipeline::new(op, make_config(2), stub_storage(), None, None);
+    let pipeline = Pipeline::new(op, make_config(2), None);
 
     // 4 cps with concurrency=2 → peak in-flight should be exactly 2.
     pipeline
@@ -300,7 +271,7 @@ async fn test_run_checkpoints_respects_concurrency() {
 #[tokio::test]
 async fn test_stats_accessor_returns_live_ref() {
     let (op, _state) = TestOperation::new((0, 0));
-    let pipeline = Pipeline::new(op, make_config(1), stub_storage(), None, None);
+    let pipeline = Pipeline::new(op, make_config(1), None);
 
     // Mutations through the accessor must be visible on subsequent reads.
     pipeline.stats().record_success("foo");

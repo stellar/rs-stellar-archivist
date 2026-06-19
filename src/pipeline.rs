@@ -6,7 +6,7 @@
 
 use crate::{
     history_format::{self, bucket_path, checkpoint_path, HistoryFileState},
-    storage::{StorageConfig, StorageRef},
+    storage::StorageConfig,
     utils::{self, ArchiveStats},
     xdr_verify::XdrVerificationManager,
 };
@@ -86,14 +86,15 @@ pub struct HistoryOutcome {
 
 /// Operation trait for scan, mirror, and repair.
 ///
-/// Pipeline owns `src_store`, `dst_store` (optional), `stats`, and handles
-/// buffer writing and stats recording. Operations implement domain-specific
-/// logic: checkpoint bounds, file processing, verification, and finalization.
+/// Pipeline owns `stats` and the orchestration machinery (concurrency, retries,
+/// bucket dedup, verification manager); each `Operation` owns the storage
+/// backends it reads/writes. Operations implement domain-specific logic:
+/// checkpoint bounds, file processing, verification, and finalization.
 #[async_trait::async_trait]
 pub trait Operation: Send + Sync + 'static {
     /// Get the checkpoint bounds for this operation.
     /// Returns (`lower_bound`, `upper_bound`) checkpoints to process.
-    async fn get_checkpoint_bounds(&self, source: &StorageRef) -> Result<(u32, u32), Error>;
+    async fn get_checkpoint_bounds(&self) -> Result<(u32, u32), Error>;
 
     /// Process a single file. Returns:
     /// - `Ok(Processed)` — work succeeded.
@@ -111,7 +112,6 @@ pub trait Operation: Send + Sync + 'static {
     async fn process_object(
         &self,
         path: &str,
-        _src_store: &StorageRef,
         manager: Option<&XdrVerificationManager>,
     ) -> Result<ProcessOutcome, crate::storage::Error>;
 
@@ -125,7 +125,7 @@ pub trait Operation: Send + Sync + 'static {
     /// `None` only for `ProcessOutcome::NeedsRepair` (repair dry-run on a
     /// missing/corrupt destination), where bucket discovery is skipped.
     ///
-    /// - scan: download from `src_store`, parse, never write → `Processed`.
+    /// - scan: download from the source, parse, never write → `Processed`.
     /// - mirror: keep a valid dst copy when not overwriting (`Skipped`), else
     ///   copy from source (`Processed`).
     /// - repair: keep a valid dst copy (`Processed`, no write); fetch + write
@@ -137,7 +137,6 @@ pub trait Operation: Send + Sync + 'static {
     async fn process_history(
         &self,
         path: &str,
-        src_store: &StorageRef,
     ) -> Result<HistoryOutcome, crate::storage::Error>;
 
     /// Called by `Pipeline::finish` after the manager (if any) has been
@@ -181,12 +180,6 @@ pub struct PipelineConfig {
 pub struct Pipeline<Op: Operation> {
     operation: Op,
     config: PipelineConfig,
-    src_store: StorageRef,
-    /// Destination store. Currently unread: the history file now reaches its
-    /// destination via the operation's own `dst_store`. Retained pending a
-    /// follow-up that removes it from `Pipeline::new`.
-    #[allow(dead_code)]
-    dst_store: Option<StorageRef>,
     stats: ArchiveStats,
     /// Hash → () presence cache used by `process_buckets` to skip buckets
     /// already seen elsewhere in this pipeline run.
@@ -204,13 +197,11 @@ pub struct Pipeline<Op: Operation> {
 }
 
 impl<Op: Operation> Pipeline<Op> {
-    /// Create a new pipeline.
-    /// Callers create storage backends and pass them in directly.
+    /// Create a new pipeline. The operation owns the storage backends it needs;
+    /// the pipeline holds none.
     pub fn new(
         operation: Op,
         config: PipelineConfig,
-        src_store: StorageRef,
-        dst_store: Option<StorageRef>,
         report_path: Option<std::path::PathBuf>,
     ) -> Self {
         let verification_manager = config.verify.then(XdrVerificationManager::new);
@@ -221,8 +212,6 @@ impl<Op: Operation> Pipeline<Op> {
         Self {
             operation,
             config,
-            src_store,
-            dst_store,
             stats: ArchiveStats::new(),
             bucket_lru,
             verification_manager,
@@ -242,10 +231,7 @@ impl<Op: Operation> Pipeline<Op> {
     /// Computes checkpoint bounds via the operation, drives the per-cp
     /// loop, then hands off to [`Self::finish`].
     pub async fn run(self) -> Result<(), Error> {
-        let (lower_bound, upper_bound) = self
-            .operation
-            .get_checkpoint_bounds(&self.src_store)
-            .await?;
+        let (lower_bound, upper_bound) = self.operation.get_checkpoint_bounds().await?;
 
         let total_count = history_format::count_checkpoints_in_range(lower_bound, upper_bound);
         if total_count != 0 {
@@ -378,7 +364,7 @@ impl<Op: Operation> Pipeline<Op> {
             self.config.storage_config.retry_min_delay.as_millis() as u64,
             "process history",
             &history_path,
-            || self.operation.process_history(&history_path, &self.src_store),
+            || self.operation.process_history(&history_path),
         )
         .await;
 
@@ -459,11 +445,8 @@ impl<Op: Operation> Pipeline<Op> {
             "process",
             &path,
             || {
-                self.operation.process_object(
-                    &path,
-                    &self.src_store,
-                    self.verification_manager.as_ref(),
-                )
+                self.operation
+                    .process_object(&path, self.verification_manager.as_ref())
             },
         )
         .await;
