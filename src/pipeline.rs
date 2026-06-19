@@ -527,6 +527,34 @@ impl<Op: Operation> Pipeline<Op> {
         }
     }
 
+    /// Record the result of processing a single object/buffer into `stats`,
+    /// using the shared `ProcessOutcome` → recorder mapping. Used by both
+    /// `process_file` and `process_history_and_buckets`.
+    async fn record_outcome(
+        &self,
+        checkpoint: u32,
+        path: &str,
+        result: Result<ProcessOutcome, crate::storage::Error>,
+    ) {
+        match result {
+            Ok(ProcessOutcome::Processed) => {
+                debug!("Processed: {}", path);
+                self.stats.record_success(path);
+            }
+            Ok(ProcessOutcome::Skipped) => {
+                debug!("Skipped: {}", path);
+                self.stats.record_skipped(path);
+            }
+            Ok(ProcessOutcome::NeedsRepair) => {
+                debug!("Needs repair: {}", path);
+                self.stats.record_failure(checkpoint, path).await;
+            }
+            Err(_) => {
+                self.stats.record_failure(checkpoint, path).await;
+            }
+        }
+    }
+
     /// Process a single file (bucket, ledger, transactions, results, scp).
     /// `checkpoint` is the cp context (for buckets, the discovering cp).
     pub(crate) async fn process_file(&self, checkpoint: u32, path: String) {
@@ -544,24 +572,7 @@ impl<Op: Operation> Pipeline<Op> {
             },
         )
         .await;
-
-        match result {
-            Ok(ProcessOutcome::Processed) => {
-                debug!("Processed: {}", path);
-                self.stats.record_success(&path);
-            }
-            Ok(ProcessOutcome::Skipped) => {
-                debug!("Skipped: {}", path);
-                self.stats.record_skipped(&path);
-            }
-            Ok(ProcessOutcome::NeedsRepair) => {
-                debug!("Needs repair: {}", path);
-                self.stats.record_failure(checkpoint, &path).await;
-            }
-            Err(_) => {
-                self.stats.record_failure(checkpoint, &path).await;
-            }
-        }
+        self.record_outcome(checkpoint, &path, result).await;
     }
 }
 
