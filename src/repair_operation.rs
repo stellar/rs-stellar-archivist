@@ -358,11 +358,7 @@ impl RepairOperation {
             retry_config.clone(),
             /*update_well_known=*/ false,
         );
-        Pipeline::new(
-            mirror_op,
-            retry_config,
-            /*report_path=*/ None,
-        )
+        Pipeline::new(mirror_op, retry_config, /*report_path=*/ None)
     }
 
     /// Build a fresh `Pipeline<RepairOperation>` for the per-file retry stage.
@@ -807,5 +803,4 @@ impl Operation for RepairOperation {
 
         Ok(())
     }
-
 }

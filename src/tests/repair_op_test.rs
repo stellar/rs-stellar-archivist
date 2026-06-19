@@ -795,9 +795,15 @@ async fn test_repair_preserves_healthy_history_file() {
         .into_iter()
         .filter(|p| !p.to_string_lossy().contains(".well-known"))
         .collect();
-    assert!(!history_files.is_empty(), "need a per-checkpoint history file");
+    assert!(
+        !history_files.is_empty(),
+        "need a per-checkpoint history file"
+    );
     let history_file = history_files[0].clone();
-    let before = std::fs::metadata(&history_file).unwrap().modified().unwrap();
+    let before = std::fs::metadata(&history_file)
+        .unwrap()
+        .modified()
+        .unwrap();
 
     // Sleep so mtime would differ if the file were rewritten.
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -808,7 +814,10 @@ async fn test_repair_preserves_healthy_history_file() {
         .await
         .expect("Repair should succeed");
 
-    let after = std::fs::metadata(&history_file).unwrap().modified().unwrap();
+    let after = std::fs::metadata(&history_file)
+        .unwrap()
+        .modified()
+        .unwrap();
     assert_eq!(
         before, after,
         "healthy history file must not be rewritten by repair"
@@ -844,12 +853,14 @@ async fn test_repair_phase1_refetches_listed_history_from_source() {
     // Tamper the listed file's dst copy: still valid HAS JSON, but marked.
     {
         let bytes = std::fs::read(&listed_file).unwrap();
-        let mut state: history_format::HistoryFileState =
-            serde_json::from_slice(&bytes).unwrap();
+        let mut state: history_format::HistoryFileState = serde_json::from_slice(&bytes).unwrap();
         state.server = Some("tampered-by-test".to_string());
         std::fs::write(&listed_file, serde_json::to_vec(&state).unwrap()).unwrap();
     }
-    let unlisted_before = std::fs::metadata(&unlisted_file).unwrap().modified().unwrap();
+    let unlisted_before = std::fs::metadata(&unlisted_file)
+        .unwrap()
+        .modified()
+        .unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
     // Plan lists ONLY the tampered history -> drives phase 1 (retry_failed_files).
@@ -873,7 +884,10 @@ async fn test_repair_phase1_refetches_listed_history_from_source() {
     );
 
     // (characterization) A healthy, unlisted history must be left untouched.
-    let unlisted_after = std::fs::metadata(&unlisted_file).unwrap().modified().unwrap();
+    let unlisted_after = std::fs::metadata(&unlisted_file)
+        .unwrap()
+        .modified()
+        .unwrap();
     assert_eq!(
         unlisted_before, unlisted_after,
         "phase 1 must not touch history files that are not in the plan"

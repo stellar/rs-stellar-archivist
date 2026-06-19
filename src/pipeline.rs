@@ -134,10 +134,7 @@ pub trait Operation: Send + Sync + 'static {
     ///
     /// The HAS is parsed unconditionally (needed for bucket discovery), so there
     /// is no verification-manager parameter.
-    async fn process_history(
-        &self,
-        path: &str,
-    ) -> Result<HistoryOutcome, crate::storage::Error>;
+    async fn process_history(&self, path: &str) -> Result<HistoryOutcome, crate::storage::Error>;
 
     /// Called by `Pipeline::finish` after the manager (if any) has been
     /// drained into `stats.failures`. The operation is responsible for
@@ -400,7 +397,10 @@ impl<Op: Operation> Pipeline<Op> {
         // `is_bucket_file` (which requires `bucket_hash_from_path` to be `Some`).
         // A missing hash here is a routing bug, not a runtime condition.
         let Some(bucket_hash) = history_format::bucket_hash_from_path(&path) else {
-            debug_assert!(false, "process_bucket_file requires a bucket path, got {path}");
+            debug_assert!(
+                false,
+                "process_bucket_file requires a bucket path, got {path}"
+            );
             error!("process_bucket_file got a non-bucket path, skipping: {path}");
             return;
         };

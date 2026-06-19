@@ -1160,7 +1160,8 @@ async fn test_mirror_no_overwrite_skips_existing_history() {
     for (path, before_mtime) in &before {
         let after_mtime = std::fs::metadata(path).unwrap().modified().unwrap();
         assert_eq!(
-            *before_mtime, after_mtime,
+            *before_mtime,
+            after_mtime,
             "history file {} must not be rewritten on a no-overwrite re-mirror",
             path.display()
         );
