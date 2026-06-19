@@ -667,8 +667,8 @@ async fn test_repair_dry_run_reports_but_no_download() {
     let deleted = delete_first_file(dest_dir.path(), "/ledger-");
 
     // History files: dry-run must not write history-*.json regardless of
-    // whether dst is missing or corrupt (Pipeline used to write the src
-    // buffer back via process_buffer even in dry-run).
+    // whether dst is missing or corrupt. process_history returns NeedsRepair
+    // (no source fetch, no write) under dry-run.
     let history_files = get_files_by_pattern(dest_dir.path(), "/history-");
     assert!(
         history_files.len() >= 2,
@@ -784,6 +784,133 @@ async fn test_repair_preserves_good_files() {
         good_file_mtime, after_mtime,
         "Good files should not be modified by repair"
     );
+}
+
+#[tokio::test]
+async fn test_repair_preserves_healthy_history_file() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    // Record mtime of a healthy per-checkpoint history file (exclude .well-known).
+    let history_files: Vec<_> = get_files_by_pattern(dest_dir.path(), "/history-")
+        .into_iter()
+        .filter(|p| !p.to_string_lossy().contains(".well-known"))
+        .collect();
+    assert!(!history_files.is_empty(), "need a per-checkpoint history file");
+    let history_file = history_files[0].clone();
+    let before = std::fs::metadata(&history_file).unwrap().modified().unwrap();
+
+    // Sleep so mtime would differ if the file were rewritten.
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Trigger a real repair by deleting an unrelated file.
+    delete_first_file(dest_dir.path(), "/ledger-");
+    run_repair(RepairConfig::new(&src_url, &dest_url))
+        .await
+        .expect("Repair should succeed");
+
+    let after = std::fs::metadata(&history_file).unwrap().modified().unwrap();
+    assert_eq!(
+        before, after,
+        "healthy history file must not be rewritten by repair"
+    );
+
+    run_scan(ScanConfig::new(&dest_url))
+        .await
+        .expect("Scan should pass after repair");
+}
+
+#[tokio::test]
+async fn test_repair_phase1_refetches_listed_history_from_source() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    // Two per-checkpoint history files: one to LIST + tamper, one healthy + UNLISTED.
+    let history_files: Vec<_> = get_files_by_pattern(dest_dir.path(), "/history-")
+        .into_iter()
+        .filter(|p| !p.to_string_lossy().contains(".well-known"))
+        .collect();
+    assert!(history_files.len() >= 2, "need at least two history files");
+    let listed_file = history_files[0].clone();
+    let unlisted_file = history_files[1].clone();
+
+    // Derive the listed file's checkpoint from its (dst-relative) path.
+    let listed_rel = listed_file
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let listed_cp = history_format::checkpoint_from_path(&listed_rel)
+        .expect("history path carries a checkpoint");
+
+    // Tamper the listed file's dst copy: still valid HAS JSON, but marked.
+    {
+        let bytes = std::fs::read(&listed_file).unwrap();
+        let mut state: history_format::HistoryFileState =
+            serde_json::from_slice(&bytes).unwrap();
+        state.server = Some("tampered-by-test".to_string());
+        std::fs::write(&listed_file, serde_json::to_vec(&state).unwrap()).unwrap();
+    }
+    let unlisted_before = std::fs::metadata(&unlisted_file).unwrap().modified().unwrap();
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    // Plan lists ONLY the tampered history -> drives phase 1 (retry_failed_files).
+    let mut tracker = crate::utils::FailureTracker::default();
+    tracker.record_file(listed_cp, crate::utils::FileFlags::HISTORY);
+    let plan = crate::report::ArchiveReport::from_failures_and_summary(
+        &tracker,
+        crate::report::Summary::default(),
+    );
+
+    run_repair(RepairConfig::new(&src_url, &dest_url).plan(plan))
+        .await
+        .expect("plan repair should succeed");
+
+    // (RED on current) The listed history must be re-fetched from SOURCE, not
+    // kept/rewritten from the tampered dst copy.
+    let after = std::fs::read_to_string(&listed_file).unwrap();
+    assert!(
+        !after.contains("tampered-by-test"),
+        "phase 1 must re-fetch a listed history from source, not keep the dst copy"
+    );
+
+    // (characterization) A healthy, unlisted history must be left untouched.
+    let unlisted_after = std::fs::metadata(&unlisted_file).unwrap().modified().unwrap();
+    assert_eq!(
+        unlisted_before, unlisted_after,
+        "phase 1 must not touch history files that are not in the plan"
+    );
+}
+
+#[tokio::test]
+async fn test_repair_replaces_broken_history_from_source() {
+    let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;
+
+    // Corrupt a per-checkpoint history file on the destination (still present,
+    // but unparseable) and capture the canonical source bytes.
+    let history_file = get_files_by_pattern(dest_dir.path(), "/history-")
+        .into_iter()
+        .find(|p| !p.to_string_lossy().contains(".well-known"))
+        .expect("a per-checkpoint history file");
+    let rel = history_file
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_path_buf();
+    let source_content = std::fs::read(testnet_small_archive_path().join(&rel)).unwrap();
+    std::fs::write(&history_file, b"{ broken json }}").unwrap();
+
+    run_repair(RepairConfig::new(&src_url, &dest_url))
+        .await
+        .expect("repair should succeed");
+
+    // The broken history must have been replaced with the source content.
+    assert_eq!(
+        std::fs::read(&history_file).unwrap(),
+        source_content,
+        "broken destination history must be replaced from source"
+    );
+
+    run_scan(ScanConfig::new(&dest_url))
+        .await
+        .expect("scan should pass after repair");
 }
 
 //=============================================================================
@@ -1812,9 +1939,9 @@ async fn test_repair_well_known_not_restored_when_history_missing() {
 //=============================================================================
 
 /// Dry-run + verify must detect a corrupt history file but leave it untouched
-/// on dst (the pipeline used to write the src buffer back via `process_buffer`
-/// even in dry-run). Complements `test_repair_dry_run_with_verify`, which only
-/// covered a corrupt bucket.
+/// on dst: `process_history` reports `NeedsRepair` under dry-run without
+/// fetching or writing. Complements `test_repair_dry_run_with_verify`, which
+/// only covered a corrupt bucket.
 #[tokio::test]
 async fn test_repair_dry_run_with_verify_leaves_corrupt_history_untouched() {
     let (src_url, dest_dir, dest_url) = mirror_testnet_small().await;

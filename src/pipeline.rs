@@ -6,19 +6,18 @@
 
 use crate::{
     history_format::{self, bucket_path, checkpoint_path, HistoryFileState},
-    storage::{download_buffer, StorageConfig, StorageRef},
+    storage::{StorageConfig, StorageRef},
     utils::{self, ArchiveStats},
     xdr_verify::XdrVerificationManager,
 };
 use futures_util::{
-    future::{join, join3, join_all, OptionFuture},
+    future::{join3, join_all, OptionFuture},
     stream, StreamExt,
 };
 use lru::LruCache;
-use opendal::Buffer;
 use std::sync::Mutex;
 use thiserror::Error;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info};
 
 /// Pipeline errors
 #[derive(Error, Debug)]
@@ -54,7 +53,7 @@ const PROGRESS_REPORTING_FREQUENCY: usize = 100;
 // Operation trait
 // ============================================================================
 
-/// Non-error outcome of `Operation::process_object` / `process_buffer`.
+/// Non-error outcome of `Operation::process_object` / `process_history`.
 ///
 /// Returned inside `Ok(_)`; the pipeline maps it to the matching
 /// `ArchiveStats` recorder: `Processed` → `record_success`,
@@ -74,49 +73,15 @@ pub enum ProcessOutcome {
     NeedsRepair,
 }
 
-/// Success outcome of [`Operation::fetch_history_buffer`].
+/// Result of [`Operation::process_history`].
 ///
-/// `NeedsRepair` rides on the `Ok` side (not the error channel) so the retry
-/// layer never acts on it: repair uses it to signal "record this checkpoint's
-/// history and skip its bucket discovery" (dry-run), while genuine fetch
-/// failures stay in `Err(StorageError)`.
-pub enum HistoryFetch {
-    /// History downloaded and ready to parse/process.
-    Available(Buffer),
-    /// History needs repair; record it and skip bucket discovery for this cp.
-    NeedsRepair,
-}
-
-impl HistoryFetch {
-    /// Interpret a history-fetch result for checkpoint `cp`: return the buffer
-    /// to process, or `None` (logging why) when the history should be recorded
-    /// as a HISTORY failure and its buckets skipped. The caller does the
-    /// recording, since that needs async stats access.
-    fn buffer_or_skip(
-        result: Result<Self, crate::storage::Error>,
-        cp: u32,
-        history_path: &str,
-    ) -> Option<Buffer> {
-        match result {
-            Ok(HistoryFetch::Available(buf)) => Some(buf),
-            Ok(HistoryFetch::NeedsRepair) => {
-                // Not an error: repair signaled this history needs repair
-                // (dry-run). The actual repair re-fetches history + buckets.
-                debug!(
-                    "History for checkpoint {cp} (0x{cp:08x}) recorded for repair; \
-                     skipping bucket discovery"
-                );
-                None
-            }
-            Err(e) => {
-                warn!(
-                    "Bucket references for checkpoint {cp} (0x{cp:08x}) were not checked \
-                     because {history_path} could not be downloaded: {e}"
-                );
-                None
-            }
-        }
-    }
+/// `outcome` is recorded into `ArchiveStats` exactly like `process_object`'s
+/// (`Processed` → success, `Skipped` → skipped, `NeedsRepair` → failure).
+/// `state` carries the parsed HAS for bucket discovery; it is `Some` for
+/// `Processed`/`Skipped` and `None` only for `NeedsRepair`.
+pub struct HistoryOutcome {
+    pub outcome: ProcessOutcome,
+    pub state: Option<HistoryFileState>,
 }
 
 /// Operation trait for scan, mirror, and repair.
@@ -150,6 +115,31 @@ pub trait Operation: Send + Sync + 'static {
         manager: Option<&XdrVerificationManager>,
     ) -> Result<ProcessOutcome, crate::storage::Error>;
 
+    /// Process a checkpoint's history (HAS) file end-to-end, returning its
+    /// parsed state so the pipeline can walk the bucket references it lists.
+    ///
+    /// The history-file analogue of [`Operation::process_object`]: the operation
+    /// owns the full decision (probe destination, fetch from source, write,
+    /// skip) and reports a [`ProcessOutcome`]. `HistoryOutcome::state` is `Some`
+    /// whenever a good HAS was obtained (so its buckets should be walked) and
+    /// `None` only for `ProcessOutcome::NeedsRepair` (repair dry-run on a
+    /// missing/corrupt destination), where bucket discovery is skipped.
+    ///
+    /// - scan: download from `src_store`, parse, never write → `Processed`.
+    /// - mirror: keep a valid dst copy when not overwriting (`Skipped`), else
+    ///   copy from source (`Processed`).
+    /// - repair: keep a valid dst copy (`Processed`, no write); fetch + write
+    ///   from source when missing/corrupt or known-broken; `NeedsRepair` under
+    ///   dry-run.
+    ///
+    /// The HAS is parsed unconditionally (needed for bucket discovery), so there
+    /// is no verification-manager parameter.
+    async fn process_history(
+        &self,
+        path: &str,
+        src_store: &StorageRef,
+    ) -> Result<HistoryOutcome, crate::storage::Error>;
+
     /// Called by `Pipeline::finish` after the manager (if any) has been
     /// drained into `stats.failures`. The operation is responsible for
     /// reporting and deciding `has_failures`-gated success.
@@ -159,37 +149,6 @@ pub trait Operation: Send + Sync + 'static {
         stats: &ArchiveStats,
         report_path: Option<&std::path::Path>,
     ) -> Result<(), Error>;
-
-    /// Fetch the history buffer for a checkpoint.
-    ///
-    /// Returns `Ok(HistoryFetch::Available(buf))` to process the buffer,
-    /// `Ok(HistoryFetch::NeedsRepair)` to record the history as needing repair
-    /// and skip its bucket discovery (repair dry-run), or `Err(_)` on a genuine
-    /// fetch error. Default implementation downloads from `src_store`
-    /// (scan/mirror behavior). Repair overrides this to read from destination
-    /// first, falling back to source.
-    async fn fetch_history_buffer(
-        &self,
-        history_path: &str,
-        src_store: &StorageRef,
-        _dst_store: Option<&StorageRef>,
-    ) -> Result<HistoryFetch, crate::storage::Error> {
-        Ok(HistoryFetch::Available(
-            download_buffer(src_store, history_path).await?,
-        ))
-    }
-
-    /// Write a fetched buffer (currently the history file) to the operation's
-    /// destination.
-    ///
-    /// Implementations diverge by mode: scan returns `Processed` without
-    /// writing; mirror writes via `storage::write_buffer_with_cleanup`;
-    /// repair skips the write in dry-run mode and otherwise writes like mirror.
-    async fn process_buffer(
-        &self,
-        path: &str,
-        buffer: Buffer,
-    ) -> Result<ProcessOutcome, crate::storage::Error>;
 }
 
 // ============================================================================
@@ -223,6 +182,10 @@ pub struct Pipeline<Op: Operation> {
     operation: Op,
     config: PipelineConfig,
     src_store: StorageRef,
+    /// Destination store. Currently unread: the history file now reaches its
+    /// destination via the operation's own `dst_store`. Retained pending a
+    /// follow-up that removes it from `Pipeline::new`.
+    #[allow(dead_code)]
     dst_store: Option<StorageRef>,
     stats: ArchiveStats,
     /// Hash → () presence cache used by `process_buckets` to skip buckets
@@ -401,68 +364,34 @@ impl<Op: Operation> Pipeline<Op> {
         }
     }
 
-    /// Fetch + parse + write a checkpoint's history file, then process all the
-    /// bucket references it discovers.
+    /// Process a checkpoint's history (HAS) file via the operation, then process
+    /// every bucket it references.
     ///
-    /// On history fetch/parse failure, `fetch_history_file_state` this method
-    /// returns early and buckets are not processed. On success, the history
-    /// buffer write and the bucket processing run concurrently.
+    /// The operation owns the probe/fetch/write/skip decision and returns the
+    /// parsed state. Buckets are walked only when a good HAS was obtained
+    /// (`state.is_some()`); a `NeedsRepair` outcome (repair dry-run) or an error
+    /// records the HISTORY failure and skips bucket discovery.
     pub(crate) async fn process_history_and_buckets(&self, checkpoint: u32) {
-        let Some((state, buffer)) = self.fetch_history_file_state(checkpoint).await else {
-            return;
-        };
         let history_path = checkpoint_path("history", checkpoint);
-        let write_history_buffer = self.process_history_file(checkpoint, &history_path, buffer);
-        let buckets = self.process_buckets(checkpoint, state);
-        let _ = join(write_history_buffer, buckets).await;
-    }
-
-    /// Fetch and parse a checkpoint's history file. On download or parse
-    /// failure, logs the error and records a failure into `stats`, returning
-    /// `None`. On success, returns the parsed state alongside the raw buffer
-    /// (the caller needs the buffer to write it to dst).
-    async fn fetch_history_file_state(
-        &self,
-        checkpoint: u32,
-    ) -> Option<(HistoryFileState, Buffer)> {
-        let history_path = checkpoint_path("history", checkpoint);
-
-        let fetched = utils::with_retries(
+        let result = utils::with_retries(
             self.config.storage_config.max_retries as u32,
             self.config.storage_config.retry_min_delay.as_millis() as u64,
-            "download history",
+            "process history",
             &history_path,
-            || {
-                self.operation.fetch_history_buffer(
-                    &history_path,
-                    &self.src_store,
-                    self.dst_store.as_ref(),
-                )
-            },
+            || self.operation.process_history(&history_path, &self.src_store),
         )
         .await;
 
-        // `buffer_or_skip` classifies + logs; both skip cases (needs-repair and
-        // fetch error) record the HISTORY failure here and stop bucket discovery.
-        let Some(buffer) = HistoryFetch::buffer_or_skip(fetched, checkpoint, &history_path) else {
-            self.stats.record_failure(checkpoint, &history_path).await;
-            return None;
-        };
-
-        match history_format::parse_history(&buffer, &history_path) {
-            Ok(state) => Some((state, buffer)),
+        match result {
+            Ok(HistoryOutcome { outcome, state }) => {
+                self.record_outcome(checkpoint, &history_path, Ok(outcome))
+                    .await;
+                if let Some(state) = state {
+                    self.process_buckets(checkpoint, state).await;
+                }
+            }
             Err(e) => {
-                error!(
-                    "Failed to parse history JSON for checkpoint {} (0x{:08x}): {}",
-                    checkpoint, checkpoint, e
-                );
-                warn!(
-                    "Bucket references for checkpoint {} (0x{:08x}) were not checked \
-                     because {} could not be parsed",
-                    checkpoint, checkpoint, history_path
-                );
-                self.stats.record_failure(checkpoint, &history_path).await;
-                None
+                self.record_outcome(checkpoint, &history_path, Err(e)).await;
             }
         }
     }
@@ -491,40 +420,6 @@ impl<Op: Operation> Pipeline<Op> {
         };
 
         join_all(bucket_futures).await;
-    }
-
-    /// Dispatch a parsed history buffer to the operation and record the
-    /// outcome into stats. Mirrors `process_file`'s match pattern but for
-    /// `process_buffer`. Retries write failures on the destination side just
-    /// like `process_object` retries fetch failures on the source side;
-    /// `Buffer` is `Bytes`-backed so each attempt clones cheaply.
-    async fn process_history_file(&self, checkpoint: u32, path: &str, buffer: Buffer) {
-        let result = utils::with_retries(
-            self.config.storage_config.max_retries as u32,
-            self.config.storage_config.retry_min_delay.as_millis() as u64,
-            "process",
-            path,
-            || self.operation.process_buffer(path, buffer.clone()),
-        )
-        .await;
-
-        match result {
-            Ok(ProcessOutcome::Processed) => {
-                debug!("Processed: {}", path);
-                self.stats.record_success(path);
-            }
-            Ok(ProcessOutcome::Skipped) => {
-                debug!("Skipped: {}", path);
-                self.stats.record_skipped(path);
-            }
-            Ok(ProcessOutcome::NeedsRepair) => {
-                debug!("Needs repair: {}", path);
-                self.stats.record_failure(checkpoint, path).await;
-            }
-            Err(_) => {
-                self.stats.record_failure(checkpoint, path).await;
-            }
-        }
     }
 
     /// Record the result of processing a single object/buffer into `stats`,

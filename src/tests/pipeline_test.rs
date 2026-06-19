@@ -1,7 +1,7 @@
 //! Unit tests for `Pipeline::run_checkpoints` and `Pipeline::stats()`.
 //!
 //! Uses a minimal `TestOperation` implementing the `Operation` trait. The test
-//! operation does no real I/O: `fetch_history_buffer` returns a fatal error
+//! operation does no real I/O: `process_history` returns a fatal error
 //! (so the pipeline records HISTORY failure and falls through to per-cp file
 //! processing), `process_object` records each invocation, and
 //! `finalize_checkpoint` / `finalize` record their respective calls.
@@ -10,11 +10,11 @@
 //! transactions, results) → 3 `process_object` calls per cp.
 
 use crate::pipeline::{
-    async_trait, HistoryFetch, Operation, Pipeline, PipelineConfig, ProcessOutcome,
+    async_trait, HistoryOutcome, Operation, Pipeline, PipelineConfig, ProcessOutcome,
 };
 use crate::storage::{Error as StorageError, StorageConfig, StorageRef};
 use crate::utils::ArchiveStats;
-use opendal::{Buffer, Reader};
+use opendal::Reader;
 use std::collections::BTreeSet;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -148,24 +148,14 @@ impl Operation for TestOperation {
         Ok(())
     }
 
-    async fn fetch_history_buffer(
-        &self,
-        _history_path: &str,
-        _src_store: &StorageRef,
-        _dst_store: Option<&StorageRef>,
-    ) -> Result<HistoryFetch, StorageError> {
-        // Fatal so `with_retries` returns immediately; pipeline records HISTORY
-        // failure and falls through to per-cp file processing.
-        Err(StorageError::fatal("test stub: no history"))
-    }
-
-    async fn process_buffer(
+    async fn process_history(
         &self,
         _path: &str,
-        _buffer: Buffer,
-    ) -> Result<ProcessOutcome, StorageError> {
-        // Not invoked because `fetch_history_buffer` always fails.
-        Ok(ProcessOutcome::Processed)
+        _src_store: &StorageRef,
+    ) -> Result<HistoryOutcome, StorageError> {
+        // Fatal so `with_retries` returns immediately; the pipeline records the
+        // HISTORY failure and per-cp file processing still runs via process_object.
+        Err(StorageError::fatal("test stub: no history"))
     }
 }
 

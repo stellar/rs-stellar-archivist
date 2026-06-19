@@ -30,13 +30,13 @@
 use crate::history_format;
 use crate::mirror_operation::MirrorOperation;
 use crate::pipeline::{
-    self, async_trait, HistoryFetch, Operation, Pipeline, PipelineConfig, ProcessOutcome,
+    self, async_trait, HistoryOutcome, Operation, Pipeline, PipelineConfig, ProcessOutcome,
 };
 use crate::storage::{self, Error as StorageError, ErrorClass, StorageRef};
 use crate::utils::{self, ArchiveStats, FailureTracker};
 use crate::xdr_verify::{self, XdrParseResult, XdrVerificationManager};
 use futures_util::{stream, StreamExt};
-use opendal::{Buffer, Reader};
+use opendal::Reader;
 use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 use tracing::{error, info, warn};
@@ -669,35 +669,54 @@ impl Operation for RepairOperation {
         Ok(ProcessOutcome::Processed)
     }
 
-    /// Override history buffer sourcing: read from destination first, fall back to source.
-    async fn fetch_history_buffer(
+    /// Process the history file: probe the destination first (a valid copy is
+    /// kept as-is, with NO write — symmetric with `verify_and_record_dst`), and
+    /// fetch from source only when the dst copy is missing/corrupt or the file
+    /// is on the known-broken list. Returns the parsed state so the pipeline can
+    /// walk bucket references.
+    async fn process_history(
         &self,
-        history_path: &str,
+        path: &str,
         src_store: &StorageRef,
-        dst_store: Option<&StorageRef>,
-    ) -> Result<HistoryFetch, StorageError> {
-        // Try reading from destination (local, cheap)
-        if let Some(dst) = dst_store {
-            if let Ok(buffer) = storage::download_buffer(dst, history_path).await {
-                if history_format::parse_history(&buffer, history_path).is_ok() {
-                    return Ok(HistoryFetch::Available(buffer));
+    ) -> Result<HistoryOutcome, StorageError> {
+        // Failed-list mode: a listed file is fetched from source directly (no dst
+        // probe), honoring `known_broken` exactly as verify_and_record_dst does.
+        let listed = self
+            .known_broken
+            .as_ref()
+            .is_some_and(|kb| kb.contains_path(path));
+
+        if !listed {
+            if let Ok(buffer) = storage::download_buffer(&self.dst_store, path).await {
+                if let Ok(state) = history_format::parse_history(&buffer, path) {
+                    // Healthy dst copy: keep it, do not write.
+                    return Ok(HistoryOutcome {
+                        outcome: ProcessOutcome::Processed,
+                        state: Some(state),
+                    });
                 }
-                // Exists but corrupt — fall through to source
+                // present but corrupt -> fall through and repair
             }
         }
 
-        // Destination missing or corrupt.
+        // Destination missing/corrupt, or this file is on the known-broken list.
         if self.dry_run {
-            // Signal "needs repair": the pipeline records the HISTORY failure and
-            // skips bucket discovery. No src fetch — the actual repair re-fetches
-            // history and its buckets together via process_history_and_buckets.
-            return Ok(HistoryFetch::NeedsRepair);
+            // Report needs-repair; never fetch or write under dry-run.
+            return Ok(HistoryOutcome {
+                outcome: ProcessOutcome::NeedsRepair,
+                state: None,
+            });
         }
 
-        // Download from source (pipeline will write to dst via process_buffer)
-        Ok(HistoryFetch::Available(
-            storage::download_buffer(src_store, history_path).await?,
-        ))
+        // Fetch from source, parse (before writing), then write to destination.
+        let buffer = storage::download_buffer(src_store, path).await?;
+        let state = history_format::parse_history(&buffer, path)
+            .map_err(|e| StorageError::fatal(format!("failed to parse history {path}: {e}")))?;
+        storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await?;
+        Ok(HistoryOutcome {
+            outcome: ProcessOutcome::Processed,
+            state: Some(state),
+        })
     }
 
     async fn finalize(
@@ -791,19 +810,4 @@ impl Operation for RepairOperation {
         Ok(())
     }
 
-    /// Repair writes the history buffer to its own dst. In dry-run mode the
-    /// write is skipped but the file is still reported as `Processed` (the
-    /// pipeline records it as a success — matching how repair's `process_object`
-    /// reports its dry-run no-op branches).
-    async fn process_buffer(
-        &self,
-        path: &str,
-        buffer: Buffer,
-    ) -> Result<ProcessOutcome, StorageError> {
-        if self.dry_run {
-            return Ok(ProcessOutcome::Processed);
-        }
-        storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await?;
-        Ok(ProcessOutcome::Processed)
-    }
 }

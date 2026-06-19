@@ -1,11 +1,10 @@
 //! Mirror operation - copies files from source to destination
 
 use crate::history_format;
-use crate::pipeline::{async_trait, Operation, PipelineConfig, ProcessOutcome};
+use crate::pipeline::{async_trait, HistoryOutcome, Operation, PipelineConfig, ProcessOutcome};
 use crate::storage::{self, Error as StorageError, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
-use opendal::Buffer;
 use thiserror::Error;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
@@ -409,13 +408,37 @@ impl Operation for MirrorOperation {
         Ok(())
     }
 
-    /// Mirror writes the history buffer to its own dst.
-    async fn process_buffer(
+    /// Copy the history file from source to destination, parsing it for bucket
+    /// discovery. Symmetric with `process_object`: when `--overwrite` is off and
+    /// the destination already holds a valid copy, keep it (`Skipped`) and walk
+    /// its buckets; otherwise fetch from source, parse (before writing), write,
+    /// and report `Processed`.
+    async fn process_history(
         &self,
         path: &str,
-        buffer: Buffer,
-    ) -> Result<ProcessOutcome, StorageError> {
+        src_store: &StorageRef,
+    ) -> Result<HistoryOutcome, StorageError> {
+        // Symmetric with process_object's `exists && !overwrite => Skipped`.
+        if !self.overwrite {
+            if let Ok(buffer) = storage::download_buffer(&self.dst_store, path).await {
+                if let Ok(state) = history_format::parse_history(&buffer, path) {
+                    return Ok(HistoryOutcome {
+                        outcome: ProcessOutcome::Skipped,
+                        state: Some(state),
+                    });
+                }
+                // present but unparseable -> fall through and re-fetch from source
+            }
+        }
+
+        let buffer = storage::download_buffer(src_store, path).await?;
+        // Parse-before-write: never commit an unparseable HAS to the destination.
+        let state = history_format::parse_history(&buffer, path)
+            .map_err(|e| StorageError::fatal(format!("failed to parse history {path}: {e}")))?;
         storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await?;
-        Ok(ProcessOutcome::Processed)
+        Ok(HistoryOutcome {
+            outcome: ProcessOutcome::Processed,
+            state: Some(state),
+        })
     }
 }

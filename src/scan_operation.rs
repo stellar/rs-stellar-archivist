@@ -1,9 +1,8 @@
 use crate::history_format;
-use crate::pipeline::{async_trait, Operation, PipelineConfig, ProcessOutcome};
+use crate::pipeline::{async_trait, HistoryOutcome, Operation, PipelineConfig, ProcessOutcome};
 use crate::storage::{from_opendal_error, Error as StorageError, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
-use opendal::Buffer;
 use opendal::Reader;
 use thiserror::Error;
 use tracing::error;
@@ -157,12 +156,19 @@ impl Operation for ScanOperation {
         Ok(())
     }
 
-    /// Scan never writes — return `Processed` and let the pipeline record it.
-    async fn process_buffer(
+    /// Scan reads the history file from the source and parses it for bucket
+    /// discovery; it never writes.
+    async fn process_history(
         &self,
-        _path: &str,
-        _buffer: Buffer,
-    ) -> Result<ProcessOutcome, StorageError> {
-        Ok(ProcessOutcome::Processed)
+        path: &str,
+        src_store: &StorageRef,
+    ) -> Result<HistoryOutcome, StorageError> {
+        let buffer = crate::storage::download_buffer(src_store, path).await?;
+        let state = crate::history_format::parse_history(&buffer, path)
+            .map_err(|e| StorageError::fatal(format!("failed to parse history {path}: {e}")))?;
+        Ok(HistoryOutcome {
+            outcome: ProcessOutcome::Processed,
+            state: Some(state),
+        })
     }
 }

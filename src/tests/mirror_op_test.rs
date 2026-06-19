@@ -1123,3 +1123,86 @@ async fn test_mirror_report_summary_on_success() {
     assert!(summary.succeeded > 0, "mirror copied files");
     assert!(report.section.files.is_empty() && report.section.buckets.is_empty());
 }
+
+#[tokio::test]
+async fn test_mirror_no_overwrite_skips_existing_history() {
+    use super::utils::get_files_by_pattern;
+
+    let src_url = file_url_from_path(&testnet_small_archive_path());
+    let dest_dir = TempDir::new().unwrap();
+    let dest_url = file_url_from_path(dest_dir.path());
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("initial mirror should succeed");
+
+    // Record mtimes of all per-checkpoint history files.
+    let history_files: Vec<_> = get_files_by_pattern(dest_dir.path(), "/history-")
+        .into_iter()
+        .filter(|p| !p.to_string_lossy().contains(".well-known"))
+        .collect();
+    assert!(!history_files.is_empty());
+    let before: Vec<_> = history_files
+        .iter()
+        .map(|p| (p.clone(), std::fs::metadata(p).unwrap().modified().unwrap()))
+        .collect();
+
+    // Delete .well-known so the re-mirror reprocesses every checkpoint in range
+    // (without --overwrite). Existing valid files must be skipped, not rewritten.
+    std::fs::remove_file(dest_dir.path().join(".well-known/stellar-history.json")).unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("re-mirror should succeed");
+
+    for (path, before_mtime) in &before {
+        let after_mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+        assert_eq!(
+            *before_mtime, after_mtime,
+            "history file {} must not be rewritten on a no-overwrite re-mirror",
+            path.display()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_mirror_no_overwrite_replaces_broken_history() {
+    use super::utils::get_files_by_pattern;
+
+    let src_path = testnet_small_archive_path();
+    let src_url = file_url_from_path(&src_path);
+    let dest_dir = TempDir::new().unwrap();
+    let dest_url = file_url_from_path(dest_dir.path());
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("initial mirror should succeed");
+
+    // Corrupt a per-checkpoint history file on the destination (still present,
+    // but unparseable) and capture the canonical source bytes.
+    let history_file = get_files_by_pattern(dest_dir.path(), "/history-")
+        .into_iter()
+        .find(|p| !p.to_string_lossy().contains(".well-known"))
+        .expect("a per-checkpoint history file");
+    let rel = history_file
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_path_buf();
+    let source_content = std::fs::read(src_path.join(&rel)).unwrap();
+    std::fs::write(&history_file, b"{ broken json }}").unwrap();
+
+    // Delete .well-known so the re-mirror reprocesses every checkpoint in range
+    // (without --overwrite). The broken history must NOT be skipped.
+    std::fs::remove_file(dest_dir.path().join(".well-known/stellar-history.json")).unwrap();
+
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("re-mirror should succeed");
+
+    // The broken history must have been replaced with the source content.
+    assert_eq!(
+        std::fs::read(&history_file).unwrap(),
+        source_content,
+        "broken destination history must be replaced from source"
+    );
+}
