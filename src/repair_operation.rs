@@ -433,6 +433,11 @@ impl RepairOperation {
         // File-retry runs in failed-list mode: every listed file is fetched
         // from src directly (no dst probe); transitively discovered buckets are
         // validated on dst and re-fetched only if missing/invalid.
+        //
+        // HISTORY work re-walks its referenced buckets through the pipeline's
+        // bucket scheduler; direct bucket work enters that same scheduler via
+        // `process_bucket_file`. So a bucket listed directly AND referenced by a
+        // failed HISTORY is processed once per file-retry run (shared LRU gate).
         let file_retry_pipeline = self.build_file_retry_pipeline(known_broken);
         stream::iter(work.into_iter())
             .for_each_concurrent(self.pipeline_config.concurrency, |(cp, path)| {
@@ -440,6 +445,8 @@ impl RepairOperation {
                 async move {
                     if history_format::is_history_file(&path) {
                         pipeline.process_history_and_buckets(cp).await;
+                    } else if history_format::is_bucket_file(&path) {
+                        pipeline.process_bucket_file(cp, path).await;
                     } else {
                         pipeline.process_file(cp, path).await;
                     }
@@ -562,7 +569,9 @@ impl RepairOperation {
 /// never probed (the case where the history download itself failed before
 /// bucket refs were walked). Bucket entries are also kept unconditionally —
 /// they're content-addressed, not cp-keyed, and `retry_failed_files` is the
-/// only place that repairs `failures.buckets`.
+/// only place that repairs `failures.buckets`. Keeping a bucket here that a
+/// failed HISTORY also references no longer means double processing: both routes
+/// go through `Pipeline::process_bucket_file`, which dedupes on the bucket hash.
 fn build_failed_files_work_list(failures: &FailureTracker) -> Vec<(u32, String)> {
     let mut work = Vec::new();
 

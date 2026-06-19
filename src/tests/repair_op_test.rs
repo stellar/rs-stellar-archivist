@@ -1355,6 +1355,90 @@ async fn test_file_retry_history_repair_fetches_history_and_referenced_buckets()
     );
 }
 
+/// A bucket listed directly in `failures.buckets` AND referenced by a failed
+/// HISTORY must be fetched from source exactly once during file-retry — the
+/// direct work item and the HISTORY-discovered sighting must share the bucket
+/// scheduling gate. Counts GET requests only (HEAD probes are irrelevant).
+#[tokio::test]
+async fn test_file_retry_dedupes_bucket_listed_directly_and_via_history() {
+    use super::utils::{start_http_server_with_app, RequestTracker};
+    use axum::{
+        body::Body,
+        http::{Method, Request, StatusCode},
+        response::IntoResponse,
+        routing::any,
+        Router,
+    };
+    use tower::util::ServiceExt;
+    use tower_http::services::ServeDir;
+
+    // Separate src and dst archives (both full copies of testnet-small).
+    let src_dir = TempDir::new().unwrap();
+    copy_testnet_small_archive(src_dir.path()).expect("copy src archive");
+    let dst_dir = TempDir::new().unwrap();
+    copy_testnet_small_archive(dst_dir.path()).expect("copy dst archive");
+
+    // Pick a HISTORY file and one bucket it references.
+    let (history_abs, cp, _hashes, bucket_abs) = pick_history_with_buckets(dst_dir.path());
+    let history_relative = history_abs
+        .strip_prefix(dst_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+    let bucket_relative = bucket_abs[0]
+        .strip_prefix(dst_dir.path())
+        .unwrap()
+        .to_string_lossy()
+        .replace('\\', "/");
+
+    // Break both on dst so the retry must fetch them from source.
+    std::fs::remove_file(&history_abs).expect("delete dst history");
+    std::fs::remove_file(&bucket_abs[0]).expect("delete dst bucket");
+
+    // Serve src over HTTP, counting GET requests per path.
+    let tracker = RequestTracker::new();
+    let tracker_for_app = tracker.clone();
+    let serve = ServeDir::new(src_dir.path());
+    let app = Router::new().fallback(any(move |req: Request<Body>| {
+        let serve = serve.clone();
+        let tracker = tracker_for_app.clone();
+        async move {
+            if req.method() == Method::GET {
+                tracker.increment(req.uri().path().trim_start_matches('/'));
+            }
+            match serve.oneshot(req).await {
+                Ok(resp) => resp.into_response(),
+                Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+            }
+        }
+    }));
+    let (src_url, _handle) = start_http_server_with_app(app).await;
+    let dst_url = file_url_from_path(dst_dir.path());
+
+    // Plan lists BOTH the failed HISTORY and the same bucket directly.
+    let op = build_repair_op(&src_url, &dst_url, /*verify=*/ false);
+    let parent_stats = crate::utils::ArchiveStats::new();
+    parent_stats.record_failure(cp, &history_relative).await;
+    parent_stats.record_failure(0, &bucket_relative).await;
+
+    let stats = op.retry_failed_files(&parent_stats).await;
+
+    // The chosen bucket must have been GETed from source exactly once.
+    let counts = tracker.get_counts();
+    let bucket_gets = counts.get(&bucket_relative).copied().unwrap_or(0);
+    assert_eq!(
+        bucket_gets, 1,
+        "bucket listed directly AND via HISTORY must be fetched once; counts={counts:?}"
+    );
+
+    // Both files restored; retry stats clean.
+    assert!(history_abs.exists(), "history restored");
+    assert!(bucket_abs[0].exists(), "bucket restored");
+    let f = stats.failures.lock().await;
+    assert!(!f.files.contains_key(&cp), "HISTORY flag cleared");
+    assert!(f.buckets.is_empty(), "no bucket failures remain");
+}
+
 /// History was failed (manually marked) but its referenced buckets are already
 /// present and valid in dst. The HISTORY-retry path re-fetches the history file,
 /// then probes each discovered bucket dst-first and finds them valid — so they

@@ -17,7 +17,7 @@ use futures_util::{
 use lru::LruCache;
 use std::sync::Mutex;
 use thiserror::Error;
-use tracing::{debug, info};
+use tracing::{debug, error, info};
 
 /// Pipeline errors
 #[derive(Error, Debug)]
@@ -382,28 +382,51 @@ impl<Op: Operation> Pipeline<Op> {
         }
     }
 
-    /// Process every bucket referenced by `state`, deduped against the
-    /// pipeline-wide `bucket_lru`. The lock is held only across the filter-map
-    /// → collect (CPU-only — `LruCache::put` returns `None` iff the key is
-    /// new); each surviving `process_file` future then runs concurrently
-    /// outside the lock.
-    async fn process_buckets(&self, checkpoint: u32, state: HistoryFileState) {
-        let bucket_futures: Vec<_> = {
-            let mut cache = self.bucket_lru.lock().unwrap();
-            state
-                .buckets()
-                .iter()
-                .filter_map(|bucket| {
-                    if cache.put(bucket.clone(), ()).is_none() {
-                        bucket_path(bucket)
-                            .ok()
-                            .map(|path| self.process_file(checkpoint, path))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+    /// Schedule one bucket file through the shared dedupe gate. Both bucket
+    /// routes funnel here: HISTORY-discovered buckets (via `process_buckets`)
+    /// and buckets listed directly in `failures.buckets` (repair file-retry).
+    /// The pipeline-wide `bucket_lru` makes the first sighting of a
+    /// content-addressed bucket responsible for processing it; later sightings
+    /// in the same run are skipped (without recording a `Skipped` stat, matching
+    /// the prior `process_buckets` dedupe accounting).
+    ///
+    /// `bucket_hash_from_path` canonicalizes to lowercase 64-hex, so a bucket
+    /// reached as a HISTORY ref (hash → path → here) and one listed directly
+    /// (`hex::encode` → path → here) produce the SAME LRU key and dedupe — do
+    /// not drop this normalization in favor of keying on the raw path.
+    pub(crate) async fn process_bucket_file(&self, checkpoint: u32, path: String) {
+        // Invariant: callers only pass real bucket paths — `process_buckets`
+        // builds them via `bucket_path`, and repair's dispatch guards with
+        // `is_bucket_file` (which requires `bucket_hash_from_path` to be `Some`).
+        // A missing hash here is a routing bug, not a runtime condition.
+        let Some(bucket_hash) = history_format::bucket_hash_from_path(&path) else {
+            debug_assert!(false, "process_bucket_file requires a bucket path, got {path}");
+            error!("process_bucket_file got a non-bucket path, skipping: {path}");
+            return;
         };
+
+        // First sighting of this content-addressed bucket in the run? Scope the
+        // LRU guard so it is released before the await below.
+        let first_sighting = {
+            let mut cache = self.bucket_lru.lock().unwrap();
+            cache.put(bucket_hash, ()).is_none()
+        };
+        if first_sighting {
+            self.process_file(checkpoint, path).await;
+        } else {
+            debug!("Skipped duplicate bucket sighting: {}", path);
+        }
+    }
+
+    /// Expand a parsed HAS into bucket work, scheduling each referenced bucket
+    /// through [`Self::process_bucket_file`] (which owns the dedupe LRU gate).
+    async fn process_buckets(&self, checkpoint: u32, state: HistoryFileState) {
+        let bucket_futures: Vec<_> = state
+            .buckets()
+            .iter()
+            .filter_map(|bucket| bucket_path(bucket).ok())
+            .map(|path| self.process_bucket_file(checkpoint, path))
+            .collect();
 
         join_all(bucket_futures).await;
     }
