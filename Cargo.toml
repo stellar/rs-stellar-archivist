@@ -48,7 +48,7 @@ futures-util = { version = "0.3" }
 url = { version = "2.5" }
 async-trait = "0.1"
 tokio-util = { version = "0.7.16", features = ["compat", "io"] }
-lru = { version = "0.12" }
+lru = { version = "0.16" }
 opendal = { version = "0.55", default-features = false, features = ["services-fs", "services-http", "layers-throttle"] }
 bytes = { version = "1" }
 futures-io = { version = "0.3" }
