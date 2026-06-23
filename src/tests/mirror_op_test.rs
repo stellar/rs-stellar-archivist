@@ -192,6 +192,7 @@ async fn test_mirror_full_archive() {
     let src_url = file_url_from_path(&test_archive_path);
 
     let mirror_config = MirrorConfig {
+        report_path: None,
         src: src_url,
         dst: mirror_dest_url.clone(),
         concurrency: 20,
@@ -208,6 +209,7 @@ async fn test_mirror_full_archive() {
 
     // Verify with scan
     run_scan(ScanConfig {
+        report_path: None,
         archive: mirror_dest_url,
         concurrency: 4,
         skip_optional: false,
@@ -243,6 +245,7 @@ async fn test_mirror_bounded() {
     let src_url = file_url_from_path(&test_archive_path);
 
     let mirror_config = MirrorConfig {
+        report_path: None,
         src: src_url,
         dst: mirror_dest_url.clone(),
         concurrency: 20,
@@ -261,6 +264,7 @@ async fn test_mirror_bounded() {
 
     // Verify with scan
     run_scan(ScanConfig {
+        report_path: None,
         archive: mirror_dest_url,
         concurrency: 4,
         skip_optional: false,
@@ -295,6 +299,7 @@ async fn test_mirror_skip_optional() {
     let src_url = file_url_from_path(&test_archive_path);
 
     let mirror_config = MirrorConfig {
+        report_path: None,
         src: src_url,
         dst: mirror_dest_url.clone(),
         concurrency: 4,
@@ -316,6 +321,7 @@ async fn test_mirror_skip_optional() {
 
     // Verify with scan (must also skip optional)
     run_scan(ScanConfig {
+        report_path: None,
         archive: mirror_dest_url,
         concurrency: 4,
         skip_optional: true,
@@ -816,6 +822,7 @@ async fn test_mirror_http_to_filesystem() {
 
     // Mirror from HTTP to filesystem
     let mirror_config = MirrorConfig {
+        report_path: None,
         src: server_url.clone(),
         dst: mirror_dest_url.clone(),
         concurrency: 4,
@@ -835,6 +842,7 @@ async fn test_mirror_http_to_filesystem() {
 
     // Verify the mirrored archive
     let scan_config = ScanConfig {
+        report_path: None,
         archive: mirror_dest_url,
         concurrency: 4,
         skip_optional: false,
@@ -912,6 +920,7 @@ async fn test_mirror_race_condition_with_advancing_archive() {
     let mirror_dest_url = file_url_from_path(temp_dest.path());
 
     let mirror_config = MirrorConfig {
+        report_path: None,
         src: server_url.clone(),
         dst: mirror_dest_url,
         concurrency: 4,
@@ -1030,5 +1039,172 @@ async fn test_mirror_verify_does_not_advance_well_known_on_verification_failure(
         after_ledger, baseline_ledger,
         ".well-known should still be at checkpoint {} after verification failure, but was at {}",
         baseline_ledger, after_ledger
+    );
+}
+
+/// Mirror constructed with `update_well_known=false` must not write or advance
+/// the destination's `.well-known/stellar-history.json` even when it successfully
+/// mirrors checkpoint data. This is the contract repair's retry pipeline relies
+/// on: re-mirroring a disjoint subset of cps must not advertise partial coverage
+/// in the dst archive.
+#[tokio::test]
+async fn test_mirror_with_update_well_known_false_does_not_touch_well_known() {
+    use crate::mirror_operation::MirrorOperation;
+    use crate::pipeline::{Pipeline, PipelineConfig};
+    use crate::storage::from_url_with_config;
+
+    let src_archive = testnet_small_archive_path();
+    let src_url = file_url_from_path(&src_archive);
+
+    let temp_dir = TempDir::new().unwrap();
+    let dest_path = temp_dir.path().join("mirror_dest");
+    let dst_url = file_url_from_path(&dest_path);
+
+    let storage_config = test_storage_config();
+    let src_store = from_url_with_config(&src_url, &storage_config).unwrap();
+    let dst_store = from_url_with_config(&dst_url, &storage_config).unwrap();
+
+    let pipeline_config = PipelineConfig {
+        concurrency: 4,
+        skip_optional: true,
+        skip_history_and_buckets: false,
+        verify: false,
+        storage_config: storage_config.clone(),
+    };
+
+    let mirror_op = MirrorOperation::new(
+        src_store,
+        dst_store,
+        /*overwrite=*/ true,
+        Some(64),
+        Some(127),
+        /*allow_mirror_gaps=*/ true,
+        pipeline_config.clone(),
+        /*update_well_known=*/ false,
+    );
+
+    let pipeline = Pipeline::new(mirror_op, pipeline_config, None);
+
+    pipeline.run().await.expect("Mirror should succeed");
+
+    // At least one per-cp file must have been copied (proves the mirror actually ran).
+    let ledger_files: Vec<_> = WalkDir::new(&dest_path)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter(|e| e.file_type().is_file() && e.path().to_string_lossy().contains("ledger-"))
+        .collect();
+    assert!(
+        !ledger_files.is_empty(),
+        "expected ledger files to be mirrored to dst"
+    );
+
+    // But the .well-known file must NOT have been created.
+    let wellknown = dest_path.join(".well-known/stellar-history.json");
+    assert!(
+        !wellknown.exists(),
+        ".well-known should not be created when update_well_known=false"
+    );
+}
+
+#[tokio::test]
+async fn test_mirror_report_summary_on_success() {
+    use super::utils::{file_url_from_path, testnet_small_archive_path};
+    let src_url = file_url_from_path(&testnet_small_archive_path());
+    let dir = TempDir::new().unwrap();
+    let dst_url = file_url_from_path(dir.path());
+    let report_path = dir.path().join("mirror-report.json");
+
+    run_mirror(MirrorConfig::new(&src_url, &dst_url).report(&report_path))
+        .await
+        .expect("mirror should succeed");
+
+    let report = crate::report::read_from_path(&report_path).unwrap();
+    let summary = report.section.summary;
+    assert_eq!(summary.failed, 0, "clean mirror has no failures");
+    assert!(summary.succeeded > 0, "mirror copied files");
+    assert!(report.section.files.is_empty() && report.section.buckets.is_empty());
+}
+
+#[tokio::test]
+async fn test_mirror_no_overwrite_skips_existing_history() {
+    use super::utils::get_files_by_pattern;
+
+    let src_url = file_url_from_path(&testnet_small_archive_path());
+    let dest_dir = TempDir::new().unwrap();
+    let dest_url = file_url_from_path(dest_dir.path());
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("initial mirror should succeed");
+
+    // Record mtimes of all per-checkpoint history files.
+    let history_files: Vec<_> = get_files_by_pattern(dest_dir.path(), "/history-")
+        .into_iter()
+        .filter(|p| !p.to_string_lossy().contains(".well-known"))
+        .collect();
+    assert!(!history_files.is_empty());
+    let before: Vec<_> = history_files
+        .iter()
+        .map(|p| (p.clone(), std::fs::metadata(p).unwrap().modified().unwrap()))
+        .collect();
+
+    // Delete .well-known so the re-mirror reprocesses every checkpoint in range
+    // (without --overwrite). Existing valid files must be skipped, not rewritten.
+    std::fs::remove_file(dest_dir.path().join(".well-known/stellar-history.json")).unwrap();
+
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("re-mirror should succeed");
+
+    for (path, before_mtime) in &before {
+        let after_mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+        assert_eq!(
+            *before_mtime,
+            after_mtime,
+            "history file {} must not be rewritten on a no-overwrite re-mirror",
+            path.display()
+        );
+    }
+}
+
+#[tokio::test]
+async fn test_mirror_no_overwrite_replaces_broken_history() {
+    use super::utils::get_files_by_pattern;
+
+    let src_path = testnet_small_archive_path();
+    let src_url = file_url_from_path(&src_path);
+    let dest_dir = TempDir::new().unwrap();
+    let dest_url = file_url_from_path(dest_dir.path());
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("initial mirror should succeed");
+
+    // Corrupt a per-checkpoint history file on the destination (still present,
+    // but unparseable) and capture the canonical source bytes.
+    let history_file = get_files_by_pattern(dest_dir.path(), "/history-")
+        .into_iter()
+        .find(|p| !p.to_string_lossy().contains(".well-known"))
+        .expect("a per-checkpoint history file");
+    let rel = history_file
+        .strip_prefix(dest_dir.path())
+        .unwrap()
+        .to_path_buf();
+    let source_content = std::fs::read(src_path.join(&rel)).unwrap();
+    std::fs::write(&history_file, b"{ broken json }}").unwrap();
+
+    // Delete .well-known so the re-mirror reprocesses every checkpoint in range
+    // (without --overwrite). The broken history must NOT be skipped.
+    std::fs::remove_file(dest_dir.path().join(".well-known/stellar-history.json")).unwrap();
+
+    run_mirror(MirrorConfig::new(&src_url, &dest_url))
+        .await
+        .expect("re-mirror should succeed");
+
+    // The broken history must have been replaced with the source content.
+    assert_eq!(
+        std::fs::read(&history_file).unwrap(),
+        source_content,
+        "broken destination history must be replaced from source"
     );
 }

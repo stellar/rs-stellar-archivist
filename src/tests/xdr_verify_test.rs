@@ -4,7 +4,7 @@ use crate::xdr_verify::{
     compute_v1_tx_set_hash, expected_ledger_range, is_empty_tx_set_hash,
     parse_ledger_header_entries_for_checkpoint, parse_result_entries_for_checkpoint,
     parse_scp_entries, parse_transaction_entries_for_checkpoint, LedgerHeaderVerificationData,
-    XdrVerificationManager, EMPTY_XDR_ARRAY_HASH,
+    VerificationErrorType, XdrVerificationManager, EMPTY_XDR_ARRAY_HASH,
 };
 use rstest::rstest;
 use sha2::{Digest, Sha256};
@@ -557,10 +557,10 @@ fn test_chain_break_within_ledger_file(#[case] checkpoint: u32, #[case] corrupte
     manager.record_header_data(checkpoint, header_data);
     manager.verify_and_release(checkpoint);
 
-    assert!(manager
-        .get_errors()
-        .iter()
-        .any(|e| e.ledger_seq == Some(corrupted_ledger) && e.message.contains("hash chain break")),);
+    assert!(manager.get_errors().iter().any(|e| matches!(
+        e.kind,
+        VerificationErrorType::Ledger(seq) if seq == corrupted_ledger
+    ) && e.message.contains("hash chain break")));
 }
 
 #[rstest]
@@ -633,11 +633,13 @@ fn test_cross_checkpoint_chain(#[case] break_chain: bool) {
     manager.verify_and_release(63);
     manager.verify_and_release(127);
 
-    let chain_errors = manager.verify_checkpoint_chain();
+    let errors_before_chain = manager.get_errors().len();
+    manager.verify_checkpoint_chain();
+    let chain_errors_added = manager.get_errors().len() - errors_before_chain;
     if break_chain {
-        assert_eq!(chain_errors.len(), 1);
+        assert_eq!(chain_errors_added, 1);
     } else {
-        assert!(chain_errors.is_empty());
+        assert_eq!(chain_errors_added, 0);
     }
 }
 
@@ -675,11 +677,11 @@ fn test_consecutive_checkpoints_full(#[case] break_chain: bool) {
     manager.verify_and_release(127);
 
     assert!(manager.get_errors().is_empty());
-    let chain_errors = manager.verify_checkpoint_chain();
+    manager.verify_checkpoint_chain();
     if break_chain {
-        assert!(!chain_errors.is_empty());
+        assert!(!manager.get_errors().is_empty());
     } else {
-        assert!(chain_errors.is_empty());
+        assert!(manager.get_errors().is_empty());
     }
 }
 
@@ -692,7 +694,8 @@ fn test_non_consecutive_checkpoint_scanning() {
     manager.verify_and_release(191);
 
     assert!(manager.get_errors().is_empty());
-    assert!(manager.verify_checkpoint_chain().is_empty());
+    manager.verify_checkpoint_chain();
+    assert!(manager.get_errors().is_empty());
 }
 
 #[test]
@@ -705,9 +708,9 @@ fn test_cross_checkpoint_missing_last_ledger_breaks_chain() {
     manager.record_header_data(127, create_complete_checkpoint_data(127, [0; 32]));
     manager.verify_and_release(63);
     manager.verify_and_release(127);
+    manager.verify_checkpoint_chain();
 
-    let total_errors = manager.get_errors().len() + manager.verify_checkpoint_chain().len();
-    assert!(total_errors > 0);
+    assert!(!manager.get_errors().is_empty());
 }
 
 #[test]
@@ -762,14 +765,16 @@ fn test_verify_checkpoint_chain_with_three_consecutive_checkpoints() {
     manager.verify_and_release(63);
     manager.verify_and_release(127);
     manager.verify_and_release(191);
+    manager.verify_checkpoint_chain();
 
-    assert!(manager.verify_checkpoint_chain().is_empty());
+    assert!(manager.get_errors().is_empty());
 }
 
 #[test]
 fn test_verify_checkpoint_chain_empty_manager() {
     let manager = XdrVerificationManager::new();
-    assert!(manager.verify_checkpoint_chain().is_empty());
+    manager.verify_checkpoint_chain();
+    assert!(manager.get_errors().is_empty());
 }
 
 #[test]
@@ -932,4 +937,106 @@ fn test_parse_rejects_ledger_outside_checkpoint_range(#[case] file_type: &str) {
         _ => unreachable!(),
     };
     assert!(err.message.contains("outside expected checkpoint range"));
+}
+
+//=============================================================================
+// record_all_errors — drains manager errors into ArchiveStats.failures.checkpoints
+//=============================================================================
+
+#[test]
+fn test_record_all_errors_empty_manager_is_noop() {
+    let manager = XdrVerificationManager::new();
+    let mut failures = crate::utils::FailureTracker::default();
+
+    manager.drain_all_errors(&mut failures);
+
+    assert!(failures.is_empty());
+    assert!(failures.checkpoints.is_empty());
+    assert!(failures.files.is_empty());
+    assert!(failures.buckets.is_empty());
+    assert!(failures.well_known.is_none());
+}
+
+#[test]
+fn test_record_all_errors_drains_each_variant() {
+    let manager = XdrVerificationManager::new();
+
+    // Trigger a `Checkpoint(cp)` error via a completeness failure.
+    manager.record_header_data(127, create_checkpoint_data_missing(127, &[100]));
+    manager.verify_and_release(127);
+
+    // Trigger a `Ledger(seq)` error via an internal chain break.
+    let mut chain_break_data = create_complete_checkpoint_data(191, [0; 32]);
+    chain_break_data.get_mut(&150).unwrap().prev_hash = Hash([0xff; 32]);
+    manager.record_header_data(191, chain_break_data);
+    manager.verify_and_release(191);
+
+    // Sanity: manager has accumulated errors.
+    assert!(!manager.get_errors().is_empty());
+
+    let mut failures = crate::utils::FailureTracker::default();
+    manager.drain_all_errors(&mut failures);
+
+    // Checkpoint(127) → cp 127.
+    assert!(failures.checkpoints.contains(&127));
+    // Ledger(150) → round_to_upper_checkpoint(150) = 191.
+    assert!(failures.checkpoints.contains(&191));
+    // Nothing should land in files/buckets/well_known — all manager errors are
+    // cp-level cross-file/chain inconsistencies.
+    assert!(failures.files.is_empty());
+    assert!(failures.buckets.is_empty());
+    assert!(failures.well_known.is_none());
+}
+
+#[test]
+fn test_record_all_errors_boundary_inserts_both_cps() {
+    let manager = XdrVerificationManager::new();
+
+    // Build two adjacent cps (127 and 191) where the boundary hash chain
+    // breaks: cp 127 ends with one computed hash, cp 191's first prev_hash
+    // doesn't match.
+    let data_127 = create_complete_checkpoint_data(127, [0; 32]);
+    manager.record_header_data(127, data_127);
+    manager.verify_and_release(127);
+
+    // cp 191's first ledger (128) has prev_hash that won't match cp 127's last
+    // computed_hash.
+    let mut data_191 = create_complete_checkpoint_data(191, [0xab; 32]);
+    // Make the internal chain self-consistent but mismatched with cp 127.
+    let mut prev_hash = [0xab; 32];
+    for (seq, entry) in &mut data_191 {
+        entry.prev_hash = Hash(prev_hash);
+        prev_hash = entry.computed_hash.0;
+        let _ = seq;
+    }
+    manager.record_header_data(191, data_191);
+    manager.verify_and_release(191);
+
+    manager.verify_checkpoint_chain();
+
+    let mut failures = crate::utils::FailureTracker::default();
+    manager.drain_all_errors(&mut failures);
+
+    // Boundary(191) records both 191 and 191-64=127.
+    assert!(failures.checkpoints.contains(&191));
+    assert!(failures.checkpoints.contains(&127));
+}
+
+#[test]
+fn test_record_all_errors_idempotent() {
+    let manager = XdrVerificationManager::new();
+    manager.record_header_data(127, create_checkpoint_data_missing(127, &[100]));
+    manager.verify_and_release(127);
+
+    let mut failures = crate::utils::FailureTracker::default();
+    manager.drain_all_errors(&mut failures);
+    let cps_after_first = failures.checkpoints.clone();
+
+    // Calling again is a true no-op: the first call drained the manager's
+    // errors, so the second finds nothing to record and the set is unchanged.
+    manager.drain_all_errors(&mut failures);
+    let cps_after_second = failures.checkpoints.clone();
+
+    assert_eq!(cps_after_first, cps_after_second);
+    assert!(cps_after_first.contains(&127));
 }

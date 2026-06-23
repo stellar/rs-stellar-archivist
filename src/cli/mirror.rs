@@ -52,23 +52,26 @@ impl MirrorCmd {
             )));
         }
 
+        let pipeline_config = PipelineConfig {
+            concurrency: args.concurrency,
+            skip_optional: args.skip_optional,
+            skip_history_and_buckets: false,
+            verify: args.verify,
+            storage_config: args.storage_config,
+        };
+
         let operation = MirrorOperation::new(
-            dst_store.clone(),
+            src_store,
+            dst_store,
             self.overwrite,
             self.low,
             self.high,
             self.allow_mirror_gaps,
-            &args.storage_config,
-            args.verify,
+            pipeline_config.clone(),
+            /*update_well_known=*/ true,
         );
 
-        let pipeline_config = PipelineConfig {
-            concurrency: args.concurrency,
-            skip_optional: args.skip_optional,
-            storage_config: args.storage_config,
-        };
-
-        let pipeline = Pipeline::new(operation, pipeline_config, src_store, Some(dst_store));
+        let pipeline = Pipeline::new(operation, pipeline_config, args.report_path);
 
         pipeline.run().await.map_err(utils::map_pipeline_error)?;
 

@@ -103,6 +103,10 @@ struct Cli {
     /// Verify SHA256 hash of bucket files by decompressing and hashing content
     #[arg(long, global = true)]
     verify: bool,
+
+    /// Write a JSON status report to this local path
+    #[arg(long, global = true)]
+    report: Option<std::path::PathBuf>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -122,6 +126,7 @@ pub struct GlobalArgs {
     pub skip_optional: bool,
     pub storage_config: StorageConfig,
     pub verify: bool,
+    pub report_path: Option<std::path::PathBuf>,
 }
 
 /// Run the CLI with the given arguments
@@ -167,6 +172,7 @@ where
             cli.atomic_file_writes,
         ),
         verify: cli.verify,
+        report_path: cli.report,
     };
 
     match cli.command {

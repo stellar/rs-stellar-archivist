@@ -1,14 +1,10 @@
 //! Mirror operation - copies files from source to destination
 
 use crate::history_format;
-use crate::pipeline::{async_trait, Operation};
-use crate::storage::cleanup_partial_file;
-use crate::storage::{self, Error as StorageError, StorageConfig, StorageRef};
+use crate::pipeline::{async_trait, HistoryOutcome, Operation, PipelineConfig, ProcessOutcome};
+use crate::storage::{self, Error as StorageError, StorageRef};
 use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
 use crate::xdr_verify::XdrVerificationManager;
-use opendal::Buffer;
-use opendal::Reader;
-use std::sync::Arc;
 use thiserror::Error;
 use tokio::sync::OnceCell;
 use tracing::{debug, error, info, warn};
@@ -37,9 +33,13 @@ pub enum Error {
 
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
+
+    #[error("Report error: {0}")]
+    Report(#[from] crate::report::ReportError),
 }
 
 pub struct MirrorOperation {
+    src_store: StorageRef,
     dst_store: StorageRef,
     overwrite: bool,
 
@@ -48,25 +48,31 @@ pub struct MirrorOperation {
     high: Option<u32>,
     allow_mirror_gaps: bool,
 
-    // Storage configuration (retry params for fetches live here)
-    storage_config: StorageConfig,
+    // Pipeline configuration (storage retry params + verify mode for the report)
+    pipeline_config: PipelineConfig,
 
     // Cached destination checkpoint at start of operation (or None if destination doesn't exist)
     initial_dest_checkpoint: OnceCell<Option<u32>>,
 
-    // Populated if we should verify files, otherwise None
-    verification_manager: Option<Arc<XdrVerificationManager>>,
+    // Whether finalize should update the destination's .well-known file with
+    // the highest mirrored checkpoint. The top-level mirror operation (driven
+    // by `Pipeline::run` over a contiguous range) sets this to true. Sub-uses
+    // such as repair's retry pipeline — which re-mirror a disjoint subset and
+    // therefore cannot claim a contiguous "now mirrored up to" — set it to
+    // false to avoid advertising partial coverage in the dst archive.
+    update_well_known: bool,
 }
 
 impl MirrorOperation {
     pub fn new(
+        src_store: StorageRef,
         dst_store: StorageRef,
         overwrite: bool,
         low: Option<u32>,
         high: Option<u32>,
         allow_mirror_gaps: bool,
-        storage_config: &StorageConfig,
-        verify: bool,
+        pipeline_config: PipelineConfig,
+        update_well_known: bool,
     ) -> Self {
         debug_assert!(
             dst_store.supports_writes(),
@@ -74,18 +80,15 @@ impl MirrorOperation {
         );
 
         Self {
+            src_store,
             dst_store,
             overwrite,
             low,
             high,
             allow_mirror_gaps,
-            storage_config: storage_config.clone(),
+            pipeline_config,
             initial_dest_checkpoint: OnceCell::new(),
-            verification_manager: if verify {
-                Some(Arc::new(XdrVerificationManager::new()))
-            } else {
-                None
-            },
+            update_well_known,
         }
     }
 
@@ -98,8 +101,11 @@ impl MirrorOperation {
                 // Try to read the destination's .well-known file
                 match fetch_well_known_history_file(
                     &self.dst_store,
-                    self.storage_config.max_retries as u32,
-                    self.storage_config.retry_min_delay.as_millis() as u64,
+                    self.pipeline_config.storage_config.max_retries as u32,
+                    self.pipeline_config
+                        .storage_config
+                        .retry_min_delay
+                        .as_millis() as u64,
                 )
                 .await
                 {
@@ -203,29 +209,11 @@ impl MirrorOperation {
 
         Ok(())
     }
-
-    async fn copy_file(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
-        match self.dst_store.copy_from_reader(path, reader).await {
-            Ok(()) => Ok(()),
-            Err(e) => {
-                cleanup_partial_file(&self.dst_store, path).await?;
-                Err(e)
-            }
-        }
-    }
-
-    fn checkpoint_from_verified_path(path: &str) -> Result<u32, StorageError> {
-        crate::history_format::checkpoint_from_path(path)
-            .ok_or_else(|| StorageError::fatal(format!("invalid checkpoint path: {}", path)))
-    }
 }
 
 #[async_trait]
 impl Operation for MirrorOperation {
-    async fn get_checkpoint_bounds(
-        &self,
-        source: &StorageRef,
-    ) -> Result<(u32, u32), crate::pipeline::Error> {
+    async fn get_checkpoint_bounds(&self) -> Result<(u32, u32), crate::pipeline::Error> {
         // Determine the effective low checkpoint based on destination .well-known/stellar-history.json and flags
         //
         // Starting ledger logic:
@@ -240,9 +228,12 @@ impl Operation for MirrorOperation {
 
         // First, get the source's latest checkpoint to know what's available
         let source_state = fetch_well_known_history_file(
-            source,
-            self.storage_config.max_retries as u32,
-            self.storage_config.retry_min_delay.as_millis() as u64,
+            &self.src_store,
+            self.pipeline_config.storage_config.max_retries as u32,
+            self.pipeline_config
+                .storage_config
+                .retry_min_delay
+                .as_millis() as u64,
         )
         .await
         .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
@@ -356,114 +347,56 @@ impl Operation for MirrorOperation {
             .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))
     }
 
-    async fn pre_check(&self, path: &str) -> Option<Result<(), StorageError>> {
-        // Check destination before querying source, skip if file already exists
-        match self.dst_store.exists(path).await {
-            Ok(true) => {
-                // If file exists and we're not overwriting, skip it
-                if !self.overwrite {
-                    return Some(Ok(()));
-                }
-                // Overwrite mode - proceed to download
-                None
-            }
-            Ok(false) => {
-                // File doesn't exist - proceed to download
-                None
-            }
-            Err(e) => {
-                // Failed to check existence on destination
-                Some(Err(StorageError::fatal(format!(
-                    "Failed to check existence of destination {path}: {e}"
-                ))))
-            }
+    async fn process_object(
+        &self,
+        path: &str,
+        manager: Option<&XdrVerificationManager>,
+    ) -> Result<ProcessOutcome, StorageError> {
+        // Skip if dst already has the file and we're not overwriting.
+        if self.dst_store.exists(path).await? && !self.overwrite {
+            return Ok(ProcessOutcome::Skipped);
         }
-    }
-
-    async fn process_object(&self, path: &str, src_store: &StorageRef) -> Result<(), StorageError> {
-        let reader = src_store.open_reader(path).await?;
-        if let Some(ref manager) = self.verification_manager {
-            if crate::history_format::is_bucket_file(path) {
-                match crate::verify::verify_and_write_bucket(path, reader, &self.dst_store).await {
-                    Ok(()) => Ok(()),
-                    Err(e) => {
-                        cleanup_partial_file(&self.dst_store, path).await?;
-                        Err(e)
-                    }
-                }
-            } else if crate::history_format::is_ledger_header_file(path)
-                || crate::history_format::is_transactions_file(path)
-                || crate::history_format::is_results_file(path)
-                || crate::history_format::is_scp_file(path)
-            {
-                use crate::xdr_verify::XdrParseResult;
-                let result =
-                    match crate::xdr_verify::verify_and_write_xdr(path, reader, &self.dst_store)
-                        .await
-                    {
-                        Ok(result) => result,
-                        Err(e) => {
-                            cleanup_partial_file(&self.dst_store, path).await?;
-                            return Err(e);
-                        }
-                    };
-
-                let checkpoint = if matches!(result, XdrParseResult::None) {
-                    None
-                } else {
-                    Some(Self::checkpoint_from_verified_path(path)?)
-                };
-                match result {
-                    XdrParseResult::Ledger(data) => {
-                        manager.record_header_data(checkpoint.unwrap(), data);
-                    }
-                    XdrParseResult::Transactions(hashes) => {
-                        manager.record_tx_set_hashes(checkpoint.unwrap(), hashes);
-                    }
-                    XdrParseResult::Results(hashes) => {
-                        manager.record_result_hashes(checkpoint.unwrap(), hashes);
-                    }
-                    XdrParseResult::None => {}
-                }
-                Ok(())
-            } else {
-                self.copy_file(path, reader).await
-            }
-        } else {
-            self.copy_file(path, reader).await
-        }
+        crate::xdr_verify::fetch_verify_and_write(&self.src_store, &self.dst_store, path, manager)
+            .await?;
+        Ok(ProcessOutcome::Processed)
     }
 
     async fn finalize(
         &self,
         highest_checkpoint: u32,
         stats: &ArchiveStats,
+        report_path: Option<&std::path::Path>,
     ) -> Result<(), crate::pipeline::Error> {
-        if let Some(ref manager) = self.verification_manager {
-            let chain_errors = manager.verify_checkpoint_chain();
-            for err in &chain_errors {
-                error!("Checkpoint {}: {}", err.checkpoint, err.message);
-                stats.record_failure("xdr-chain-verification").await;
-            }
-
-            let accumulated_errors = manager.get_errors();
-            for _ in &accumulated_errors {
-                stats.record_failure("xdr-cross-verification").await;
-            }
-
-            let total_errors = chain_errors.len() + accumulated_errors.len();
-            if total_errors > 0 {
-                error!(
-                    "XDR verification found {} cross-file hash mismatches",
-                    total_errors
-                );
-            }
-        }
-
         stats.report("mirror").await;
 
-        if stats.has_failures() {
+        if let Some(path) = report_path {
+            let report = crate::report::ArchiveReport {
+                version: crate::report::REPORT_VERSION,
+                section: stats.report_section().await,
+            };
+            crate::report::write_to_path(path, &report)
+                .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Report(e)))?;
+        }
+
+        // Cross-file/chain checks run after the per-cp files are written, so a
+        // checkpoint flagged here means individually-valid files were already
+        // committed to the destination but are mutually inconsistent.
+        let inconsistent = stats.checkpoint_failure_count().await;
+        if inconsistent > 0 {
+            error!(
+                "{inconsistent} checkpoint(s) passed per-file verification but failed \
+                 cross-file/chain checks; their files were written to the destination but are \
+                 mutually inconsistent. Re-run `repair --verify` against a known-good source to \
+                 reconcile them."
+            );
+        }
+
+        if stats.has_failures().await {
             return Err(Error::MirrorFailed.into());
+        }
+
+        if !self.update_well_known {
+            return Ok(());
         }
 
         if let Err(e) = self.maybe_update_well_known(highest_checkpoint).await {
@@ -474,20 +407,33 @@ impl Operation for MirrorOperation {
         Ok(())
     }
 
-    fn finalize_checkpoint(&self, checkpoint: u32) {
-        if let Some(ref manager) = self.verification_manager {
-            manager.verify_and_release(checkpoint);
-        }
-    }
-
-    /// Mirror writes the history buffer to its own dst.
-    async fn process_buffer(&self, path: &str, buffer: Buffer, stats: &ArchiveStats) {
-        match storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await {
-            Ok(()) => stats.record_success(path),
-            Err(e) => {
-                error!("Failed to write history file {}: {}", path, e);
-                stats.record_failure(path).await;
+    /// Copy the history file from source to destination, parsing it for bucket
+    /// discovery. Symmetric with `process_object`: when `--overwrite` is off and
+    /// the destination already holds a valid copy, keep it (`Skipped`) and walk
+    /// its buckets; otherwise fetch from source, parse (before writing), write,
+    /// and report `Processed`.
+    async fn process_history(&self, path: &str) -> Result<HistoryOutcome, StorageError> {
+        // Symmetric with process_object's `exists && !overwrite => Skipped`.
+        if !self.overwrite {
+            if let Ok(buffer) = storage::download_buffer(&self.dst_store, path).await {
+                if let Ok(state) = history_format::parse_history(&buffer, path) {
+                    return Ok(HistoryOutcome {
+                        outcome: ProcessOutcome::Skipped,
+                        state: Some(state),
+                    });
+                }
+                // present but unparseable -> fall through and re-fetch from source
             }
         }
+
+        let buffer = storage::download_buffer(&self.src_store, path).await?;
+        // Parse-before-write: never commit an unparseable HAS to the destination.
+        let state = history_format::parse_history(&buffer, path)
+            .map_err(|e| StorageError::fatal(format!("failed to parse history {path}: {e}")))?;
+        storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await?;
+        Ok(HistoryOutcome {
+            outcome: ProcessOutcome::Processed,
+            state: Some(state),
+        })
     }
 }

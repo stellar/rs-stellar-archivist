@@ -32,19 +32,21 @@ impl ScanCmd {
             info!("Scanning up to checkpoint {}", high);
         }
 
-        // Create the scan operation
-        let operation = ScanOperation::new(self.low, self.high, &args.storage_config, args.verify);
-
         let src_store = storage::from_url_with_config(&self.archive, &args.storage_config)
             .map_err(|e| Error::Other(format!("Failed to create source backend: {e}")))?;
 
         let pipeline_config = PipelineConfig {
             concurrency: args.concurrency,
             skip_optional: args.skip_optional,
+            skip_history_and_buckets: false,
+            verify: args.verify,
             storage_config: args.storage_config,
         };
 
-        let pipeline = Pipeline::new(operation, pipeline_config, src_store, None);
+        // Create the scan operation
+        let operation = ScanOperation::new(src_store, self.low, self.high, pipeline_config.clone());
+
+        let pipeline = Pipeline::new(operation, pipeline_config, args.report_path);
 
         pipeline.run().await.map_err(utils::map_pipeline_error)?;
 

@@ -240,6 +240,7 @@ async fn test_mirror_verify_produces_verifiable_archive() {
     .expect("Mirror with --verify should succeed");
 
     run_scan(ScanConfig {
+        report_path: None,
         archive: mirror_dest,
         concurrency: 4,
         skip_optional: true,

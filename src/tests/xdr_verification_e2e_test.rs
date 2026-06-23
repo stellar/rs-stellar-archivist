@@ -5,17 +5,17 @@
 //!
 //! Uses pubnet-archive-old-txset which contains V0 TransactionSet format.
 
-use super::utils::get_files_by_pattern;
+use super::utils::{
+    get_files_by_pattern, read_and_parse_ledger_file, recompute_entry_hash,
+    write_ledger_header_entries_to_file,
+};
 use crate::test_helpers::{run_mirror, run_scan, test_storage_config, MirrorConfig, ScanConfig};
 use flate2::write::GzEncoder;
 use flate2::Compression;
 use rstest::rstest;
-use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use stellar_xdr::curr::{
-    Frame, Hash, LedgerHeaderHistoryEntry, Limited, Limits, ReadXdr, WriteXdr,
-};
+use stellar_xdr::curr::Hash;
 use tempfile::TempDir;
 
 fn pubnet_old_txset_archive_path() -> PathBuf {
@@ -899,52 +899,6 @@ async fn test_scan_verify_fails_with_multiple_corrupt_files_same_checkpoint() {
 // (rather than raw bytes), preserving per-entry hash consistency so that
 // failures surface at cross-file or cross-checkpoint verification.
 //=============================================================================
-
-fn read_and_parse_ledger_file(path: &Path) -> Vec<LedgerHeaderHistoryEntry> {
-    use flate2::read::GzDecoder;
-    use std::io::Read as _;
-
-    let data = std::fs::read(path).expect("Failed to read ledger file");
-    let mut decoder = GzDecoder::new(&data[..]);
-    let mut decompressed = Vec::new();
-    decoder
-        .read_to_end(&mut decompressed)
-        .expect("Failed to decompress");
-
-    let cursor = std::io::Cursor::new(&decompressed);
-    let mut limited = Limited::new(cursor, Limits::none());
-
-    Frame::<LedgerHeaderHistoryEntry>::read_xdr_iter(&mut limited)
-        .map(|r| r.expect("Failed to parse ledger-header entry").0)
-        .collect()
-}
-
-fn recompute_entry_hash(entry: &mut LedgerHeaderHistoryEntry) {
-    let header_xdr = entry
-        .header
-        .to_xdr(Limits::none())
-        .expect("Failed to serialize header");
-    entry.hash = Hash(Sha256::digest(&header_xdr).into());
-}
-
-fn write_ledger_header_entries_to_file(path: &Path, entries: &[LedgerHeaderHistoryEntry]) {
-    let mut data = Vec::new();
-    for entry in entries {
-        let entry_xdr = entry
-            .to_xdr(Limits::none())
-            .expect("Failed to serialize entry");
-        let frame_len = entry_xdr.len() as u32 | 0x8000_0000;
-        data.extend_from_slice(&frame_len.to_be_bytes());
-        data.extend_from_slice(&entry_xdr);
-    }
-
-    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-    encoder
-        .write_all(&data)
-        .expect("Failed to write compressed data");
-    let compressed = encoder.finish().expect("Failed to finish compression");
-    std::fs::write(path, compressed).expect("Failed to write file");
-}
 
 /// Modify all entries in a ledger file: set the specified hash field to a wrong
 /// value, recompute each entry's hash, and fix the internal prev-hash chain so
