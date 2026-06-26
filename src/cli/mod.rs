@@ -81,7 +81,7 @@ struct Cli {
     retry_max_delay_secs: u64,
 
     /// Maximum concurrent I/O operations per storage backend (source and destination each have their own limit)
-    #[arg(long, global = true, default_value_t = 64)]
+    #[arg(long, global = true, default_value_t = 128)]
     max_concurrent: usize,
 
     /// Request timeout in seconds (for metadata operations)

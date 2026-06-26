@@ -9,12 +9,20 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.91.0"
 
+[lints.rust]
+# `tokio_unstable` is enabled via RUSTFLAGS for opt-in Tokio runtime metrics
+# (perf diagnostics only); register it so it isn't flagged as an unexpected cfg.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
 [lib]
 name = "stellar_archivist"
 
 [features]
 default = ["cli", "opendal-all"]
 cli = ["dep:clap", "dep:tracing-subscriber"]
+
+# Perf testing only (NOT for production; off by default, compiled out otherwise).
+perf-metrics = ["dep:libc"]
 
 # OpenDAL-based storage backends (fs and http are always enabled)
 opendal-s3 = ["opendal/services-s3"]
@@ -62,6 +70,8 @@ async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 flate2 = "1.1.9"
 hex = "0.4"
 tokio-stream = "0.1"
+# Perf testing only (optional; pulled in by perf-metrics).
+libc = { version = "0.2", optional = true }
 
 [dev-dependencies]
 tempfile = { version = "3.5.0" }

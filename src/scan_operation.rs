@@ -164,9 +164,17 @@ impl Operation for ScanOperation {
     /// Scan reads the history file from the source and parses it for bucket
     /// discovery; it never writes.
     async fn process_history(&self, path: &str) -> Result<HistoryOutcome, StorageError> {
-        let buffer = crate::storage::download_buffer(&self.src_store, path).await?;
-        let state = crate::history_format::parse_history(&buffer, path)
-            .map_err(|e| StorageError::fatal(format!("failed to parse history {path}: {e}")))?;
+        let buffer = {
+            let fetch_phase = crate::phase!(crate::metrics::Phase::HistoryFetch);
+            let buffer = crate::storage::download_buffer(&self.src_store, path).await?;
+            fetch_phase.record_file(buffer.len() as u64);
+            buffer
+        };
+        let state = {
+            let _g = crate::phase!(crate::metrics::Phase::HistoryParse);
+            crate::history_format::parse_history(&buffer, path)
+        }
+        .map_err(|e| StorageError::fatal(format!("failed to parse history {path}: {e}")))?;
         Ok(HistoryOutcome {
             outcome: ProcessOutcome::Processed,
             state: Some(state),
