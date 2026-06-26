@@ -239,6 +239,7 @@ impl XdrVerificationManager {
     /// No-op if no data was recorded for this checkpoint. If ledger data is
     /// missing but tx/result data exists, records a warning error.
     pub(crate) fn verify_and_release(&self, checkpoint: u32) {
+        let _g = crate::phase!(crate::metrics::Phase::CrossFileVerify);
         let data = {
             let mut pending = self.pending.lock().unwrap();
             pending.remove(&checkpoint)
@@ -534,6 +535,7 @@ impl XdrVerificationManager {
     /// Only checks adjacent checkpoints separated by exactly `CHECKPOINT_FREQUENCY` —
     /// non-consecutive checkpoints (from partial or bounded scans) are skipped.
     pub(crate) fn verify_checkpoint_chain(&self) {
+        let _g = crate::phase!(crate::metrics::Phase::ChainVerify);
         let boundaries = self.boundaries.lock().unwrap();
         let mut chain_errors = Vec::new();
 
@@ -622,6 +624,7 @@ pub(crate) fn parse_ledger_header_entries_for_checkpoint(
     decompressed_data: &[u8],
     checkpoint: Option<u32>,
 ) -> Result<BTreeMap<u32, LedgerHeaderVerificationData>, StorageError> {
+    let _g = crate::phase!(crate::metrics::Phase::XdrParseLedger);
     let cursor = Cursor::new(decompressed_data);
     let mut limited = Limited::new(cursor, Limits::none());
     let mut data = BTreeMap::new();
@@ -780,6 +783,7 @@ pub(crate) fn parse_result_entries_for_checkpoint(
     decompressed_data: &[u8],
     checkpoint: Option<u32>,
 ) -> Result<BTreeMap<u32, Hash>, StorageError> {
+    let _g = crate::phase!(crate::metrics::Phase::XdrParseResult);
     let cursor = Cursor::new(decompressed_data);
     let mut limited = Limited::new(cursor, Limits::none());
     let mut hashes = BTreeMap::new();
@@ -833,26 +837,16 @@ pub(crate) fn parse_result_entries_for_checkpoint(
     Ok(hashes)
 }
 
-/// Decompress a gzipped reader into an in-memory `Vec<u8>`. No write side —
-/// thin wrapper over [`decompress_and_write_internal`] with `writer = None`.
-async fn decompress_to_buffer(path: &str, reader: Reader) -> Result<Vec<u8>, StorageError> {
-    // the writer is None, thus the return sink is also None, which is safe to
-    // be discarded
-    let (decompressed, _) = decompress_and_write_internal(path, reader, None).await?;
-    Ok(decompressed)
-}
-
-/// Decompress a gzipped ledger file from a reader and parse it.
-/// Infers the checkpoint number from the file path for range validation.
 pub async fn parse_ledger_header_stream(
     path: &str,
     reader: Reader,
 ) -> Result<BTreeMap<u32, LedgerHeaderVerificationData>, StorageError> {
-    let decompressed = decompress_to_buffer(path, reader).await?;
-    parse_ledger_header_entries_for_checkpoint(
-        &decompressed,
-        history_format::checkpoint_from_path(path),
-    )
+    let cp = history_format::checkpoint_from_path(path);
+    Ok(decompress_then(path, reader, None, move |b| {
+        parse_ledger_header_entries_for_checkpoint(b, cp)
+    })
+    .await?
+    .0)
 }
 
 /// Decompress a gzipped result file from a reader and parse it.
@@ -861,8 +855,12 @@ pub async fn parse_results_stream(
     path: &str,
     reader: Reader,
 ) -> Result<BTreeMap<u32, Hash>, StorageError> {
-    let decompressed = decompress_to_buffer(path, reader).await?;
-    parse_result_entries_for_checkpoint(&decompressed, history_format::checkpoint_from_path(path))
+    let cp = history_format::checkpoint_from_path(path);
+    Ok(decompress_then(path, reader, None, move |b| {
+        parse_result_entries_for_checkpoint(b, cp)
+    })
+    .await?
+    .0)
 }
 
 /// Parse decompressed transaction XDR data, computing content hashes per ledger.
@@ -877,6 +875,7 @@ pub(crate) fn parse_transaction_entries_for_checkpoint(
     decompressed_data: &[u8],
     checkpoint: Option<u32>,
 ) -> Result<BTreeMap<u32, Hash>, StorageError> {
+    let _g = crate::phase!(crate::metrics::Phase::XdrParseTx);
     let cursor = Cursor::new(decompressed_data);
     let mut limited = Limited::new(cursor, Limits::none());
     let mut hashes = BTreeMap::new();
@@ -928,6 +927,7 @@ pub(crate) fn parse_transaction_entries_for_checkpoint(
 /// Validate SCP history XDR frame structure. Only checks that frames deserialize
 /// correctly — no hashes are computed or returned. Fatal error on malformed XDR.
 pub fn parse_scp_entries(decompressed_data: &[u8]) -> Result<(), StorageError> {
+    let _g = crate::phase!(crate::metrics::Phase::XdrParseScp);
     let cursor = Cursor::new(decompressed_data);
     let mut limited = Limited::new(cursor, Limits::none());
 
@@ -945,17 +945,19 @@ pub async fn parse_transactions_stream(
     path: &str,
     reader: Reader,
 ) -> Result<BTreeMap<u32, Hash>, StorageError> {
-    let decompressed = decompress_to_buffer(path, reader).await?;
-    parse_transaction_entries_for_checkpoint(
-        &decompressed,
-        history_format::checkpoint_from_path(path),
-    )
+    let cp = history_format::checkpoint_from_path(path);
+    Ok(decompress_then(path, reader, None, move |b| {
+        parse_transaction_entries_for_checkpoint(b, cp)
+    })
+    .await?
+    .0)
 }
 
 /// Decompress a gzipped SCP file from a reader and validate its frame structure.
 pub async fn parse_scp_stream(path: &str, reader: Reader) -> Result<(), StorageError> {
-    let decompressed = decompress_to_buffer(path, reader).await?;
-    parse_scp_entries(&decompressed)
+    decompress_then(path, reader, None, parse_scp_entries)
+        .await
+        .map(|(parsed, _sink)| parsed)
 }
 
 /// Result of parsing an XDR archive file during a verified mirror write.
@@ -968,34 +970,28 @@ pub enum XdrParseResult {
     None,
 }
 
-/// Streaming core: read gzipped bytes from `reader`, optionally tee-write the
-/// raw (still-compressed) bytes to `writer`, and return the fully decompressed
-/// payload alongside the **unclosed** sink.
+/// Streaming core for every XDR file: read gzipped bytes from `reader`,
+/// optionally tee the still-compressed bytes to `writer`, gzip-decode to a
+/// buffer, and run `parse` on it ALL inside one spawned task (gzip decode AND
+/// the XDR parse/hash leave the orchestration task; the caller only feeds
+/// chunks). Returns the parse result alongside the **unclosed** sink (`None`
+/// when `writer` is `None`); the caller commits a write only after `parse`
+/// succeeds (parse-before-commit), so a parse failure never leaves committed
+/// corrupt data.
 ///
-/// Pipeline:
-/// 1. Pull gzipped chunks from `reader`'s opendal stream.
-/// 2. For each chunk: forward the compressed bytes to `sink` (if present), and
-///    push them through an mpsc channel into a spawned decompression task.
-/// 3. The decompression task feeds the channel through a `GzipDecoder` and
-///    accumulates the decompressed bytes into a `Vec<u8>`.
-/// 4. When the source stream ends, the channel closes and the decompression
-///    task returns.
-///
-/// **Sink lifecycle**: the returned sink is *not* closed. The caller closes it
-/// only after additional verification (e.g. XDR parse) succeeds — that way a
-/// post-write verification failure can `drop(sink)` and avoid committing
-/// corrupt data on atomic-write backends. On non-atomic backends, partial data
-/// is already on disk via `sink.send`, so the caller must additionally call
-/// [`cleanup_non_atomic_partial_write`] on failure.
-///
-/// Errors:
-/// - **Retry**: malformed gzip framing (decompression error)
-/// - **Fatal**: storage I/O error on read or write, or decompress task panic
-async fn decompress_and_write_internal(
+/// Error classes (the pipeline retries only `ErrorClass::Retry`): gzip framing
+/// → `retry`; XDR parse/hash → whatever `parse` returns (`fatal` in practice);
+/// storage I/O → opendal-classified; channel-closed or task panic → `fatal`.
+async fn decompress_then<T>(
     path: &str,
     reader: Reader,
     writer: Option<Writer>,
-) -> Result<(Vec<u8>, Option<opendal::BufferSink>), StorageError> {
+    parse: impl FnOnce(&[u8]) -> Result<T, StorageError> + Send + 'static,
+) -> Result<(T, Option<opendal::BufferSink>), StorageError>
+where
+    T: Send + 'static,
+{
+    let decompress_phase = crate::phase!(crate::metrics::Phase::XdrDecompress);
     use futures_util::SinkExt;
 
     let stream = reader
@@ -1004,25 +1000,30 @@ async fn decompress_and_write_internal(
         .map_err(|e| from_opendal_error(e, &format!("failed to create stream for {}", path)))?;
 
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
+    let path_owned = path.to_string();
 
-    let decompress_task = tokio::spawn(async move {
-        let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
-        let stream = stream.map(Ok::<_, std::io::Error>);
-        let stream_reader = StreamReader::new(stream);
-        let mut decoder = GzipDecoder::new(BufReader::new(stream_reader));
+    // Decode then parse, both inside the spawned task. Returns the parse result
+    // plus the decompressed length so the parent records byte metrics exactly once.
+    let task = tokio::spawn(async move {
+        let _dg = crate::metrics::DecodeGuard::enter();
+        let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
+        let mut decoder = GzipDecoder::new(BufReader::new(StreamReader::new(stream)));
 
         let mut decompressed = Vec::new();
         let mut buf = vec![0u8; DECOMPRESS_BUFFER_SIZE];
-
         loop {
-            let n = decoder.read(&mut buf).await?;
+            let n = decoder.read(&mut buf).await.map_err(|e| {
+                StorageError::retry(format!("failed to decompress {}: {}", path_owned, e))
+            })?;
             if n == 0 {
                 break;
             }
             decompressed.extend_from_slice(&buf[..n]);
         }
 
-        Ok::<_, std::io::Error>(decompressed)
+        let len = decompressed.len() as u64;
+        let parsed = parse(&decompressed)?; // parse carries its own phase!(XdrParse*)
+        Ok::<(T, u64), StorageError>((parsed, len))
     });
 
     futures_util::pin_mut!(stream);
@@ -1066,19 +1067,20 @@ async fn decompress_and_write_internal(
     drop(tx);
 
     if let Some(err) = streaming_error {
-        decompress_task.abort();
-        return Err(err);
+        task.abort();
+        return Err(err); // sink dropped here unclosed — caller cleans up
     }
 
-    let decompressed = decompress_task
-        .await
-        .map_err(|e| StorageError::fatal(format!("decompress task panicked for {}: {}", path, e)))?
-        .map_err(|e| StorageError::retry(format!("failed to decompress {}: {}", path, e)))?;
+    let (parsed, len) = task.await.map_err(|e| {
+        StorageError::fatal(format!(
+            "decompress/parse task panicked for {}: {}",
+            path, e
+        ))
+    })??;
 
-    // Return the unclosed sink — caller is responsible for closing it only after
-    // verification succeeds, preventing corrupt data from being committed on
-    // atomic backends.
-    Ok((decompressed, sink))
+    decompress_phase.record_file(len);
+
+    Ok((parsed, sink))
 }
 
 /// Remove a partially-written file after a verified-write fails.
@@ -1177,45 +1179,30 @@ pub async fn verify_and_write_xdr(
     };
 
     let writer = dst_store.open_writer(&write_path).await?;
-    let (decompressed, sink) =
-        match decompress_and_write_internal(&write_path, reader, Some(writer)).await {
-            Ok(result) => result,
-            Err(e) => {
-                // Decompression or I/O error — sink was dropped inside
-                // decompress_and_write_internal without close. Clean up any
-                // partial data on non-atomic backends.
-                cleanup_non_atomic_partial_write(&write_path, dst_store).await;
-                return Err(e);
-            }
-        };
 
-    let parse_result = if crate::history_format::is_ledger_header_file(path) {
-        parse_ledger_header_entries_for_checkpoint(
-            &decompressed,
-            history_format::checkpoint_from_path(path),
-        )
-        .map(XdrParseResult::Ledger)
-    } else if crate::history_format::is_results_file(path) {
-        parse_result_entries_for_checkpoint(
-            &decompressed,
-            history_format::checkpoint_from_path(path),
-        )
-        .map(XdrParseResult::Results)
-    } else if crate::history_format::is_transactions_file(path) {
-        parse_transaction_entries_for_checkpoint(
-            &decompressed,
-            history_format::checkpoint_from_path(path),
-        )
-        .map(XdrParseResult::Transactions)
-    } else if crate::history_format::is_scp_file(path) {
-        parse_scp_entries(&decompressed).map(|()| XdrParseResult::None)
-    } else {
-        Ok(XdrParseResult::None)
+    // Decode + parse run together in the spawned task. The closure captures
+    // only owned data (the logical `path` for file-type detection and `cp`) so
+    // it is `Send + 'static`. Classify on `path`, NOT `write_path`, so a `.tmp`
+    // sibling is never misread as an unrecognized type.
+    let cp = history_format::checkpoint_from_path(path);
+    let path_owned = path.to_string();
+    let parse = move |b: &[u8]| -> Result<XdrParseResult, StorageError> {
+        if crate::history_format::is_ledger_header_file(&path_owned) {
+            parse_ledger_header_entries_for_checkpoint(b, cp).map(XdrParseResult::Ledger)
+        } else if crate::history_format::is_results_file(&path_owned) {
+            parse_result_entries_for_checkpoint(b, cp).map(XdrParseResult::Results)
+        } else if crate::history_format::is_transactions_file(&path_owned) {
+            parse_transaction_entries_for_checkpoint(b, cp).map(XdrParseResult::Transactions)
+        } else if crate::history_format::is_scp_file(&path_owned) {
+            parse_scp_entries(b).map(|()| XdrParseResult::None)
+        } else {
+            Ok(XdrParseResult::None)
+        }
     };
 
-    match parse_result {
-        Ok(result) => {
-            // Verification passed — close sink to commit the write
+    match decompress_then(&write_path, reader, Some(writer), parse).await {
+        Ok((result, sink)) => {
+            // Parse passed — close the sink to commit the write.
             if let Some(mut s) = sink {
                 s.close().await.map_err(|e| {
                     from_opendal_error(e, &format!("failed to close {}", write_path))
@@ -1225,12 +1212,12 @@ pub async fn verify_and_write_xdr(
             commit_non_atomic_write(dst_store, &write_path, path).await?;
             Ok(result)
         }
-        Err(err) => {
-            // Verification failed — don't close sink, prevents committing corrupt data
-            // on atomic backends. For non-atomic backends, data is already on disk via
-            // send() so clean up the partial file.
+        Err(e) => {
+            // Decode or parse failed — `decompress_then` dropped the sink unclosed
+            // (no commit on atomic backends). On non-atomic backends partial data
+            // may be on disk via send(), so remove it.
             cleanup_non_atomic_partial_write(&write_path, dst_store).await;
-            Err(err)
+            Err(e)
         }
     }
 }
