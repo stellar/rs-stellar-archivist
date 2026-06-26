@@ -23,6 +23,7 @@ async fn verify_bucket_maybe_write(
     reader: Reader,
     writer: Option<Writer>,
 ) -> Result<(), StorageError> {
+    let bucket_phase = crate::phase!(crate::metrics::Phase::BucketStream);
     use futures_util::SinkExt;
 
     let expected = bucket_hash_from_path(path)
@@ -37,6 +38,7 @@ async fn verify_bucket_maybe_write(
     let (tx, rx) = tokio::sync::mpsc::channel::<Bytes>(CHANNEL_CAPACITY);
 
     let hash_task = tokio::spawn(async move {
+        let _dg = crate::metrics::DecodeGuard::enter();
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         let stream = stream.map(Ok::<_, std::io::Error>);
         let stream_reader = tokio_util::io::StreamReader::new(stream);
@@ -44,6 +46,7 @@ async fn verify_bucket_maybe_write(
 
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; HASH_BUFFER_SIZE];
+        let mut decompressed_bytes: u64 = 0;
 
         loop {
             let n = decoder.read(&mut buf).await?;
@@ -51,9 +54,10 @@ async fn verify_bucket_maybe_write(
                 break;
             }
             hasher.update(&buf[..n]);
+            decompressed_bytes += n as u64;
         }
 
-        Ok::<_, std::io::Error>(hex::encode(hasher.finalize()))
+        Ok::<_, std::io::Error>((hex::encode(hasher.finalize()), decompressed_bytes))
     });
 
     futures_util::pin_mut!(stream);
@@ -102,7 +106,7 @@ async fn verify_bucket_maybe_write(
         return Err(err);
     }
 
-    let actual = hash_task
+    let (actual, decompressed_bytes) = hash_task
         .await
         .map_err(|e| StorageError::fatal(format!("Hash task panicked for {}: {}", path, e)))?
         .map_err(|e| StorageError::retry(format!("Failed to decompress {}: {}", path, e)))?;
@@ -121,10 +125,16 @@ async fn verify_bucket_maybe_write(
             .map_err(|e| from_opendal_error(e, &format!("Failed to close {}", path)))?;
     }
 
+    bucket_phase.record_file(decompressed_bytes);
+
     Ok(())
 }
 
 /// Verify a bucket file's hash (scan operation).
+///
+/// Delegates to the production async streaming path
+/// ([`verify_bucket_maybe_write`] with no writer), the shipped decode used by
+/// scan-verify.
 pub async fn verify_bucket_stream(path: &str, reader: Reader) -> Result<(), StorageError> {
     debug!("Verifying bucket hash for {}", path);
     verify_bucket_maybe_write(path, reader, None).await

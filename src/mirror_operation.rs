@@ -426,10 +426,18 @@ impl Operation for MirrorOperation {
             }
         }
 
-        let buffer = storage::download_buffer(&self.src_store, path).await?;
+        let buffer = {
+            let fetch_phase = crate::phase!(crate::metrics::Phase::HistoryFetch);
+            let buffer = storage::download_buffer(&self.src_store, path).await?;
+            fetch_phase.record_file(buffer.len() as u64);
+            buffer
+        };
         // Parse-before-write: never commit an unparseable HAS to the destination.
-        let state = history_format::parse_history(&buffer, path)
-            .map_err(|e| StorageError::fatal(format!("failed to parse history {path}: {e}")))?;
+        let state = {
+            let _g = crate::phase!(crate::metrics::Phase::HistoryParse);
+            history_format::parse_history(&buffer, path)
+        }
+        .map_err(|e| StorageError::fatal(format!("failed to parse history {path}: {e}")))?;
         storage::write_buffer_with_cleanup(&self.dst_store, path, buffer).await?;
         Ok(HistoryOutcome {
             outcome: ProcessOutcome::Processed,

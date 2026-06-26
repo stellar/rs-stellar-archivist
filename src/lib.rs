@@ -31,6 +31,7 @@
 #![allow(clippy::doc_markdown)]
 
 pub mod history_format;
+pub mod metrics;
 pub mod mirror_operation;
 pub mod pipeline;
 pub mod repair_operation;
@@ -43,6 +44,15 @@ pub mod xdr_verify;
 
 #[cfg(feature = "cli")]
 pub mod cli;
+
+/// Scoped phase timer. Always binds a `metrics::Guard`: a real RAII timer under
+/// `--features perf-metrics`, or a zero-sized no-op guard otherwise (compiled out).
+#[macro_export]
+macro_rules! phase {
+    ($p:expr) => {
+        $crate::metrics::Guard::new($p)
+    };
+}
 
 use thiserror::Error;
 
