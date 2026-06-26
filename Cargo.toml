@@ -8,6 +8,10 @@ license = "Apache-2.0"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.91.0"
+# Test fixtures are kept in the repo for `cargo test` and CI, but excluded from
+# the published crate: consumers don't need them and they would push the package
+# past crates.io's 10 MiB limit.
+exclude = ["/testdata"]
 
 [lints.rust]
 # `tokio_unstable` is enabled via RUSTFLAGS for opt-in Tokio runtime metrics
