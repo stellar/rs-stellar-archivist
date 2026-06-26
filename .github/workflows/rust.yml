@@ -79,3 +79,10 @@ jobs:
     with:
       runs-on: ${{ matrix.sys.os }}
       target: ${{ matrix.sys.target }}
+      # Restrict the powerset to the feature toggles users actually compile
+      # (the CLI, the perf build, and the backend bundles) instead of the full
+      # ~400-combination powerset over every individual backend. Each backend's
+      # code is still built via opendal-all / opendal-unix, and cfg gates are all
+      # single-feature, so this keeps real coverage while avoiding the long,
+      # disk-heavy verify marathon.
+      cargo-hack-feature-options: --feature-powerset --include-features cli,perf-metrics,opendal-all,opendal-unix
