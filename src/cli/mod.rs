@@ -88,11 +88,11 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 30)]
     timeout_secs: u64,
 
-    /// I/O timeout in seconds (for read/write operations on large files)
+    /// Read/write I/O timeout in seconds
     #[arg(long, global = true, default_value_t = 300)]
     io_timeout_secs: u64,
 
-    /// Bandwidth limit in bytes per second (0 = unlimited)
+    /// Per-backend OpenDAL bandwidth limit in bytes per second (0 = unlimited)
     #[arg(long, global = true, default_value_t = 0)]
     bandwidth_limit: u32,
 

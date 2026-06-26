@@ -12,11 +12,11 @@ pub struct ScanCmd {
     /// Archive URL to scan (http://, https://, file://)
     pub archive: String,
 
-    /// Scan starting from this ledger (will round to nearest checkpoint)
+    /// Scan starting from this ledger (rounds down to previous checkpoint unless already one)
     #[arg(long)]
     pub low: Option<u32>,
 
-    /// Scan up to this checkpoint only
+    /// Scan up to this ledger (rounds up to next checkpoint unless already one)
     #[arg(long)]
     pub high: Option<u32>,
 }
