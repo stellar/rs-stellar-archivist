@@ -16,11 +16,11 @@ pub struct RepairCmd {
     /// Destination archive path to repair (must be file://)
     pub dst: String,
 
-    /// Repair starting from this ledger (will round down to nearest checkpoint)
+    /// Repair starting from this ledger (rounds down to previous checkpoint unless already one)
     #[arg(long)]
     pub low: Option<u32>,
 
-    /// Repair up to this ledger (will round up to nearest checkpoint)
+    /// Repair up to this ledger (rounds up to next checkpoint unless already one)
     #[arg(long)]
     pub high: Option<u32>,
 

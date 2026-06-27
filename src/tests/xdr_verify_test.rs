@@ -778,6 +778,16 @@ fn test_verify_checkpoint_chain_empty_manager() {
 }
 
 #[test]
+fn test_verify_checkpoint_chain_single_checkpoint_is_noop() {
+    let manager = XdrVerificationManager::new();
+    manager.record_header_data(63, create_complete_checkpoint_data(63, [0; 32]));
+    manager.verify_and_release(63);
+    manager.verify_checkpoint_chain();
+
+    assert!(manager.get_errors().is_empty());
+}
+
+#[test]
 fn test_expected_ledger_range_large_checkpoint() {
     let checkpoint = u32::MAX - (u32::MAX % 64);
     let (first, last) = expected_ledger_range(checkpoint);

@@ -541,7 +541,6 @@ impl XdrVerificationManager {
 
         let entries: Vec<_> = boundaries.iter().collect();
 
-        // TODO: need to handle corner case of only 1 entry.
         for window in entries.windows(2) {
             let (&prev_checkpoint, prev_boundary) = window[0];
             let (&curr_checkpoint, curr_boundary) = window[1];
