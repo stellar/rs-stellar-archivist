@@ -254,6 +254,10 @@ have*, reach for `scan` or `repair`, not `mirror --verify`.
 Any `--report` from `scan`, `mirror`, or `repair --dry-run` can be fed straight
 back in as a `repair --plan` — they share one schema.
 
+## Architecture
+
+For a high-level tour of how the tool is structured — see [`docs/architecture.md`](docs/architecture.md).
+
 ## License
 
 Apache-2.0
