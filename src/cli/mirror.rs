@@ -15,19 +15,19 @@ pub struct MirrorCmd {
     /// Destination path (must be file://)
     pub dst: String,
 
-    /// Mirror starting from this ledger (will round down to nearest checkpoint)
+    /// Mirror starting from this ledger (rounds down to previous checkpoint unless already one)
     #[arg(long)]
     pub low: Option<u32>,
 
-    /// Mirror up to this ledger only (will round up to nearest checkpoint)
+    /// Mirror up to this ledger (rounds up to next checkpoint unless already one)
     #[arg(long)]
     pub high: Option<u32>,
 
-    /// Overwrite existing files within the mirrored range (if not set, mirror will skip over existing files)
+    /// Re-fetch and replace existing destination files in the mirror range
     #[arg(long)]
     pub overwrite: bool,
 
-    /// Allow mirroring even when it would create gaps in the destination archive
+    /// Allow --low to start after the destination's current checkpoint, leaving a gap
     #[arg(long, default_value_t = false)]
     pub allow_mirror_gaps: bool,
 }

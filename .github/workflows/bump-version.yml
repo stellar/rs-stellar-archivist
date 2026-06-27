@@ -1,0 +1,20 @@
+name: Bump Version
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to bump to'
+        required: true
+
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+
+jobs:
+
+  bump-version:
+    uses: stellar/actions/.github/workflows/rust-bump-version.yml@main
+    with:
+      version: ${{ inputs.version }}
