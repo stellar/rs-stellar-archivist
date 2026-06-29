@@ -5,7 +5,7 @@ homepage = "https://github.com/stellar/rs-stellar-archivist"
 repository = "https://github.com/stellar/rs-stellar-archivist"
 authors = ["Stellar Development Foundation <info@stellar.org>"]
 license = "Apache-2.0"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 rust-version = "1.91.0"
 # Test fixtures are kept in the repo for `cargo test` and CI, but excluded from
