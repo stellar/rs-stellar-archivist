@@ -1,7 +1,7 @@
 use crate::history_format::{
-    checkpoint_prefix, count_checkpoints_in_range, is_checkpoint, is_valid_bucket_hash,
-    round_to_lower_checkpoint, round_to_upper_checkpoint, HistoryFileState,
-    GENESIS_CHECKPOINT_LEDGER,
+    checkpoint_prefix, count_checkpoints_in_range, is_checkpoint, is_pubnet_passphrase,
+    is_valid_bucket_hash, round_to_lower_checkpoint, round_to_upper_checkpoint, scp_expected,
+    HistoryFileState, FIRST_SCP_CHECKPOINT, GENESIS_CHECKPOINT_LEDGER, PUBLIC_NETWORK_PASSPHRASE,
 };
 use rstest::*;
 use std::fs;
@@ -657,4 +657,33 @@ fn test_version_2_hot_bucket_validation(mut canonical_v2_json: serde_json::Value
         error,
         crate::history_format::Error::MalformedBucketHash { .. }
     ));
+}
+
+// ── pubnet early-SCP gap ──────────────────────────────────────────────────────
+
+#[test]
+fn test_first_scp_checkpoint_is_a_checkpoint_boundary() {
+    // The gap boundary must be a real checkpoint so `scp_expected` splits cleanly.
+    assert!(is_checkpoint(FIRST_SCP_CHECKPOINT));
+    assert_eq!(FIRST_SCP_CHECKPOINT, 1_214_079);
+}
+
+#[rstest]
+#[case::genesis(GENESIS_CHECKPOINT_LEDGER, false)] // 63 — deep in the gap
+#[case::last_missing(1_214_015, false)] // 0x0012863f — last checkpoint with no SCP
+#[case::first_present(1_214_079, true)] // 0x0012867f — first checkpoint with SCP
+#[case::just_after(1_214_143, true)] // 0x001286bf — the old (wrong) bound; SCP exists here
+#[case::far_future(63_000_000, true)]
+fn test_scp_expected_boundary(#[case] checkpoint: u32, #[case] expected: bool) {
+    assert_eq!(scp_expected(checkpoint), expected);
+}
+
+#[test]
+fn test_is_pubnet_passphrase() {
+    assert!(is_pubnet_passphrase(Some(PUBLIC_NETWORK_PASSPHRASE)));
+    assert!(!is_pubnet_passphrase(Some(
+        "Test SDF Network ; September 2015"
+    )));
+    assert!(!is_pubnet_passphrase(Some("")));
+    assert!(!is_pubnet_passphrase(None));
 }

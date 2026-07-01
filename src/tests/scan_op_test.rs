@@ -448,3 +448,6 @@ async fn test_scan_report_lists_missing_files() {
         "report should list the missing ledger checkpoint"
     );
 }
+
+// Pubnet early-SCP-gap tolerance is covered against real pubnet data in
+// tests/pubnet_scp_gap_test.rs.

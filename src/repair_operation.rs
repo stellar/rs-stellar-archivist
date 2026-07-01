@@ -531,8 +531,14 @@ impl RepairOperation {
             }
         }
 
-        match tokio::fs::copy(&src_file, &dst_file).await {
-            Ok(_) => {
+        match crate::utils::write_well_known_from_history(
+            &src_file,
+            &dst_file,
+            self.pipeline_config.source_network_passphrase.as_deref(),
+        )
+        .await
+        {
+            Ok(()) => {
                 info!(
                     "Restored .well-known from checkpoint {} (0x{:08x})",
                     highest_checkpoint, highest_checkpoint
