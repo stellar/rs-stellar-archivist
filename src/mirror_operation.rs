@@ -189,13 +189,19 @@ impl MirrorOperation {
                 })?;
             }
 
-            tokio::fs::copy(&src_file, &dst_file).await.map_err(|e| {
+            crate::utils::write_well_known_from_history(
+                &src_file,
+                &dst_file,
+                self.pipeline_config.source_network_passphrase.as_deref(),
+            )
+            .await
+            .map_err(|e| {
                 std::io::Error::new(
                     e.kind(),
                     format!(
-                        "Failed to copy {} to {}: {}",
-                        src_file.display(),
+                        "Failed to write .well-known {} from {}: {}",
                         dst_file.display(),
+                        src_file.display(),
                         e
                     ),
                 )

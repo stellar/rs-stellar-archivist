@@ -282,13 +282,15 @@ pub mod test_helpers {
                 |e| crate::Error::Other(format!("Failed to create source backend: {e}")),
             )?;
 
-        let pipeline_config = PipelineConfig {
-            concurrency: config.concurrency,
-            skip_optional: config.skip_optional,
-            skip_history_and_buckets: false,
-            verify: config.verify,
-            storage_config: config.storage_config,
-        };
+        let pipeline_config = PipelineConfig::new(
+            config.concurrency,
+            config.skip_optional,
+            false,
+            config.verify,
+            config.storage_config,
+            &src_store,
+        )
+        .await;
 
         let operation =
             ScanOperation::new(src_store, config.low, config.high, pipeline_config.clone());
@@ -318,13 +320,15 @@ pub mod test_helpers {
             )));
         }
 
-        let pipeline_config = PipelineConfig {
-            concurrency: config.concurrency,
-            skip_optional: config.skip_optional,
-            skip_history_and_buckets: false,
-            verify: config.verify,
-            storage_config: config.storage_config,
-        };
+        let pipeline_config = PipelineConfig::new(
+            config.concurrency,
+            config.skip_optional,
+            false,
+            config.verify,
+            config.storage_config,
+            &src_store,
+        )
+        .await;
 
         let operation = MirrorOperation::new(
             src_store,
@@ -449,13 +453,15 @@ pub mod test_helpers {
             )));
         }
 
-        let pipeline_config = PipelineConfig {
-            concurrency: config.concurrency,
-            skip_optional: config.skip_optional,
-            skip_history_and_buckets: false,
-            verify: config.verify,
-            storage_config: config.storage_config,
-        };
+        let pipeline_config = PipelineConfig::new(
+            config.concurrency,
+            config.skip_optional,
+            false,
+            config.verify,
+            config.storage_config,
+            &src_store,
+        )
+        .await;
 
         if let Some(plan) = config.plan {
             let operation = RepairOperation::new(

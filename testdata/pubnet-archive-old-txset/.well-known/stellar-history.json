@@ -2,6 +2,7 @@
     "version": 1,
     "server": "v0.6.1-27-gdb7b26b",
     "currentLedger": 12001023,
+    "networkPassphrase": "Public Global Stellar Network ; September 2015",
     "currentBuckets": [
         {
             "curr": "0000000000000000000000000000000000000000000000000000000000000000",

@@ -60,13 +60,15 @@ impl RepairCmd {
             )));
         }
 
-        let pipeline_config = PipelineConfig {
-            concurrency: args.concurrency,
-            skip_optional: args.skip_optional,
-            skip_history_and_buckets: false,
-            verify: args.verify,
-            storage_config: args.storage_config,
-        };
+        let pipeline_config = PipelineConfig::new(
+            args.concurrency,
+            args.skip_optional,
+            false,
+            args.verify,
+            args.storage_config,
+            &src_store,
+        )
+        .await;
 
         // Read the plan up front (if any); the `Option` doubles as the mode flag
         // below. `--verify` works exactly as in regular repair: it governs

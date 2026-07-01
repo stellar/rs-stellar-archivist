@@ -17,6 +17,34 @@ pub const GENESIS_CHECKPOINT_LEDGER: u32 = CHECKPOINT_FREQUENCY - 1;
 // Standard location for .well-known file in archives
 pub const ROOT_WELL_KNOWN_PATH: &str = ".well-known/stellar-history.json";
 
+/// Network passphrase of the Stellar public network (pubnet).
+pub const PUBLIC_NETWORK_PASSPHRASE: &str = "Public Global Stellar Network ; September 2015";
+
+/// First checkpoint for which pubnet history archives contain an SCP file.
+///
+/// SCP archiving began partway through pubnet's history; earlier checkpoints
+/// have no SCP file and can never be backfilled. Below this checkpoint a
+/// missing SCP file on a pubnet archive is expected, not a failure.
+///
+/// Validated against history.stellar.org core_live_001/002/003: the last
+/// checkpoint *without* an SCP file is `0x0012863f` (1,214,015) and the first
+/// *with* one is `0x0012867f` (1,214,079).
+pub const FIRST_SCP_CHECKPOINT: u32 = 0x0012_867f; // 1_214_079
+
+/// Whether `passphrase` identifies the Stellar public network (pubnet).
+#[must_use]
+pub fn is_pubnet_passphrase(passphrase: Option<&str>) -> bool {
+    passphrase == Some(PUBLIC_NETWORK_PASSPHRASE)
+}
+
+/// Whether an SCP file is expected to exist for `checkpoint`. A missing SCP file
+/// below this point is tolerated on pubnet (see [`FIRST_SCP_CHECKPOINT`]); at or
+/// above it, a missing SCP file is a real failure.
+#[must_use]
+pub fn scp_expected(checkpoint: u32) -> bool {
+    checkpoint >= FIRST_SCP_CHECKPOINT
+}
+
 /// Errors that can occur when working with history files
 #[derive(Error, Debug)]
 pub enum Error {

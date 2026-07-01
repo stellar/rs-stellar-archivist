@@ -146,6 +146,7 @@ fn make_config(concurrency: usize) -> PipelineConfig {
         skip_optional: true, // 3 per-cp files (no SCP)
         skip_history_and_buckets: false,
         verify: false,
+        source_network_passphrase: None,
         storage_config,
     }
 }

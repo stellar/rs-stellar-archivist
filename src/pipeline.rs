@@ -170,8 +170,47 @@ pub struct PipelineConfig {
     /// the pipeline drives `verify_and_release` per cp + chain check + drain
     /// at the end of `run_checkpoints`.
     pub verify: bool,
+    /// The source archive's network passphrase, read once from its root
+    /// `.well-known` (`None` if unreachable or absent). Single source of network
+    /// identity: [`PipelineConfig::is_pubnet`] derives from it to gate the
+    /// early-SCP-gap tolerance, and mirror/repair stamp it into the destination
+    /// `.well-known` (per-checkpoint history files omit the passphrase).
+    pub source_network_passphrase: Option<String>,
     /// Storage layer configuration (retry, timeout, bandwidth, etc.)
     pub storage_config: StorageConfig,
+}
+
+impl PipelineConfig {
+    /// Build a config, fetching the source archive's root `.well-known` **once**
+    /// to capture its network passphrase (see [`Self::source_network_passphrase`]).
+    pub async fn new(
+        concurrency: usize,
+        skip_optional: bool,
+        skip_history_and_buckets: bool,
+        verify: bool,
+        storage_config: StorageConfig,
+        source: &crate::storage::StorageRef,
+    ) -> Self {
+        let source_network_passphrase =
+            crate::utils::fetch_source_network_passphrase(source, &storage_config).await;
+        Self {
+            concurrency,
+            skip_optional,
+            skip_history_and_buckets,
+            verify,
+            source_network_passphrase,
+            storage_config,
+        }
+    }
+
+    /// Whether the source archive is the Stellar public network. Pubnet archives
+    /// have no SCP files before [`history_format::FIRST_SCP_CHECKPOINT`], so
+    /// `process_checkpoint` does not schedule those gap-range SCP files — a
+    /// missing early SCP is expected, not a failure.
+    #[must_use]
+    pub fn is_pubnet(&self) -> bool {
+        history_format::is_pubnet_passphrase(self.source_network_passphrase.as_deref())
+    }
 }
 
 pub struct Pipeline<Op: Operation> {
@@ -324,8 +363,14 @@ impl<Op: Operation> Pipeline<Op> {
                 .map(|cat| self.process_file(checkpoint, checkpoint_path(cat, checkpoint))),
         );
 
-        // Optional: SCP file. Skipped when `skip_optional` is set.
-        let scp: OptionFuture<_> = (!self.config.skip_optional)
+        // Optional: SCP file. Skipped when `skip_optional` is set, and also for
+        // pubnet checkpoints below FIRST_SCP_CHECKPOINT — pubnet never published
+        // SCP for those early ledgers, so a "missing" SCP there is expected, not
+        // a failure. Not scheduling it means it never becomes a failure (or a
+        // repair action) in any mode.
+        let scp_in_pubnet_gap =
+            self.config.is_pubnet() && !history_format::scp_expected(checkpoint);
+        let scp: OptionFuture<_> = (!self.config.skip_optional && !scp_in_pubnet_gap)
             .then(|| self.process_file(checkpoint, checkpoint_path("scp", checkpoint)))
             .into();
 

@@ -1257,6 +1257,7 @@ fn build_repair_op_full(
         skip_optional: false,
         skip_history_and_buckets: false,
         verify,
+        source_network_passphrase: None,
         storage_config,
     };
     crate::repair_operation::RepairOperation::new(
@@ -2107,6 +2108,7 @@ async fn test_repair_dry_run_verify_surfaces_cross_file_failure() {
         skip_optional: false,
         skip_history_and_buckets: false,
         verify: true,
+        source_network_passphrase: None,
         storage_config,
     };
     let pipeline = Pipeline::new(op, config, None);
@@ -2731,3 +2733,6 @@ async fn test_plan_refetches_corrupt_present_file_without_verify() {
         "corrupt dst transactions file is overwritten with src content"
     );
 }
+
+// Pubnet early-SCP-gap tolerance for repair and repair --dry-run is covered
+// against real pubnet data in tests/pubnet_scp_gap_test.rs.
