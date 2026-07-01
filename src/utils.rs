@@ -593,6 +593,68 @@ pub async fn fetch_well_known_history_file(
     Ok(state)
 }
 
+/// Read the network passphrase from the archive root `.well-known` at `store`.
+///
+/// Returns `None` if the file is unreachable or omits the passphrase. This is the
+/// single source of truth for network identity: it drives the pubnet-only
+/// early-SCP-gap tolerance (via [`history_format::is_pubnet_passphrase`]) and is
+/// stamped into mirrored/repaired `.well-known` files, since per-checkpoint
+/// history files omit the passphrase (only the archive root carries it).
+pub async fn fetch_source_network_passphrase(
+    store: &StorageRef,
+    storage_config: &crate::storage::StorageConfig,
+) -> Option<String> {
+    fetch_well_known_history_file(
+        store,
+        storage_config.max_retries as u32,
+        storage_config.retry_min_delay.as_millis() as u64,
+    )
+    .await
+    .ok()
+    .and_then(|state| state.network_passphrase)
+}
+
+/// Write `src_history_file` (a per-checkpoint history file) to `dst_well_known`,
+/// stamping in `network_passphrase` when `Some` so the mirrored/repaired archive
+/// root carries the network identity that per-checkpoint history files omit
+/// (only the archive root `.well-known` does). When `None` (the source archive
+/// itself had no passphrase) the file is copied verbatim. The caller is
+/// responsible for ensuring the destination parent directory exists.
+pub async fn write_well_known_from_history(
+    src_history_file: &std::path::Path,
+    dst_well_known: &std::path::Path,
+    network_passphrase: Option<&str>,
+) -> std::io::Result<()> {
+    // Start from the source bytes; only replace them when the passphrase
+    // actually needs stamping (source has one and the history file lacks it or
+    // carries a different value).
+    let mut contents = tokio::fs::read(src_history_file).await?;
+
+    if let Some(passphrase) = network_passphrase {
+        let mut value: serde_json::Value = serde_json::from_slice(&contents)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let already_present =
+            value.get("networkPassphrase").and_then(|v| v.as_str()) == Some(passphrase);
+        if !already_present {
+            let obj = value.as_object_mut().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "history file is not a JSON object",
+                )
+            })?;
+            obj.insert(
+                "networkPassphrase".to_string(),
+                serde_json::Value::String(passphrase.to_string()),
+            );
+            contents = serde_json::to_vec_pretty(&value)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+            contents.push(b'\n');
+        }
+    }
+
+    tokio::fs::write(dst_well_known, contents).await
+}
+
 /// Compute checkpoint bounds using a pre-fetched source checkpoint
 pub fn compute_checkpoint_bounds(
     source_checkpoint: u32,

@@ -35,13 +35,15 @@ impl ScanCmd {
         let src_store = storage::from_url_with_config(&self.archive, &args.storage_config)
             .map_err(|e| Error::Other(format!("Failed to create source backend: {e}")))?;
 
-        let pipeline_config = PipelineConfig {
-            concurrency: args.concurrency,
-            skip_optional: args.skip_optional,
-            skip_history_and_buckets: false,
-            verify: args.verify,
-            storage_config: args.storage_config,
-        };
+        let pipeline_config = PipelineConfig::new(
+            args.concurrency,
+            args.skip_optional,
+            false,
+            args.verify,
+            args.storage_config,
+            &src_store,
+        )
+        .await;
 
         // Create the scan operation
         let operation = ScanOperation::new(src_store, self.low, self.high, pipeline_config.clone());

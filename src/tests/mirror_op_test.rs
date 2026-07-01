@@ -1069,6 +1069,7 @@ async fn test_mirror_with_update_well_known_false_does_not_touch_well_known() {
         skip_optional: true,
         skip_history_and_buckets: false,
         verify: false,
+        source_network_passphrase: None,
         storage_config: storage_config.clone(),
     };
 
@@ -1208,3 +1209,7 @@ async fn test_mirror_no_overwrite_replaces_broken_history() {
         "broken destination history must be replaced from source"
     );
 }
+
+// Pubnet early-SCP-gap tolerance for mirror (incl. .well-known passphrase
+// preservation) is covered against real pubnet data in
+// tests/pubnet_scp_gap_test.rs.
