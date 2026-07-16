@@ -20,7 +20,7 @@ use crate::xdr_verify::HashExt;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
-use stellar_xdr::curr::Hash;
+use stellar_xdr::Hash;
 use thiserror::Error;
 
 /// Current schema version.

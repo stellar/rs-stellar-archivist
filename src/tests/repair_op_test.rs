@@ -1865,9 +1865,7 @@ fn tamper_ledger_break_chain(archive_path: &Path) -> u32 {
     use flate2::read::GzDecoder;
     use sha2::{Digest, Sha256};
     use std::io::Read;
-    use stellar_xdr::curr::{
-        Frame, Hash, LedgerHeaderHistoryEntry, Limited, Limits, ReadXdr, WriteXdr,
-    };
+    use stellar_xdr::{Frame, Hash, LedgerHeaderHistoryEntry, Limited, Limits, ReadXdr, WriteXdr};
 
     let files = get_files_by_pattern(archive_path, "/ledger-");
     assert!(!files.is_empty(), "no ledger files found");

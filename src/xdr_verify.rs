@@ -26,7 +26,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::io::Cursor;
 use std::sync::Mutex;
-use stellar_xdr::curr::{
+use stellar_xdr::{
     Frame, GeneralizedTransactionSet, Hash, LedgerHeaderHistoryEntry, Limited, Limits, ReadXdr,
     ScpHistoryEntry, TransactionHistoryEntry, TransactionHistoryEntryExt,
     TransactionHistoryResultEntry, TransactionSetV1, VecM, WriteXdr,
@@ -44,13 +44,13 @@ pub(crate) const EMPTY_XDR_ARRAY_HASH: Hash = Hash([
 /// All-zero hash. Used as a sentinel for "no result entry expected."
 const ZERO_HASH: Hash = Hash([0; 32]);
 
-/// SHA-256 of `data` returned as a `stellar_xdr::curr::Hash` (the same newtype
+/// SHA-256 of `data` returned as a `stellar_xdr::Hash` (the same newtype
 /// used by ledger headers, tx-set hashes, etc.).
 fn sha256(data: &[u8]) -> Hash {
     Hash(Sha256::digest(data).into())
 }
 
-/// Extension methods for `stellar_xdr::curr::Hash`.
+/// Extension methods for `stellar_xdr::Hash`.
 pub(crate) trait HashExt {
     /// Hex-encode the 32 bytes (lowercase, no prefix).
     fn to_hex(&self) -> String;
@@ -730,10 +730,10 @@ pub(crate) fn is_empty_tx_set_hash(expected: &Hash, prev_hash: &Hash) -> bool {
 ///
 /// This matches stellar-core's `computeNonGeneralizedTxSetContentsHash()`.
 pub(crate) fn compute_v0_tx_set_hash(
-    tx_set: &stellar_xdr::curr::TransactionSet,
+    tx_set: &stellar_xdr::TransactionSet,
 ) -> Result<Hash, StorageError> {
     let mut serialized_txs = Vec::with_capacity(tx_set.txs.len());
-    for tx in tx_set.txs.iter() {
+    for tx in &tx_set.txs {
         let tx_xdr = tx.to_xdr(Limits::none()).map_err(|e| {
             StorageError::fatal(format!("failed to serialize TransactionEnvelope: {}", e))
         })?;
@@ -760,7 +760,7 @@ pub(crate) fn compute_v0_tx_set_hash(
 /// The V1 hash is simply SHA256 of the entire XDR-serialized struct.
 /// This matches stellar-core's `xdrSha256(xdrTxSet)`.
 pub(crate) fn compute_v1_tx_set_hash(
-    generalized_tx_set: &stellar_xdr::curr::GeneralizedTransactionSet,
+    generalized_tx_set: &stellar_xdr::GeneralizedTransactionSet,
 ) -> Result<Hash, StorageError> {
     let xdr = generalized_tx_set.to_xdr(Limits::none()).map_err(|e| {
         StorageError::fatal(format!(

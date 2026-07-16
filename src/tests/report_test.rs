@@ -2,7 +2,7 @@
 
 use crate::report::{ArchiveReport, Summary, REPORT_VERSION};
 use crate::utils::{FailureTracker, FileFlags};
-use stellar_xdr::curr::Hash;
+use stellar_xdr::Hash;
 
 fn sample_tracker() -> FailureTracker {
     let mut t = FailureTracker::default();

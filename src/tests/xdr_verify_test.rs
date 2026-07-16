@@ -9,16 +9,18 @@ use crate::xdr_verify::{
 use rstest::rstest;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
-use stellar_xdr::curr::{
-    AccountId, CreateAccountOp, GeneralizedTransactionSet, Hash, LedgerHeader, LedgerHeaderExt,
+use stellar_xdr::{
+    AccountId, ContractId, CreateAccountOp, GeneralizedTransactionSet, Hash, HostFunction,
+    InvokeContractArgs, InvokeHostFunctionOp, LedgerHeader, LedgerHeaderExt,
     LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerScpMessages, Limits, Memo,
-    MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ScpHistoryEntry,
-    ScpHistoryEntryV0, SequenceNumber, TimePoint, Transaction, TransactionEnvelope,
-    TransactionHistoryEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntry,
-    TransactionHistoryResultEntryExt, TransactionPhase, TransactionResult, TransactionResultExt,
-    TransactionResultPair, TransactionResultResult, TransactionResultSet, TransactionSet,
-    TransactionSetV1, TransactionV0, TransactionV0Envelope, TransactionV0Ext,
-    TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    MuxedAccount, Operation, OperationBody, Preconditions, PublicKey, ScAddress, ScSymbol, ScVal,
+    ScpHistoryEntry, ScpHistoryEntryV0, SequenceNumber, SorobanAddressCredentials,
+    SorobanAuthorizationEntry, SorobanAuthorizedFunction, SorobanAuthorizedInvocation,
+    SorobanCredentials, TimePoint, Transaction, TransactionEnvelope, TransactionHistoryEntry,
+    TransactionHistoryEntryExt, TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
+    TransactionPhase, TransactionResult, TransactionResultExt, TransactionResultPair,
+    TransactionResultResult, TransactionResultSet, TransactionSet, TransactionSetV1, TransactionV0,
+    TransactionV0Envelope, TransactionV0Ext, TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
 
 fn frame_xdr<T: WriteXdr>(entry: &T) -> Vec<u8> {
@@ -76,7 +78,49 @@ fn tx_v1_envelope(id: u8) -> TransactionEnvelope {
             cond: Preconditions::None,
             memo: Memo::None,
             operations: vec![create_account_operation(id)].try_into().unwrap(),
-            ext: stellar_xdr::curr::TransactionExt::V0,
+            ext: stellar_xdr::TransactionExt::V0,
+        },
+        signatures: VecM::default(),
+    })
+}
+
+/// Soroban transaction whose auth entry uses the CAP-0071 (protocol 27)
+/// `SOROBAN_CREDENTIALS_ADDRESS_V2` arm, which pre-27 XDR cannot decode.
+fn tx_soroban_envelope_with_address_v2_auth(id: u8) -> TransactionEnvelope {
+    let invoke_args = InvokeContractArgs {
+        contract_address: ScAddress::Contract(ContractId(Hash([id; 32]))),
+        function_name: ScSymbol("transfer".try_into().unwrap()),
+        args: VecM::default(),
+    };
+    let auth = SorobanAuthorizationEntry {
+        credentials: SorobanCredentials::AddressV2(SorobanAddressCredentials {
+            address: ScAddress::Account(account_id(id)),
+            nonce: 1,
+            signature_expiration_ledger: 100,
+            signature: ScVal::Void,
+        }),
+        root_invocation: SorobanAuthorizedInvocation {
+            function: SorobanAuthorizedFunction::ContractFn(invoke_args.clone()),
+            sub_invocations: VecM::default(),
+        },
+    };
+    TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: Transaction {
+            source_account: muxed_account(id),
+            fee: 100,
+            seq_num: SequenceNumber(i64::from(id) + 1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                    host_function: HostFunction::InvokeContract(invoke_args),
+                    auth: vec![auth].try_into().unwrap(),
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: stellar_xdr::TransactionExt::V0,
         },
         signatures: VecM::default(),
     })
@@ -106,8 +150,8 @@ fn v1_history_entry(
     prev_hash: [u8; 32],
     txs: Vec<TransactionEnvelope>,
 ) -> TransactionHistoryEntry {
-    let component = stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-        stellar_xdr::curr::TxSetComponentTxsMaybeDiscountedFee {
+    let component = stellar_xdr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+        stellar_xdr::TxSetComponentTxsMaybeDiscountedFee {
             base_fee: None,
             txs: txs.try_into().unwrap(),
         },
@@ -166,11 +210,11 @@ fn create_minimal_ledger_header(
     LedgerHeader {
         ledger_version: 21,
         previous_ledger_hash: Hash(prev_hash),
-        scp_value: stellar_xdr::curr::StellarValue {
+        scp_value: stellar_xdr::StellarValue {
             tx_set_hash: Hash(tx_set_hash),
             close_time: TimePoint(0),
             upgrades: VecM::default(),
-            ext: stellar_xdr::curr::StellarValueExt::Basic,
+            ext: stellar_xdr::StellarValueExt::Basic,
         },
         tx_set_result_hash: Hash(result_hash),
         bucket_list_hash: Hash([0; 32]),
@@ -409,6 +453,22 @@ fn test_parse_transaction_entries_v1_non_empty() {
 }
 
 #[test]
+fn test_parse_transaction_entries_v1_with_cap71_address_v2_credentials() {
+    let prev_hash = [0x24; 32];
+    let entry = v1_history_entry(
+        100,
+        prev_hash,
+        vec![tx_soroban_envelope_with_address_v2_auth(1)],
+    );
+    let parsed = parse_transaction_entries(&frame_xdr(&entry)).unwrap();
+
+    let TransactionHistoryEntryExt::V1(generalized) = &entry.ext else {
+        panic!("expected V1 entry");
+    };
+    assert_eq!(parsed[&100], compute_v1_tx_set_hash(generalized).unwrap());
+}
+
+#[test]
 fn test_compute_v0_tx_set_hash_matches_manual_hash() {
     let prev_hash = [0x10; 32];
     let txs = vec![tx_v0_envelope(1), tx_v0_envelope(2)];
@@ -450,14 +510,12 @@ fn test_compute_v1_tx_set_hash_matches_manual_hash() {
     let generalized = GeneralizedTransactionSet::V1(TransactionSetV1 {
         previous_ledger_hash: Hash([0x11; 32]),
         phases: vec![TransactionPhase::V0(
-            vec![
-                stellar_xdr::curr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
-                    stellar_xdr::curr::TxSetComponentTxsMaybeDiscountedFee {
-                        base_fee: None,
-                        txs: vec![tx_v1_envelope(1)].try_into().unwrap(),
-                    },
-                ),
-            ]
+            vec![stellar_xdr::TxSetComponent::TxsetCompTxsMaybeDiscountedFee(
+                stellar_xdr::TxSetComponentTxsMaybeDiscountedFee {
+                    base_fee: None,
+                    txs: vec![tx_v1_envelope(1)].try_into().unwrap(),
+                },
+            )]
             .try_into()
             .unwrap(),
         )]

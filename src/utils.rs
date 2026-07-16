@@ -1,7 +1,7 @@
 use bytes::Buf;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
-use stellar_xdr::curr::Hash;
+use stellar_xdr::Hash;
 use thiserror::Error;
 use tracing::{debug, error, info, warn};
 

@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use stellar_xdr::curr::Hash;
+use stellar_xdr::Hash;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tower_http::services::ServeDir;
@@ -540,10 +540,10 @@ pub fn parse_transaction_entries(
 
 pub(crate) fn read_and_parse_ledger_file(
     path: &Path,
-) -> Vec<stellar_xdr::curr::LedgerHeaderHistoryEntry> {
+) -> Vec<stellar_xdr::LedgerHeaderHistoryEntry> {
     use flate2::read::GzDecoder;
     use std::io::Read as _;
-    use stellar_xdr::curr::{Frame, LedgerHeaderHistoryEntry, Limited, Limits, ReadXdr};
+    use stellar_xdr::{Frame, LedgerHeaderHistoryEntry, Limited, Limits, ReadXdr};
 
     let data = std::fs::read(path).expect("Failed to read ledger file");
     let mut decoder = GzDecoder::new(&data[..]);
@@ -560,9 +560,9 @@ pub(crate) fn read_and_parse_ledger_file(
         .collect()
 }
 
-pub(crate) fn recompute_entry_hash(entry: &mut stellar_xdr::curr::LedgerHeaderHistoryEntry) {
+pub(crate) fn recompute_entry_hash(entry: &mut stellar_xdr::LedgerHeaderHistoryEntry) {
     use sha2::{Digest, Sha256};
-    use stellar_xdr::curr::{Limits, WriteXdr};
+    use stellar_xdr::{Limits, WriteXdr};
 
     let header_xdr = entry
         .header
@@ -573,12 +573,12 @@ pub(crate) fn recompute_entry_hash(entry: &mut stellar_xdr::curr::LedgerHeaderHi
 
 pub(crate) fn write_ledger_header_entries_to_file(
     path: &Path,
-    entries: &[stellar_xdr::curr::LedgerHeaderHistoryEntry],
+    entries: &[stellar_xdr::LedgerHeaderHistoryEntry],
 ) {
     use flate2::write::GzEncoder;
     use flate2::Compression;
     use std::io::Write as _;
-    use stellar_xdr::curr::{Limits, WriteXdr};
+    use stellar_xdr::{Limits, WriteXdr};
 
     let mut data = Vec::new();
     for entry in entries {

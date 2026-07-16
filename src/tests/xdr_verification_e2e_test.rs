@@ -15,7 +15,7 @@ use flate2::Compression;
 use rstest::rstest;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use stellar_xdr::curr::Hash;
+use stellar_xdr::Hash;
 use tempfile::TempDir;
 
 fn pubnet_old_txset_archive_path() -> PathBuf {
