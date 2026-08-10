@@ -68,9 +68,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 normalize-path = { version = "0.2.1" }
 sha2 = "0.10"
 # NB: the stellar-xdr needs to keep up-to-date with the latest major (protocol)
-# version or it may fail to parse the latest ledger format. The cap_0083 feature
-# can be dropped once a future stellar-xdr release includes it unconditionally (protocol 28).
-stellar-xdr = { version = "27.0.0", default-features = true, features = ["cap_0083"] }
+# version or it may fail to parse the latest ledger format.
+stellar-xdr = { version = "28.0.0", default-features = true }
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 flate2 = "1.1.9"
 hex = "0.4"

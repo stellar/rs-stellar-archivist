@@ -11,19 +11,20 @@ use rstest::rstest;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use stellar_xdr::{
-    AccountId, ContractId, CreateAccountOp, GeneralizedTransactionSet, Hash, HostFunction,
-    InvokeContractArgs, InvokeHostFunctionOp, LedgerCloseValueSignature, LedgerHeader,
-    LedgerHeaderExt, LedgerHeaderHistoryEntry, LedgerHeaderHistoryEntryExt, LedgerScpMessages,
-    Limits, Memo, MuxedAccount, NodeId, Operation, OperationBody, ParallelTxsComponent,
-    Preconditions, PublicKey, ScAddress, ScSymbol, ScVal, ScpHistoryEntry, ScpHistoryEntryV0,
-    SequenceNumber, Signature, SorobanAddressCredentials, SorobanAuthorizationEntry,
-    SorobanAuthorizedFunction, SorobanAuthorizedInvocation, SorobanCredentials, StellarValueExt,
-    StellarValueProposedValue, TimePoint, Transaction, TransactionEnvelope,
-    TransactionHistoryEntry, TransactionHistoryEntryExt, TransactionHistoryResultEntry,
-    TransactionHistoryResultEntryExt, TransactionPhase, TransactionResult, TransactionResultExt,
-    TransactionResultPair, TransactionResultResult, TransactionResultSet, TransactionSet,
-    TransactionSetV1, TransactionV0, TransactionV0Envelope, TransactionV0Ext,
-    TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    AccountId, ContractExecutable, ContractExecutableExternalRef, ContractId, ContractIdPreimage,
+    ContractIdPreimageFromAddress, CreateAccountOp, CreateContractArgsV2,
+    GeneralizedTransactionSet, Hash, HostFunction, InvokeContractArgs, InvokeHostFunctionOp,
+    LedgerCloseValueSignature, LedgerHeader, LedgerHeaderExt, LedgerHeaderHistoryEntry,
+    LedgerHeaderHistoryEntryExt, LedgerScpMessages, Limits, Memo, MuxedAccount, NodeId, Operation,
+    OperationBody, ParallelTxsComponent, Preconditions, PublicKey, ScAddress, ScString, ScSymbol,
+    ScVal, ScpHistoryEntry, ScpHistoryEntryV0, SequenceNumber, Signature,
+    SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
+    SorobanAuthorizedInvocation, SorobanCredentials, StellarValueExt, StellarValueProposedValue,
+    TimePoint, Transaction, TransactionEnvelope, TransactionHistoryEntry,
+    TransactionHistoryEntryExt, TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
+    TransactionPhase, TransactionResult, TransactionResultExt, TransactionResultPair,
+    TransactionResultResult, TransactionResultSet, TransactionSet, TransactionSetV1, TransactionV0,
+    TransactionV0Envelope, TransactionV0Ext, TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
 
 fn frame_xdr<T: WriteXdr>(entry: &T) -> Vec<u8> {
@@ -119,6 +120,47 @@ fn tx_soroban_envelope_with_address_v2_auth(id: u8) -> TransactionEnvelope {
                 body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
                     host_function: HostFunction::InvokeContract(invoke_args),
                     auth: vec![auth].try_into().unwrap(),
+                }),
+            }]
+            .try_into()
+            .unwrap(),
+            ext: stellar_xdr::TransactionExt::V0,
+        },
+        signatures: VecM::default(),
+    })
+}
+
+/// Soroban transaction exercising the CAP-0085 (protocol 28) arms that
+/// pre-28 XDR cannot decode: a `CONTRACT_EXECUTABLE_EXTERNAL_REF` executable
+/// and an `SCV_EXECUTABLE_TAG` constructor argument.
+fn tx_soroban_envelope_with_external_ref_executable(id: u8) -> TransactionEnvelope {
+    let create_v2 = CreateContractArgsV2 {
+        contract_id_preimage: ContractIdPreimage::Address(ContractIdPreimageFromAddress {
+            address: ScAddress::Account(account_id(id)),
+            salt: Uint256([id; 32]),
+        }),
+        executable: ContractExecutable::ExternalRef(ContractExecutableExternalRef {
+            executable_owner: ScAddress::Contract(ContractId(Hash([id; 32]))),
+            tag: ScString("fleet-v2".try_into().unwrap()),
+        }),
+        constructor_args: vec![ScVal::ExecutableTag(ScString(
+            "fleet-v2".try_into().unwrap(),
+        ))]
+        .try_into()
+        .unwrap(),
+    };
+    TransactionEnvelope::Tx(TransactionV1Envelope {
+        tx: Transaction {
+            source_account: muxed_account(id),
+            fee: 100,
+            seq_num: SequenceNumber(i64::from(id) + 1),
+            cond: Preconditions::None,
+            memo: Memo::None,
+            operations: vec![Operation {
+                source_account: None,
+                body: OperationBody::InvokeHostFunction(InvokeHostFunctionOp {
+                    host_function: HostFunction::CreateContractV2(create_v2),
+                    auth: VecM::default(),
                 }),
             }]
             .try_into()
@@ -521,6 +563,22 @@ fn test_parse_transaction_entries_v1_with_cap71_address_v2_credentials() {
         100,
         prev_hash,
         vec![tx_soroban_envelope_with_address_v2_auth(1)],
+    );
+    let parsed = parse_transaction_entries(&frame_xdr(&entry)).unwrap();
+
+    let TransactionHistoryEntryExt::V1(generalized) = &entry.ext else {
+        panic!("expected V1 entry");
+    };
+    assert_eq!(parsed[&100], compute_v1_tx_set_hash(generalized).unwrap());
+}
+
+#[test]
+fn test_parse_transaction_entries_v1_with_cap85_external_ref_executable() {
+    let prev_hash = [0x24; 32];
+    let entry = v1_history_entry(
+        100,
+        prev_hash,
+        vec![tx_soroban_envelope_with_external_ref_executable(1)],
     );
     let parsed = parse_transaction_entries(&frame_xdr(&entry)).unwrap();
 
