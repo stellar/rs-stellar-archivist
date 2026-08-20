@@ -3,7 +3,10 @@
 use crate::history_format;
 use crate::pipeline::{async_trait, HistoryOutcome, Operation, PipelineConfig, ProcessOutcome};
 use crate::storage::{self, Error as StorageError, ErrorClass, StorageRef};
-use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
+use crate::utils::{
+    compute_checkpoint_bounds, fetch_well_known_history_file, probe_well_known_history_file,
+    ArchiveStats, ReportKind,
+};
 use crate::xdr_verify::XdrVerificationManager;
 use thiserror::Error;
 use tokio::sync::OnceCell;
@@ -99,7 +102,7 @@ impl MirrorOperation {
     async fn get_initial_dest_well_known_checkpoint(&self) -> Result<Option<u32>, Error> {
         self.initial_dest_checkpoint
             .get_or_try_init(|| async {
-                match fetch_well_known_history_file(
+                match probe_well_known_history_file(
                     &self.dst_store,
                     self.pipeline_config.storage_config.max_retries as u32,
                     self.pipeline_config
@@ -109,8 +112,8 @@ impl MirrorOperation {
                 )
                 .await
                 {
-                    Ok(has) => Ok(Some(has.current_ledger)),
-                    Err(e) if e.is_not_found() => Ok(None),
+                    Ok(Some(has)) => Ok(Some(has.current_ledger)),
+                    Ok(None) => Ok(None), // No existing archive
                     Err(e) => Err(e.into()),
                 }
             })
@@ -310,8 +313,8 @@ impl Operation for MirrorOperation {
                     }
                 }
             } else {
-                debug!(
-                    "Destination archive does not exist, proceeding with --low {}",
+                info!(
+                    "No existing archive at destination; starting a fresh mirror from --low {}",
                     requested_low
                 );
                 // No destination archive, use the requested low
@@ -333,7 +336,7 @@ impl Operation for MirrorOperation {
                 );
                 Some(next_checkpoint)
             } else {
-                debug!("Destination archive does not exist, starting from beginning");
+                info!("No existing archive at destination; starting a fresh mirror");
                 None
             }
         };
@@ -362,7 +365,7 @@ impl Operation for MirrorOperation {
         stats: &ArchiveStats,
         report_path: Option<&std::path::Path>,
     ) -> Result<(), crate::pipeline::Error> {
-        stats.report("mirror").await;
+        stats.report(ReportKind::Mirror).await;
 
         if let Some(path) = report_path {
             let report = crate::report::ArchiveReport {

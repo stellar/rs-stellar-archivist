@@ -33,7 +33,7 @@ use crate::pipeline::{
     self, async_trait, HistoryOutcome, Operation, Pipeline, PipelineConfig, ProcessOutcome,
 };
 use crate::storage::{self, Error as StorageError, ErrorClass, StorageRef};
-use crate::utils::{self, ArchiveStats, FailureTracker};
+use crate::utils::{self, ArchiveStats, FailureTracker, RepairStage, ReportKind};
 use crate::xdr_verify::{self, XdrParseResult, XdrVerificationManager};
 use futures_util::{stream, StreamExt};
 use opendal::Reader;
@@ -160,11 +160,13 @@ impl RepairOperation {
         *stats.failures.lock().await = tracker;
 
         let file_retry_stats = self.retry_failed_files(&stats).await;
-        file_retry_stats.report("repair file retry").await;
+        file_retry_stats
+            .report(ReportKind::Repair(RepairStage::FileRetry))
+            .await;
 
         let checkpoint_retry_stats = self.retry_failed_checkpoints(&stats).await;
         checkpoint_retry_stats
-            .report("repair checkpoint retry")
+            .report(ReportKind::Repair(RepairStage::CheckpointRetry))
             .await;
 
         // `.well_known` restoration runs after the retry stages because the
@@ -623,7 +625,7 @@ fn build_failed_files_work_list(failures: &FailureTracker) -> Vec<(u32, String)>
 impl Operation for RepairOperation {
     async fn get_checkpoint_bounds(&self) -> Result<(u32, u32), pipeline::Error> {
         // Try destination .well-known first (determines what range to repair)
-        let dst_result = utils::fetch_well_known_history_file(
+        let dst_checkpoint = match utils::probe_well_known_history_file(
             &self.dst_store,
             self.pipeline_config.storage_config.max_retries as u32,
             self.pipeline_config
@@ -631,30 +633,38 @@ impl Operation for RepairOperation {
                 .retry_min_delay
                 .as_millis() as u64,
         )
-        .await;
-
-        let checkpoint = match dst_result {
-            Ok(state) => history_format::round_to_lower_checkpoint(state.current_ledger),
-            Err(e) => {
-                warn!(
-                    "Destination .well-known is unreadable ({}), falling back to source",
-                    e
-                );
-                self.well_known_needs_repair.store(true, Ordering::Relaxed);
-
-                // Fall back to source .well-known
-                let src_state = utils::fetch_well_known_history_file(
-                    &self.src_store,
-                    self.pipeline_config.storage_config.max_retries as u32,
-                    self.pipeline_config
-                        .storage_config
-                        .retry_min_delay
-                        .as_millis() as u64,
-                )
-                .await
-                .map_err(|e| pipeline::Error::RepairOperation(Error::Utils(e)))?;
-                history_format::round_to_lower_checkpoint(src_state.current_ledger)
+        .await
+        {
+            Ok(Some(state)) => Some(history_format::round_to_lower_checkpoint(
+                state.current_ledger,
+            )),
+            Ok(None) => {
+                info!("No destination .well-known; deriving repair range from source");
+                None
             }
+            Err(e) => {
+                warn!("Destination .well-known is unreadable ({e}), falling back to source");
+                None
+            }
+        };
+
+        let checkpoint = if let Some(cp) = dst_checkpoint {
+            cp
+        } else {
+            self.well_known_needs_repair.store(true, Ordering::Relaxed);
+
+            // Fall back to source .well-known
+            let src_state = utils::fetch_well_known_history_file(
+                &self.src_store,
+                self.pipeline_config.storage_config.max_retries as u32,
+                self.pipeline_config
+                    .storage_config
+                    .retry_min_delay
+                    .as_millis() as u64,
+            )
+            .await
+            .map_err(|e| pipeline::Error::RepairOperation(Error::Utils(e)))?;
+            history_format::round_to_lower_checkpoint(src_state.current_ledger)
         };
 
         utils::compute_checkpoint_bounds(checkpoint, self.low, self.high)
@@ -750,7 +760,7 @@ impl Operation for RepairOperation {
         }
 
         if self.dry_run {
-            stats.report("repair").await;
+            stats.report(ReportKind::Repair(RepairStage::Main)).await;
             if let Some(path) = report_path {
                 let report = crate::report::ArchiveReport {
                     version: crate::report::REPORT_VERSION,
@@ -762,19 +772,21 @@ impl Operation for RepairOperation {
             return Ok(());
         }
 
-        stats.report("repair main").await;
+        stats.report(ReportKind::Repair(RepairStage::Main)).await;
 
         // Per-file retry: re-fetch every entry in failures.files /
         // failures.buckets. Returns its own stats — no merging.
         let file_retry_stats = self.retry_failed_files(stats).await;
-        file_retry_stats.report("repair file retry").await;
+        file_retry_stats
+            .report(ReportKind::Repair(RepairStage::FileRetry))
+            .await;
 
         // Per-checkpoint retry: re-mirror every cp in failures.checkpoints.
         // Returns its own stats (including any chain errors surfaced
         // post-retry).
         let checkpoint_retry_stats = self.retry_failed_checkpoints(stats).await;
         checkpoint_retry_stats
-            .report("repair checkpoint retry")
+            .report(ReportKind::Repair(RepairStage::CheckpointRetry))
             .await;
 
         // .well-known restoration runs *after* the retry stages. It copies the

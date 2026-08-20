@@ -110,8 +110,8 @@ async fn verify_bucket_maybe_write(
     if actual != expected {
         // Don't commit — caller aborts the staged write.
         return Err(StorageError::fatal(format!(
-            "Hash mismatch for {}: expected {}, got {}",
-            path, expected, actual
+            "Hash mismatch: got {}",
+            actual
         )));
     }
 

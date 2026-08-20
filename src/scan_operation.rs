@@ -1,16 +1,19 @@
 use crate::history_format;
 use crate::pipeline::{async_trait, HistoryOutcome, Operation, PipelineConfig, ProcessOutcome};
 use crate::storage::{from_opendal_error, Error as StorageError, StorageRef};
-use crate::utils::{compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats};
+use crate::utils::{
+    compute_checkpoint_bounds, fetch_well_known_history_file, ArchiveStats, ReportKind,
+};
 use crate::xdr_verify::XdrVerificationManager;
+use futures_util::StreamExt;
 use opendal::Reader;
 use thiserror::Error;
-use tracing::error;
+use tracing::{error, warn};
 
 #[derive(Error, Debug)]
 pub enum Error {
-    #[error("Archive scan failed")]
-    ScanFailed,
+    #[error("Archive issues found")]
+    IssuesFound,
 
     #[error(transparent)]
     Utils(#[from] crate::utils::Error),
@@ -53,7 +56,6 @@ impl ScanOperation {
     }
 
     async fn consume_stream(&self, path: &str, reader: Reader) -> Result<(), StorageError> {
-        use futures_util::StreamExt;
         let mut stream = reader
             .into_stream(..)
             .await
@@ -132,7 +134,7 @@ impl Operation for ScanOperation {
         stats: &ArchiveStats,
         report_path: Option<&std::path::Path>,
     ) -> Result<(), crate::pipeline::Error> {
-        stats.report("scan").await;
+        stats.report(ReportKind::Scan).await;
 
         if let Some(path) = report_path {
             let report = crate::report::ArchiveReport {
@@ -155,7 +157,11 @@ impl Operation for ScanOperation {
         }
 
         if stats.has_failures().await {
-            return Err(Error::ScanFailed.into());
+            warn!(
+                "Archive is incomplete: {} issue(s) found",
+                stats.issue_count().await
+            );
+            return Err(Error::IssuesFound.into());
         }
 
         Ok(())
