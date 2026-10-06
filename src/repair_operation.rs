@@ -10,8 +10,9 @@
 //! verification manager and stop. On parse failure or missing dst file, fetch
 //! from src via `verify_and_write_xdr` (or `verify_and_write_bucket`) and record
 //! the result. In **failed-list mode** (`known_broken` is `Some` — the retry
-//! stage and plan mode) a listed file skips the dst probe entirely and is
-//! fetched from src directly; only unlisted (discovered) files get the probe.
+//! stage and plan mode) a listed file skips the dst content check and is
+//! fetched from src directly, once its dst copy is confirmed missing or
+//! readable; only unlisted (discovered) files get the full probe.
 //!
 //! **Retry phase** (in `finalize`): after the main pass completes, the manager
 //! has data for every file in the range. Run `verify_checkpoint_chain` (cross-
@@ -90,7 +91,7 @@ pub struct RepairOperation {
     /// Failures already known broken — `Some` only in the failed-list pipelines
     /// (the stage-2 file retry, which plan mode also drives), seeded from the
     /// main pass's stats or the plan. A file in this set is fetched from src
-    /// directly, skipping the dst probe entirely. `None` (regular repair: main
+    /// directly, skipping the dst content check. `None` (regular repair: main
     /// pass, dry-run) probes dst-first for every file.
     known_broken: Option<FailureTracker>,
 }
@@ -121,7 +122,7 @@ impl RepairOperation {
     }
 
     /// Switch this operation into failed-list mode: every file in
-    /// `known_broken` is fetched from src directly (no dst probe); files not
+    /// `known_broken` is fetched from src directly (no dst content check); files not
     /// in the set keep the regular dst-first probe.
     #[must_use]
     pub(crate) fn with_known_broken(mut self, known_broken: FailureTracker) -> Self {
@@ -153,6 +154,19 @@ impl RepairOperation {
         if tracker.is_empty() {
             info!("Plan is empty; nothing to repair");
             return Ok(());
+        }
+        // A missing or unreadable destination .well-known may be part of the
+        // plan, so only a readable one is compared.
+        if let Ok(Some(dst_state)) = utils::probe_well_known_history_file(
+            &self.dst_store,
+            &self.pipeline_config.storage_config,
+        )
+        .await
+        {
+            utils::check_same_network(
+                self.pipeline_config.source_network_passphrase.as_deref(),
+                dst_state.network_passphrase.as_deref(),
+            )?;
         }
         let well_known_cp = tracker.well_known;
 
@@ -210,7 +224,7 @@ impl RepairOperation {
     /// Returns:
     /// - `Ok(true)` — dst is acceptable; caller skips src fetch.
     /// - `Ok(false)` — dst is missing or corrupt, OR the file is in
-    ///   `known_broken` (failed-list mode: no dst probe at all); caller
+    ///   `known_broken` (failed-list mode: no content check); caller
     ///   should fetch from src.
     ///   NotFound on `open_reader`/`exists()` is treated as "missing" so the
     ///   repair can fetch from src immediately. Same for parse failures on a
@@ -239,6 +253,7 @@ impl RepairOperation {
         // copy isn't re-downloaded.
         if let Some(known_broken) = &self.known_broken {
             if known_broken.contains_path(path) {
+                self.ensure_dst_missing_or_readable(path).await?;
                 return Ok(false);
             }
         }
@@ -322,9 +337,9 @@ impl RepairOperation {
     ///
     /// Returns:
     /// - `Ok(true)` — dst file opened AND `f(reader)` returned `true`.
-    /// - `Ok(false)` — dst file is missing (`open_reader` returned `NotFound`),
-    ///   OR `f(reader)` returned `false`.
-    /// - `Err(_)` — any non-`NotFound` storage error from `open_reader`.
+    /// - `Ok(false)` — dst file is missing, OR it reads fine but `f(reader)`
+    ///   returned `false` (the content is bad).
+    /// - `Err(_)` — any non-`NotFound` storage error reading the dst file.
     ///
     /// `f` is typically a parse or hash verification that returns `true`
     /// when the dst content is good.
@@ -334,10 +349,36 @@ impl RepairOperation {
         Fut: std::future::Future<Output = bool> + Send,
     {
         match self.dst_store.open_reader(path).await {
-            Ok(reader) => Ok(f(reader).await),
+            Ok(reader) => {
+                if f(reader).await {
+                    return Ok(true);
+                }
+                // `open_reader` does no I/O, so the check may have failed on
+                // a read error rather than on bad content.
+                self.ensure_dst_missing_or_readable(path).await?;
+                Ok(false)
+            }
             Err(e) if e.class == ErrorClass::NotFound => Ok(false),
             Err(e) => Err(e),
         }
+    }
+
+    /// Before repair replaces the dst copy of `path`, make sure the copy is
+    /// missing or readable. A read error (permission denied, rate limited,
+    /// backend failure) says nothing about whether the stored copy is good,
+    /// so it is returned instead of letting the file be overwritten.
+    async fn ensure_dst_missing_or_readable(&self, path: &str) -> Result<(), StorageError> {
+        // `exists` is false for a missing or empty file, both plainly in need
+        // of repair, and returns any other stat error.
+        if !self.dst_store.exists(path).await? {
+            return Ok(());
+        }
+        let reader = self.dst_store.open_reader(path).await?;
+        reader
+            .read(0..1)
+            .await
+            .map(|_| ())
+            .map_err(|e| storage::from_opendal_error(e, &format!("Failed to read {path}")))
     }
 
     /// Build a fresh `Pipeline<MirrorOperation>` for the per-checkpoint retry
@@ -429,7 +470,7 @@ impl RepairOperation {
         info!("Retrying {} failed file(s)", work.len());
 
         // File-retry runs in failed-list mode: every listed file is fetched
-        // from src directly (no dst probe); transitively discovered buckets are
+        // from src directly (no dst content check); transitively discovered buckets are
         // validated on dst and re-fetched only if missing/invalid.
         //
         // HISTORY work re-walks its referenced buckets through the pipeline's
@@ -506,20 +547,11 @@ impl RepairOperation {
     /// success with `.well-known` still broken.
     async fn repair_well_known(&self, highest_checkpoint: u32) -> bool {
         let history_path = history_format::checkpoint_path("history", highest_checkpoint);
-        let max_retries = self.pipeline_config.storage_config.max_retries as u32;
-        let retry_min_delay_ms = self
-            .pipeline_config
-            .storage_config
-            .retry_min_delay
-            .as_millis() as u64;
+        let storage_config = &self.pipeline_config.storage_config;
 
-        match utils::with_retries(
-            max_retries,
-            retry_min_delay_ms,
-            "probe",
-            &history_path,
-            || self.dst_store.exists(&history_path),
-        )
+        match utils::with_retries(storage_config, "probe", &history_path, || {
+            self.dst_store.exists(&history_path)
+        })
         .await
         {
             Ok(true) => {}
@@ -543,8 +575,7 @@ impl RepairOperation {
             &self.dst_store,
             &history_path,
             self.pipeline_config.source_network_passphrase.as_deref(),
-            max_retries,
-            retry_min_delay_ms,
+            storage_config,
         )
         .await
         {
@@ -627,17 +658,20 @@ impl Operation for RepairOperation {
         // Try destination .well-known first (determines what range to repair)
         let dst_checkpoint = match utils::probe_well_known_history_file(
             &self.dst_store,
-            self.pipeline_config.storage_config.max_retries as u32,
-            self.pipeline_config
-                .storage_config
-                .retry_min_delay
-                .as_millis() as u64,
+            &self.pipeline_config.storage_config,
         )
         .await
         {
-            Ok(Some(state)) => Some(history_format::round_to_lower_checkpoint(
-                state.current_ledger,
-            )),
+            Ok(Some(state)) => {
+                utils::check_same_network(
+                    self.pipeline_config.source_network_passphrase.as_deref(),
+                    state.network_passphrase.as_deref(),
+                )
+                .map_err(|e| pipeline::Error::RepairOperation(Error::Utils(e)))?;
+                Some(history_format::round_to_lower_checkpoint(
+                    state.current_ledger,
+                ))
+            }
             Ok(None) => {
                 info!("No destination .well-known; deriving repair range from source");
                 None
@@ -656,11 +690,7 @@ impl Operation for RepairOperation {
             // Fall back to source .well-known
             let src_state = utils::fetch_well_known_history_file(
                 &self.src_store,
-                self.pipeline_config.storage_config.max_retries as u32,
-                self.pipeline_config
-                    .storage_config
-                    .retry_min_delay
-                    .as_millis() as u64,
+                &self.pipeline_config.storage_config,
             )
             .await
             .map_err(|e| pipeline::Error::RepairOperation(Error::Utils(e)))?;
@@ -697,23 +727,33 @@ impl Operation for RepairOperation {
     /// is on the known-broken list. Returns the parsed state so the pipeline can
     /// walk bucket references.
     async fn process_history(&self, path: &str) -> Result<HistoryOutcome, StorageError> {
-        // Failed-list mode: a listed file is fetched from source directly (no dst
-        // probe), honoring `known_broken` exactly as verify_and_record_dst does.
+        // Failed-list mode: a listed file is fetched from source directly (no
+        // content check), honoring `known_broken` exactly as verify_and_record_dst
+        // does.
         let listed = self
             .known_broken
             .as_ref()
             .is_some_and(|kb| kb.contains_path(path));
 
-        if !listed {
-            if let Ok(buffer) = storage::download_buffer(&self.dst_store, path).await {
-                if let Ok(state) = history_format::parse_history(&buffer, path) {
-                    // Healthy dst copy: keep it, do not write.
-                    return Ok(HistoryOutcome {
-                        outcome: ProcessOutcome::Processed,
-                        state: Some(state),
-                    });
+        if listed {
+            self.ensure_dst_missing_or_readable(path).await?;
+        } else {
+            match storage::download_buffer(&self.dst_store, path).await {
+                Ok(buffer) => {
+                    if let Ok(state) = history_format::parse_history(&buffer, path) {
+                        // Healthy dst copy: keep it, do not write.
+                        return Ok(HistoryOutcome {
+                            outcome: ProcessOutcome::Processed,
+                            state: Some(state),
+                        });
+                    }
+                    // present but corrupt -> fall through and repair
                 }
-                // present but corrupt -> fall through and repair
+                // Missing -> fall through and repair.
+                Err(e) if e.class == ErrorClass::NotFound => {}
+                // Any other read error says nothing about the stored copy;
+                // surface it rather than overwrite a possibly good file.
+                Err(e) => return Err(e),
             }
         }
 

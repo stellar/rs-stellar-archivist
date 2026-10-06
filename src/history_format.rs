@@ -313,21 +313,23 @@ impl HistoryFileState {
     /// backup set for this checkpoint. From each [`BucketLevel`] we take
     /// `curr`, `snap`, and `next.output` (the only [`NextState`] field that
     /// can introduce a bucket not already enumerated at some other level —
-    /// see the [`NextState`] doc).
+    /// see the [`NextState`] doc). Hashes are lowercased so a bucket spelled
+    /// in either case maps to one dedupe key and one path, the lowercase form
+    /// stellar-core writes.
     #[must_use]
     pub(crate) fn buckets(&self) -> BTreeSet<String> {
         let mut result = BTreeSet::new();
         let mut push_levels = |levels: &[BucketLevel]| {
             for level in levels {
                 if !level.curr.is_empty() && !is_zero_hash(&level.curr) {
-                    result.insert(level.curr.clone());
+                    result.insert(level.curr.to_ascii_lowercase());
                 }
                 if !level.snap.is_empty() && !is_zero_hash(&level.snap) {
-                    result.insert(level.snap.clone());
+                    result.insert(level.snap.to_ascii_lowercase());
                 }
                 if let Some(output) = &level.next.output {
                     if !output.is_empty() && !is_zero_hash(output) {
-                        result.insert(output.clone());
+                        result.insert(output.to_ascii_lowercase());
                     }
                 }
             }
@@ -367,9 +369,10 @@ impl HistoryFileState {
 
 /// Parse and validate a history file from a buffer.
 ///
-/// Deserializes the JSON in `buffer` into a `HistoryFileState` and runs
-/// `validate()`. Used by both the pipeline (when downloading per-checkpoint
-/// history files) and repair (when reading destination-side history files).
+/// Deserializes the JSON in `buffer` into a `HistoryFileState`, runs
+/// `validate()`, and requires `currentLedger` to be the checkpoint named by
+/// `path`. Used by both the pipeline (when downloading per-checkpoint history
+/// files) and repair (when reading destination-side history files).
 pub fn parse_history(buffer: &opendal::Buffer, path: &str) -> Result<HistoryFileState, Error> {
     use bytes::Buf;
     let state: HistoryFileState =
@@ -378,6 +381,17 @@ pub fn parse_history(buffer: &opendal::Buffer, path: &str) -> Result<HistoryFile
             error: e.to_string(),
         })?;
     state.validate()?;
+    // Otherwise a source could serve another checkpoint's state, and its
+    // buckets, under this name, and it could later become the destination's
+    // root .well-known.
+    if checkpoint_from_path(path) != Some(state.current_ledger) {
+        return Err(Error::InvalidCurrentLedger {
+            reason: format!(
+                "{} does not match the checkpoint in {path}",
+                state.current_ledger
+            ),
+        });
+    }
     Ok(state)
 }
 

@@ -732,6 +732,82 @@ fn test_parse_scp_entries_rejects_invalid_bytes() {
     assert!(err.message.contains("failed to parse"));
 }
 
+/// About 1.2 MB of nested quorum sets used to recurse without limit and abort
+/// the process with a stack overflow; it must now fail with a parse error.
+#[test]
+fn test_parse_scp_entries_rejects_excessive_depth() {
+    let mut body = Vec::new();
+    let mut put = |v: u32| body.extend_from_slice(&v.to_be_bytes());
+    put(0); // ScpHistoryEntry::V0
+    put(1); // one quorum set
+    for _ in 0..100_000 {
+        put(1); // threshold
+        put(0); // no validators
+        put(1); // one inner set
+    }
+    put(1);
+    put(0);
+    put(0); // innermost set has no inner sets
+    put(63); // ledger_seq
+    put(0); // no messages
+    let mut data = (body.len() as u32 | 0x8000_0000).to_be_bytes().to_vec();
+    data.extend_from_slice(&body);
+
+    // Reaching the depth limit still recurses that deep, which nearly fills the
+    // default 2 MiB test-thread stack in debug builds.
+    let result = std::thread::Builder::new()
+        .stack_size(64 << 20)
+        .spawn(move || parse_scp_entries(&data))
+        .unwrap()
+        .join()
+        .unwrap();
+    assert!(result.unwrap_err().message.contains("depth limit exceeded"));
+}
+
+/// A forged length prefix must fail before allocating; without a length
+/// limit it requested a 4 GiB buffer for a file of a few hundred bytes.
+#[test]
+fn test_parse_transaction_entries_rejects_length_beyond_input() {
+    let entry = v0_history_entry(
+        63,
+        [0; 32],
+        vec![tx_soroban_envelope_with_external_ref_executable(1)],
+    );
+    let mut data = frame_xdr(&entry);
+    let pos = data.windows(8).position(|w| w == b"fleet-v2").unwrap();
+    data[pos - 4..pos].copy_from_slice(&u32::MAX.to_be_bytes());
+
+    let err = parse_transaction_entries_for_checkpoint(&data, None).unwrap_err();
+    assert!(
+        err.message.contains("length limit exceeded"),
+        "{}",
+        err.message
+    );
+}
+
+/// Only the generalized set of a version-1 entry is hashed, so anything in its
+/// legacy set was never committed to by the ledger header and must be rejected.
+#[rstest]
+#[case::legacy_txs(TransactionSet {
+    previous_ledger_hash: Hash([0; 32]),
+    txs: vec![tx_v1_envelope(2)].try_into().unwrap(),
+})]
+#[case::legacy_prev_hash(TransactionSet {
+    previous_ledger_hash: Hash([1; 32]),
+    txs: VecM::default(),
+})]
+fn test_parse_transaction_entries_rejects_legacy_set_in_v1_entry(#[case] legacy: TransactionSet) {
+    let mut entry = v1_history_entry(63, [0; 32], vec![tx_v1_envelope(1)]);
+    entry.tx_set = legacy;
+
+    let err = parse_transaction_entries_for_checkpoint(&frame_xdr(&entry), None).unwrap_err();
+    assert!(
+        err.message.contains("non-empty legacy tx set"),
+        "{}",
+        err.message
+    );
+}
+
 #[test]
 fn test_manager_records_and_verifies_checkpoint() {
     let manager = XdrVerificationManager::new();

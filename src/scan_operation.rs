@@ -75,16 +75,10 @@ impl ScanOperation {
 #[async_trait]
 impl Operation for ScanOperation {
     async fn get_checkpoint_bounds(&self) -> Result<(u32, u32), crate::pipeline::Error> {
-        let source_state = fetch_well_known_history_file(
-            &self.src_store,
-            self.pipeline_config.storage_config.max_retries as u32,
-            self.pipeline_config
-                .storage_config
-                .retry_min_delay
-                .as_millis() as u64,
-        )
-        .await
-        .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))?;
+        let source_state =
+            fetch_well_known_history_file(&self.src_store, &self.pipeline_config.storage_config)
+                .await
+                .map_err(|e| crate::pipeline::Error::ScanOperation(Error::Utils(e)))?;
         let source_checkpoint =
             history_format::round_to_lower_checkpoint(source_state.current_ledger);
 

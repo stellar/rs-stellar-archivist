@@ -29,8 +29,8 @@ use std::sync::Mutex;
 use stellar_xdr::{
     Frame, GeneralizedTransactionSet, Hash, LedgerHeaderHistoryEntry, Limited, Limits,
     ParallelTxsComponent, ReadXdr, ScpHistoryEntry, StellarValueExt, TransactionHistoryEntry,
-    TransactionHistoryEntryExt, TransactionHistoryResultEntry, TransactionPhase, TransactionSetV1,
-    VecM, WriteXdr,
+    TransactionHistoryEntryExt, TransactionHistoryResultEntry, TransactionPhase, TransactionSet,
+    TransactionSetV1, VecM, WriteXdr,
 };
 use tokio::io::{AsyncReadExt, BufReader};
 use tokio_util::io::StreamReader;
@@ -68,6 +68,25 @@ impl HashExt for Hash {
 
 const DECOMPRESS_BUFFER_SIZE: usize = 64 * 1024;
 const CHANNEL_CAPACITY: usize = 64;
+
+/// Largest decompressed ledger, transactions, results, or SCP file accepted.
+/// Pubnet files are well under 100 MB, the cap stops a small gzip bomb from
+/// expanding into many gigabytes of memory.
+const MAX_DECOMPRESSED_XDR_BYTES: usize = 100 * 1024 * 1024; // 100 MB
+
+/// Deepest XDR nesting accepted when parsing an archive file.
+/// stellar-core's depth limit is 1000, so this adds a 2x buffer to be safe.
+const XDR_DEPTH_LIMIT: u32 = 2000;
+
+/// XDR read limits for one decompressed archive file. Capping `len` at the
+/// input size means a forged length prefix cannot request an allocation
+/// larger than the file itself.
+fn xdr_read_limits(decompressed_data: &[u8]) -> Limits {
+    Limits {
+        depth: XDR_DEPTH_LIMIT,
+        len: decompressed_data.len(),
+    }
+}
 
 /// Inclusive `(first_ledger, last_ledger)` range covered by a given checkpoint.
 ///
@@ -806,7 +825,7 @@ pub(crate) fn parse_ledger_header_entries_for_checkpoint(
 ) -> Result<BTreeMap<u32, LedgerHeaderVerificationData>, StorageError> {
     let _g = crate::phase!(crate::metrics::Phase::XdrParseLedger);
     let cursor = Cursor::new(decompressed_data);
-    let mut limited = Limited::new(cursor, Limits::none());
+    let mut limited = Limited::new(cursor, xdr_read_limits(decompressed_data));
     let mut data = BTreeMap::new();
 
     let expected_range = checkpoint.map(expected_ledger_range);
@@ -1015,7 +1034,7 @@ pub(crate) fn parse_result_entries_for_checkpoint(
 ) -> Result<BTreeMap<u32, Hash>, StorageError> {
     let _g = crate::phase!(crate::metrics::Phase::XdrParseResult);
     let cursor = Cursor::new(decompressed_data);
-    let mut limited = Limited::new(cursor, Limits::none());
+    let mut limited = Limited::new(cursor, xdr_read_limits(decompressed_data));
     let mut hashes = BTreeMap::new();
 
     let expected_range = checkpoint.map(expected_ledger_range);
@@ -1105,7 +1124,7 @@ pub(crate) fn parse_transaction_entries_for_checkpoint(
 ) -> Result<BTreeMap<u32, Hash>, StorageError> {
     let _g = crate::phase!(crate::metrics::Phase::XdrParseTx);
     let cursor = Cursor::new(decompressed_data);
-    let mut limited = Limited::new(cursor, Limits::none());
+    let mut limited = Limited::new(cursor, xdr_read_limits(decompressed_data));
     let mut hashes = BTreeMap::new();
 
     let expected_range = checkpoint.map(expected_ledger_range);
@@ -1136,6 +1155,15 @@ pub(crate) fn parse_transaction_entries_for_checkpoint(
         let computed_hash = match &entry.ext {
             TransactionHistoryEntryExt::V0 => compute_v0_tx_set_hash(&entry.tx_set)?,
             TransactionHistoryEntryExt::V1(generalized_tx_set) => {
+                // CAP-42: the legacy set must be empty when a generalized set
+                // is present. Only the generalized set is hashed, so anything
+                // left in the legacy set would be committed unverified.
+                if entry.tx_set != TransactionSet::default() {
+                    return Err(StorageError::fatal(format!(
+                        "transaction entry for ledger seq {} has both a generalized and a non-empty legacy tx set",
+                        seq
+                    )));
+                }
                 compute_v1_tx_set_hash(generalized_tx_set)?
             }
         };
@@ -1157,7 +1185,7 @@ pub(crate) fn parse_transaction_entries_for_checkpoint(
 pub fn parse_scp_entries(decompressed_data: &[u8]) -> Result<(), StorageError> {
     let _g = crate::phase!(crate::metrics::Phase::XdrParseScp);
     let cursor = Cursor::new(decompressed_data);
-    let mut limited = Limited::new(cursor, Limits::none());
+    let mut limited = Limited::new(cursor, xdr_read_limits(decompressed_data));
 
     for result in Frame::<ScpHistoryEntry>::read_xdr_iter(&mut limited) {
         result
@@ -1231,6 +1259,9 @@ where
         let _dg = crate::metrics::DecodeGuard::enter();
         let stream = tokio_stream::wrappers::ReceiverStream::new(rx).map(Ok::<_, std::io::Error>);
         let mut decoder = GzipDecoder::new(BufReader::new(StreamReader::new(stream)));
+        // Decode every gzip member so bytes after the first one are parsed
+        // rather than committed unchecked (see verify_bucket_maybe_write).
+        decoder.multiple_members(true);
 
         let mut decompressed = Vec::new();
         let mut buf = vec![0u8; DECOMPRESS_BUFFER_SIZE];
@@ -1240,6 +1271,12 @@ where
             })?;
             if n == 0 {
                 break;
+            }
+            if decompressed.len() + n > MAX_DECOMPRESSED_XDR_BYTES {
+                return Err(StorageError::fatal(format!(
+                    "{} decompresses to more than {} bytes",
+                    path_owned, MAX_DECOMPRESSED_XDR_BYTES
+                )));
             }
             decompressed.extend_from_slice(&buf[..n]);
         }

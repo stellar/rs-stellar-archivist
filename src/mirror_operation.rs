@@ -104,15 +104,17 @@ impl MirrorOperation {
             .get_or_try_init(|| async {
                 match probe_well_known_history_file(
                     &self.dst_store,
-                    self.pipeline_config.storage_config.max_retries as u32,
-                    self.pipeline_config
-                        .storage_config
-                        .retry_min_delay
-                        .as_millis() as u64,
+                    &self.pipeline_config.storage_config,
                 )
                 .await
                 {
-                    Ok(Some(has)) => Ok(Some(has.current_ledger)),
+                    Ok(Some(has)) => {
+                        crate::utils::check_same_network(
+                            self.pipeline_config.source_network_passphrase.as_deref(),
+                            has.network_passphrase.as_deref(),
+                        )?;
+                        Ok(Some(has.current_ledger))
+                    }
                     Ok(None) => Ok(None), // No existing archive
                     Err(e) => Err(e.into()),
                 }
@@ -160,21 +162,12 @@ impl MirrorOperation {
             // Copy the history file at the specified checkpoint to be our .well-known file
             let history_path = history_format::checkpoint_path("history", highest_checkpoint);
 
-            let max_retries = self.pipeline_config.storage_config.max_retries as u32;
-            let retry_min_delay_ms = self
-                .pipeline_config
-                .storage_config
-                .retry_min_delay
-                .as_millis() as u64;
+            let storage_config = &self.pipeline_config.storage_config;
 
             // Check if the history file exists (it might not if the mirror had failures)
-            if !crate::utils::with_retries(
-                max_retries,
-                retry_min_delay_ms,
-                "probe",
-                &history_path,
-                || self.dst_store.exists(&history_path),
-            )
+            if !crate::utils::with_retries(storage_config, "probe", &history_path, || {
+                self.dst_store.exists(&history_path)
+            })
             .await?
             {
                 return Err(std::io::Error::new(
@@ -191,8 +184,7 @@ impl MirrorOperation {
                 &self.dst_store,
                 &history_path,
                 self.pipeline_config.source_network_passphrase.as_deref(),
-                max_retries,
-                retry_min_delay_ms,
+                storage_config,
             )
             .await?;
 
@@ -222,16 +214,10 @@ impl Operation for MirrorOperation {
         //    - If destination doesn't exist: start from genesis checkpoint
 
         // First, get the source's latest checkpoint to know what's available
-        let source_state = fetch_well_known_history_file(
-            &self.src_store,
-            self.pipeline_config.storage_config.max_retries as u32,
-            self.pipeline_config
-                .storage_config
-                .retry_min_delay
-                .as_millis() as u64,
-        )
-        .await
-        .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
+        let source_state =
+            fetch_well_known_history_file(&self.src_store, &self.pipeline_config.storage_config)
+                .await
+                .map_err(|e| crate::pipeline::Error::MirrorOperation(Error::Utils(e)))?;
         let source_checkpoint =
             history_format::round_to_lower_checkpoint(source_state.current_ledger);
 

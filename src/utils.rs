@@ -7,7 +7,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::history_format::{self, HistoryFileState, ROOT_WELL_KNOWN_PATH};
 use crate::pipeline;
-use crate::storage::{ErrorClass, StorageRef};
+use crate::storage::{ErrorClass, StorageConfig, StorageRef};
 use crate::xdr_verify::VerificationErrorType;
 
 //=============================================================================
@@ -73,6 +73,12 @@ pub enum Error {
     InvalidCheckpointRange {
         low_checkpoint: u32,
         high_checkpoint: u32,
+    },
+
+    #[error("Source network passphrase {source_passphrase:?} does not match the destination's {destination_passphrase:?}")]
+    NetworkMismatch {
+        source_passphrase: String,
+        destination_passphrase: String,
     },
 }
 
@@ -494,16 +500,20 @@ impl ArchiveStats {
 pub struct RetryState {
     pub attempt: u32,
     pub backoff_ms: u64,
+    pub max_backoff_ms: u64,
     pub max_retries: u32,
 }
 
 impl RetryState {
+    /// Start at `retry_min_delay` and double up to `retry_max_delay`.
     #[must_use]
-    pub fn new(max_retries: u32, initial_backoff_ms: u64) -> Self {
+    pub fn new(config: &StorageConfig) -> Self {
+        let max_backoff_ms = config.retry_max_delay.as_millis() as u64;
         Self {
             attempt: 0,
-            backoff_ms: initial_backoff_ms,
-            max_retries,
+            backoff_ms: (config.retry_min_delay.as_millis() as u64).min(max_backoff_ms),
+            max_backoff_ms,
+            max_retries: config.max_retries as u32,
         }
     }
 
@@ -543,19 +553,19 @@ impl RetryState {
         false
     }
 
-    /// Wait for the backoff period and increase it for next time
+    /// Wait for the backoff period and double it for next time, up to `max_backoff_ms`
     pub async fn backoff(&mut self) {
         let duration = tokio::time::Duration::from_millis(self.backoff_ms);
 
         #[cfg(test)]
         if let Ok(vc) = crate::tests::utils::CLOCK_OVERRIDE.try_with(|c| c.clone()) {
             vc.sleep(duration).await;
-            self.backoff_ms = (self.backoff_ms * 2).min(5000);
+            self.backoff_ms = self.backoff_ms.saturating_mul(2).min(self.max_backoff_ms);
             return;
         }
 
         tokio::time::sleep(duration).await;
-        self.backoff_ms = (self.backoff_ms * 2).min(5000); // Cap at 5 seconds
+        self.backoff_ms = self.backoff_ms.saturating_mul(2).min(self.max_backoff_ms);
     }
 }
 
@@ -578,8 +588,7 @@ impl RetryState {
 /// directly) rather than `async || obj.async_method(args).await` — both work,
 /// but the former avoids an extra opaque async-block layer.
 pub async fn with_retries<T, F, Fut>(
-    max_retries: u32,
-    retry_min_delay_ms: u64,
+    config: &StorageConfig,
     action: &str,
     path: &str,
     mut f: F,
@@ -588,7 +597,7 @@ where
     F: FnMut() -> Fut,
     Fut: std::future::Future<Output = Result<T, crate::storage::Error>> + Send,
 {
-    let mut retry = RetryState::new(max_retries, retry_min_delay_ms);
+    let mut retry = RetryState::new(config);
     loop {
         match f().await {
             Ok(val) => return Ok(val),
@@ -609,26 +618,19 @@ where
 /// unparseable, invalid) is still `Err`.
 pub(crate) async fn probe_well_known_history_file(
     store: &StorageRef,
-    max_retries: u32,
-    retry_min_delay_ms: u64,
+    config: &StorageConfig,
 ) -> Result<Option<HistoryFileState>, Error> {
     debug!("Fetching .well-known from path: {}", ROOT_WELL_KNOWN_PATH);
 
     // NotFound is absorbed here, inside the retried closure: it is never
     // retryable, so this changes no retry behavior, and `should_retry` only
     // ever sees reportable errors.
-    let buffer = with_retries(
-        max_retries,
-        retry_min_delay_ms,
-        "download",
-        ROOT_WELL_KNOWN_PATH,
-        || async {
-            match crate::storage::download_buffer(store, ROOT_WELL_KNOWN_PATH).await {
-                Err(e) if e.class == ErrorClass::NotFound => Ok(None),
-                r => r.map(Some),
-            }
-        },
-    )
+    let buffer = with_retries(config, "download", ROOT_WELL_KNOWN_PATH, || async {
+        match crate::storage::download_buffer(store, ROOT_WELL_KNOWN_PATH).await {
+            Err(e) if e.class == ErrorClass::NotFound => Ok(None),
+            r => r.map(Some),
+        }
+    })
     .await
     .map_err(|e| crate::storage::Error {
         class: e.class,
@@ -664,14 +666,12 @@ pub(crate) async fn probe_well_known_history_file(
 ///
 /// Parameters:
 /// - `store`: The storage backend to fetch from
-/// - `max_retries`: Maximum number of retry attempts (0 for no retries, e.g., for local filesystem)
-/// - `retry_min_delay_ms`: Initial backoff delay in milliseconds
+/// - `config`: Retry count and backoff delays
 pub async fn fetch_well_known_history_file(
     store: &StorageRef,
-    max_retries: u32,
-    retry_min_delay_ms: u64,
+    config: &StorageConfig,
 ) -> Result<HistoryFileState, Error> {
-    probe_well_known_history_file(store, max_retries, retry_min_delay_ms)
+    probe_well_known_history_file(store, config)
         .await?
         .ok_or_else(|| {
             error!("Missing {ROOT_WELL_KNOWN_PATH}");
@@ -688,24 +688,34 @@ pub async fn fetch_well_known_history_file(
 /// Returns `None` if the file doesn't exist or is unreachable or omits the passphrase.
 pub(crate) async fn fetch_source_network_passphrase(
     store: &StorageRef,
-    storage_config: &crate::storage::StorageConfig,
+    storage_config: &StorageConfig,
 ) -> Option<String> {
-    match probe_well_known_history_file(
-        store,
-        storage_config.max_retries as u32,
-        storage_config.retry_min_delay.as_millis() as u64,
-    )
-    .await
-    {
+    match probe_well_known_history_file(store, storage_config).await {
         Ok(Some(state)) => state.network_passphrase,
         Ok(None) => {
             debug!("Source has no root .well-known");
             None
         }
         Err(e) => {
-            debug!("Could not read source .well-known network passphrase: {e}");
+            warn!("Could not read source .well-known network passphrase: {e}");
             None
         }
+    }
+}
+
+/// Refuse to extend or repair a destination archive from another network,
+/// which would splice two unrelated histories together. Passes when either
+/// side has no passphrase, since there is nothing to compare.
+pub(crate) fn check_same_network(
+    source: Option<&str>,
+    destination: Option<&str>,
+) -> Result<(), Error> {
+    match (source, destination) {
+        (Some(source), Some(destination)) if source != destination => Err(Error::NetworkMismatch {
+            source_passphrase: source.to_string(),
+            destination_passphrase: destination.to_string(),
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -747,21 +757,16 @@ pub(crate) fn stamp_network_passphrase(
 /// Copy `history_path` (already present on `store`) to
 /// `.well-known/stellar-history.json` on the same store, stamping the network
 /// passphrase when provided. Works on any writable backend; the destination
-/// read and write are retried up to `max_retries` times.
+/// read and write are retried up to `config.max_retries` times.
 pub async fn update_well_known_from_history(
     store: &crate::storage::StorageRef,
     history_path: &str,
     network_passphrase: Option<&str>,
-    max_retries: u32,
-    retry_min_delay_ms: u64,
+    config: &StorageConfig,
 ) -> Result<(), crate::storage::Error> {
-    let buffer = with_retries(
-        max_retries,
-        retry_min_delay_ms,
-        "download",
-        history_path,
-        || crate::storage::download_buffer(store, history_path),
-    )
+    let buffer = with_retries(config, "download", history_path, || {
+        crate::storage::download_buffer(store, history_path)
+    })
     .await?;
     let contents = stamp_network_passphrase(buffer.to_vec(), network_passphrase).map_err(|e| {
         crate::storage::Error::fatal(format!(
@@ -769,8 +774,7 @@ pub async fn update_well_known_from_history(
         ))
     })?;
     with_retries(
-        max_retries,
-        retry_min_delay_ms,
+        config,
         "write",
         crate::history_format::ROOT_WELL_KNOWN_PATH,
         || {

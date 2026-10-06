@@ -43,6 +43,10 @@ async fn verify_bucket_maybe_write(
         let stream = stream.map(Ok::<_, std::io::Error>);
         let stream_reader = tokio_util::io::StreamReader::new(stream);
         let mut decoder = GzipDecoder::new(BufReader::new(stream_reader));
+        // Decode every gzip member, as `gzip -d` does. Otherwise decoding stops
+        // after the first member and any bytes after it are committed without
+        // being hashed; trailing non-gzip bytes now fail as a decode error.
+        decoder.multiple_members(true);
 
         let mut hasher = Sha256::new();
         let mut buf = vec![0u8; HASH_BUFFER_SIZE];

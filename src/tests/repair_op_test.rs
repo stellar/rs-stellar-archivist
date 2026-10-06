@@ -5,7 +5,8 @@
 
 use super::utils::{
     copy_testnet_small_archive, corrupt_ledger_cross_file_hash, delete_first_file,
-    file_url_from_path, get_files_by_pattern, start_http_server, testnet_small_archive_path,
+    file_url_from_path, get_files_by_pattern, set_network_passphrase, start_http_server,
+    testnet_small_archive_path,
 };
 use crate::history_format;
 use crate::test_helpers::{
@@ -2720,3 +2721,63 @@ async fn test_plan_refetches_corrupt_present_file_without_verify() {
 
 // Pubnet early-SCP-gap tolerance for repair and repair --dry-run is covered
 // against real pubnet data in tests/pubnet_scp_gap_test.rs.
+
+/// Resuming a mirror into, or repairing, a destination from another network
+/// must fail rather than splice two networks' histories together.
+#[rstest]
+#[case::mirror(false)]
+#[case::repair(true)]
+#[tokio::test]
+async fn test_rejects_destination_from_another_network(#[case] repair: bool) {
+    let dest_dir = TempDir::new().unwrap();
+    copy_testnet_small_archive(dest_dir.path()).unwrap();
+    set_network_passphrase(dest_dir.path(), "Some Other Network ; 2026");
+    let src_url = file_url_from_path(&testnet_small_archive_path());
+    let dest_url = file_url_from_path(dest_dir.path());
+
+    let result = if repair {
+        run_repair(RepairConfig::new(&src_url, &dest_url)).await
+    } else {
+        run_mirror(MirrorConfig::new(&src_url, &dest_url)).await
+    };
+
+    let err = result.unwrap_err().to_string();
+    assert!(err.contains("does not match the destination"), "{err}");
+}
+
+/// A destination file repair cannot read must fail the run, not be
+/// overwritten: the read error says nothing about the stored copy.
+#[cfg(unix)]
+#[rstest]
+#[case::history("/history-", false)]
+#[case::results_verified("/results-", true)]
+#[tokio::test]
+async fn test_repair_does_not_overwrite_unreadable_file(
+    #[case] pattern: &str,
+    #[case] verify: bool,
+) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dest_dir = TempDir::new().unwrap();
+    copy_testnet_small_archive(dest_dir.path()).unwrap();
+    let file = get_files_by_pattern(dest_dir.path(), pattern)
+        .into_iter()
+        .next()
+        .unwrap();
+    std::fs::write(&file, b"unreadable copy").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&file).is_ok() {
+        return; // permissions are not enforced, e.g. running as root
+    }
+
+    let src_url = file_url_from_path(&testnet_small_archive_path());
+    let mut config = RepairConfig::new(src_url, file_url_from_path(dest_dir.path()));
+    if verify {
+        config = config.verify();
+    }
+    let result = run_repair(config).await;
+
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(result.is_err());
+    assert_eq!(std::fs::read(&file).unwrap(), b"unreadable copy");
+}

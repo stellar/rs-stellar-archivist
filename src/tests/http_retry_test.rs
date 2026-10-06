@@ -257,7 +257,7 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
     let storage_config = StorageConfig::new(
         3,
         Duration::from_secs(1), // initial backoff = 1000ms
-        Duration::from_secs(30),
+        Duration::from_secs(3), // max backoff = 3000ms
         64,
         Duration::from_secs(30),
         Duration::from_secs(300),
@@ -305,7 +305,7 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
     );
 
     // Verify backoff durations recorded by the virtual clock.
-    // Each retried path independently sleeps [1s, 2s, 4s, ...] (capped at 5s).
+    // Each retried path independently sleeps [1s, 2s, 3s] (doubling, capped at 3s).
     // Sorted, that's num_retried_paths copies of each level in ascending order.
     let mut sorted_sleeps = virtual_clock.recorded_sleeps();
     sorted_sleeps.sort();
@@ -317,7 +317,7 @@ async fn test_exponential_backoff_timing(#[case] fail_count: usize) {
             Duration::from_millis(ms),
             num_retried_paths,
         ));
-        ms = (ms * 2).min(5000);
+        ms = (ms * 2).min(3000);
     }
 
     assert_eq!(

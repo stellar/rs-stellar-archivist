@@ -105,6 +105,13 @@ impl CorruptionType {
 // Helper Functions
 //=============================================================================
 
+/// Gzip-compress `data` as a single member
+fn gzip(data: &[u8]) -> Vec<u8> {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(data).expect("Failed to write to encoder");
+    encoder.finish().expect("Failed to finish compression")
+}
+
 /// Get the first bucket file from an archive
 fn get_first_bucket_file(archive_path: &Path) -> PathBuf {
     let bucket_files = get_files_by_pattern(archive_path, "/bucket-");
@@ -122,11 +129,7 @@ fn corrupt_bucket_file(path: &Path, corruption: CorruptionType) {
         }
         CorruptionType::HashMismatch => {
             // Create a valid gzip file with wrong content
-            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
-            encoder
-                .write_all(b"This is valid compressed content but with wrong hash!")
-                .expect("Failed to write to encoder");
-            let compressed = encoder.finish().expect("Failed to finish compression");
+            let compressed = gzip(b"This is valid compressed content but with wrong hash!");
             std::fs::write(path, compressed).expect("Failed to write wrong content to file");
         }
     }
@@ -141,6 +144,23 @@ fn setup_corrupted_archive(corruption: CorruptionType) -> (TempDir, PathBuf) {
 
     let bucket_file = get_first_bucket_file(&archive_path);
     corrupt_bucket_file(&bucket_file, corruption);
+
+    (temp_dir, archive_path)
+}
+
+/// Copy the test archive and append `suffix` to the first file matching `pattern`
+fn setup_archive_with_suffix(pattern: &str, suffix: &[u8]) -> (TempDir, PathBuf) {
+    let temp_dir = TempDir::new().expect("Failed to create temp dir");
+    let archive_path = temp_dir.path().to_path_buf();
+    copy_test_archive(&archive_path).expect("Failed to copy test archive");
+
+    let file = get_files_by_pattern(&archive_path, pattern)
+        .into_iter()
+        .next()
+        .expect("Test archive has no matching file");
+    let mut contents = std::fs::read(&file).expect("Failed to read file");
+    contents.extend_from_slice(suffix);
+    std::fs::write(&file, contents).expect("Failed to write file");
 
     (temp_dir, archive_path)
 }
@@ -189,6 +209,32 @@ async fn test_verify_detects_corruption(#[case] op: Operation, #[case] corruptio
         "{:?} with --verify should fail on {} but succeeded",
         op,
         corruption.description()
+    );
+}
+
+/// Bytes after the first gzip member were once committed without being
+/// decompressed or checked. Extra members and trailing bytes must now fail.
+#[rstest]
+#[case::bucket_extra_member("/bucket-", gzip(b"extra member"))]
+#[case::bucket_trailing_bytes("/bucket-", b"trailing bytes".to_vec())]
+#[case::bucket_truncated_member("/bucket-", vec![0x1f, 0x8b, 0x08])]
+// Spans many read buffers, so the suffix arrives after the first member ends
+#[case::bucket_large_trailing_bytes("/bucket-", vec![0xaa; 1 << 20])]
+#[case::ledger_extra_member("/ledger-", gzip(b"extra member"))]
+#[case::ledger_trailing_bytes("/ledger-", b"trailing bytes".to_vec())]
+#[tokio::test]
+async fn test_verify_rejects_data_after_gzip_member(
+    #[values(Operation::Scan, Operation::Mirror)] op: Operation,
+    #[case] pattern: &str,
+    #[case] suffix: Vec<u8>,
+) {
+    let (_temp_dir, archive_path) = setup_archive_with_suffix(pattern, &suffix);
+
+    let result = op.run_with_verify(&file_url_from_path(&archive_path)).await;
+
+    assert!(
+        result.is_err(),
+        "{op:?} with --verify accepted data after the gzip member of a {pattern} file"
     );
 }
 

@@ -402,8 +402,7 @@ impl<Op: Operation> Pipeline<Op> {
     pub(crate) async fn process_history_and_buckets(&self, checkpoint: u32) {
         let history_path = checkpoint_path("history", checkpoint);
         let result = utils::with_retries(
-            self.config.storage_config.max_retries as u32,
-            self.config.storage_config.retry_min_delay.as_millis() as u64,
+            &self.config.storage_config,
             "process history",
             &history_path,
             || self.operation.process_history(&history_path),
@@ -507,16 +506,10 @@ impl<Op: Operation> Pipeline<Op> {
     /// Process a single file (bucket, ledger, transactions, results, scp).
     /// `checkpoint` is the cp context (for buckets, the discovering cp).
     pub(crate) async fn process_file(&self, checkpoint: u32, path: String) {
-        let result = utils::with_retries(
-            self.config.storage_config.max_retries as u32,
-            self.config.storage_config.retry_min_delay.as_millis() as u64,
-            "process",
-            &path,
-            || {
-                self.operation
-                    .process_object(&path, self.verification_manager.as_ref())
-            },
-        )
+        let result = utils::with_retries(&self.config.storage_config, "process", &path, || {
+            self.operation
+                .process_object(&path, self.verification_manager.as_ref())
+        })
         .await;
         self.record_outcome(checkpoint, &path, result).await;
     }

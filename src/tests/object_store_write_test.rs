@@ -167,7 +167,7 @@ async fn update_well_known_writes_through_the_storage_trait() {
         .await
         .unwrap();
 
-    update_well_known_from_history(&store, &history_path, Some("P"), 0, 100)
+    update_well_known_from_history(&store, &history_path, Some("P"), &test_storage_config())
         .await
         .expect("update .well-known via store");
 

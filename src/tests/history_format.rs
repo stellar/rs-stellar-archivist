@@ -1,8 +1,8 @@
 use crate::history_format::{
-    bucket_path, checkpoint_prefix, count_checkpoints_in_range, hash_prefix, is_checkpoint,
-    is_pubnet_passphrase, is_valid_bucket_hash, round_to_lower_checkpoint,
-    round_to_upper_checkpoint, scp_expected, HistoryFileState, FIRST_SCP_CHECKPOINT,
-    GENESIS_CHECKPOINT_LEDGER, PUBLIC_NETWORK_PASSPHRASE,
+    bucket_path, checkpoint_path, checkpoint_prefix, count_checkpoints_in_range, hash_prefix,
+    is_checkpoint, is_pubnet_passphrase, is_valid_bucket_hash, parse_history,
+    round_to_lower_checkpoint, round_to_upper_checkpoint, scp_expected, HistoryFileState,
+    FIRST_SCP_CHECKPOINT, GENESIS_CHECKPOINT_LEDGER, PUBLIC_NETWORK_PASSPHRASE,
 };
 use rstest::*;
 use std::fs;
@@ -346,6 +346,20 @@ fn test_bucket_path_rejects_invalid_hashes(#[case] hash: &str) {
     assert!(matches!(
         hash_prefix(hash).unwrap_err(),
         crate::history_format::Error::MalformedBucketHash { .. }
+    ));
+}
+
+/// A history file must describe the checkpoint its path names; a source could
+/// otherwise serve another checkpoint's state under that name.
+#[rstest]
+fn test_parse_history_requires_checkpoint_from_path(canonical_v1_json: serde_json::Value) {
+    let ledger = u32::try_from(canonical_v1_json["currentLedger"].as_u64().unwrap()).unwrap();
+    let buffer = opendal::Buffer::from(serde_json::to_vec(&canonical_v1_json).unwrap());
+
+    assert!(parse_history(&buffer, &checkpoint_path("history", ledger)).is_ok());
+    assert!(matches!(
+        parse_history(&buffer, &checkpoint_path("history", ledger + 64)).unwrap_err(),
+        crate::history_format::Error::InvalidCurrentLedger { .. }
     ));
 }
 
