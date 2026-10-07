@@ -45,9 +45,7 @@ use walkdir::WalkDir;
 pub(crate) fn mock_object_store(root: &Path) -> StorageRef {
     let root_str = root.normalize().to_string_lossy().to_string();
     let builder = Fs::default().root(&root_str).atomic_write_dir(&root_str);
-    let operator = Operator::new(builder)
-        .expect("build mock object store operator")
-        .finish();
+    let operator = Operator::new(builder).expect("build mock object store operator");
     Arc::new(OpendalStore::from_operator(
         operator, "", None, /*writable=*/ true, /*atomic_writes=*/ true,
     ))

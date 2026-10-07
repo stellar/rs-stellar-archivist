@@ -10,7 +10,10 @@
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use normalize_path::NormalizePath;
-use opendal::{layers, Buffer, ErrorKind, Operator, Reader, Writer};
+use opendal::{
+    layers, Buffer, ErrorKind, HttpTransporter, OperationContext, Operator, Reader, Writer,
+};
+use opendal_http_transport_reqwest::ReqwestTransport;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -416,47 +419,32 @@ impl OpendalStore {
         }
     }
 
-    /// Apply standard layers to an operator builder
+    /// Apply standard layers to an operator builder, and send every HTTP-based
+    /// service's requests through our own client (see [`Self::create_http_client`]).
+    /// Note: No `RetryLayer` - retries are handled at the pipeline level to avoid
+    /// file corruption from partial writes during streaming operations.
     fn apply_layers<B: opendal::Builder>(
         builder: B,
         config: &StorageConfig,
     ) -> Result<Operator, Error> {
-        Self::apply_layers_with_http_client(builder, config, None)
-    }
-
-    /// Apply standard layers to an operator builder with optional custom HTTP client.
-    /// Note: No `RetryLayer` - retries are handled at the pipeline level to avoid
-    /// file corruption from partial writes during streaming operations.
-    fn apply_layers_with_http_client<B: opendal::Builder>(
-        builder: B,
-        config: &StorageConfig,
-        http_client: Option<opendal::raw::HttpClient>,
-    ) -> Result<Operator, Error> {
         // Build operator with layers
         // Order of layers (innermost to outermost):
-        //   Service -> HttpClient -> Timeout -> ConcurrentLimit -> Logging
-        // Note: ThrottleLayer is applied at the end since it needs the final Operator type
+        //   Service -> Timeout -> ConcurrentLimit -> Logging -> Throttle
         // Note: No RetryLayer - retries are handled at the pipeline level with proper error
         //       classification (see from_opendal_error)
+        let transport = HttpTransporter::new(ReqwestTransport::new(Self::create_http_client()?));
         let op = Operator::new(builder)
             .map_err(|e| Error::fatal(format!("Failed to create operator: {e}")))?
+            .with_context(OperationContext::new().with_http_transport(transport))
             .layer(
                 layers::TimeoutLayer::default()
                     .with_timeout(config.timeout)
                     .with_io_timeout(config.io_timeout),
             )
             .layer(layers::ConcurrentLimitLayer::new(config.max_concurrent))
-            .layer(layers::LoggingLayer::default())
-            .finish();
+            .layer(layers::LoggingLayer::default());
 
-        // Apply custom HTTP client if provided (must be applied after finish() for dynamic dispatch)
-        let op = if let Some(client) = http_client {
-            op.layer(layers::HttpClientLayer::new(client))
-        } else {
-            op
-        };
-
-        // Add bandwidth throttling if configured (applied at the end on the finished Operator)
+        // Add bandwidth throttling if configured
         let op = if config.bandwidth_limit > 0 {
             // Burst is set to 2x bandwidth to allow some burstiness while still limiting overall throughput
             op.layer(layers::ThrottleLayer::new(
@@ -515,15 +503,18 @@ impl OpendalStore {
     /// User-Agent string for HTTP requests
     const USER_AGENT: &'static str = concat!("stellar-archivist/", env!("CARGO_PKG_VERSION"));
 
-    /// Create a custom HTTP client with proper User-Agent header
-    fn create_http_client() -> Result<opendal::raw::HttpClient, Error> {
-        let reqwest_client = reqwest::Client::builder()
+    /// Create the HTTP client used by every HTTP-based backend, with a proper
+    /// User-Agent header and redirect following (up to 10 redirects)
+    fn create_http_client() -> Result<reqwest::Client, Error> {
+        // reqwest is built without a bundled TLS crypto provider, so use
+        // rustls's ring provider. Installing fails only when a provider is
+        // already installed, which is fine.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        reqwest::Client::builder()
             .user_agent(Self::USER_AGENT)
             .redirect(reqwest::redirect::Policy::limited(10))
             .build()
-            .map_err(|e| Error::fatal(format!("Failed to create HTTP client: {e}")))?;
-
-        Ok(opendal::raw::HttpClient::with(reqwest_client))
+            .map_err(|e| Error::fatal(format!("Failed to create HTTP client: {e}")))
     }
 
     /// Create an HTTP/HTTPS storage backend
@@ -557,8 +548,7 @@ impl OpendalStore {
         tracing::debug!("HTTP backend: endpoint={}, root={}", endpoint, root);
 
         let builder = Http::default().endpoint(&endpoint).root(root);
-        let http_client = Self::create_http_client()?;
-        let operator = Self::apply_layers_with_http_client(builder, config, Some(http_client))?;
+        let operator = Self::apply_layers(builder, config)?;
 
         Ok(Self::from_operator(
             operator, "", None, false, // HTTP is read-only

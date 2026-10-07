@@ -9,11 +9,4 @@ ignore = [
     # Pulled in by reqsign (via opendal) only to sign cloud credentials
     # requests; no RSA decryption happens, so there is no timing oracle.
     "RUSTSEC-2023-0071",
-
-    # quick-xml 0.37 and 0.38: excessive allocation and quadratic time on
-    # hostile XML. Fixed in 0.41, which needs an opendal release newer than
-    # 0.55. Only XML responses from S3 and Azure endpoints the operator
-    # configured are parsed, never archive content.
-    "RUSTSEC-2026-0194",
-    "RUSTSEC-2026-0195",
 ]

@@ -61,10 +61,17 @@ url = { version = "2.5" }
 async-trait = "0.1"
 tokio-util = { version = "0.7.16", features = ["compat", "io"] }
 lru = { version = "0.18" }
-opendal = { version = "0.55", default-features = false, features = ["services-fs", "services-http", "layers-throttle"] }
+# Not 0.59 yet: its HTTP reader rejects responses without Content-Length,
+# which history.stellar.org serves over HTTP/2.
+opendal = { version = "0.58.2", default-features = false, features = ["services-fs", "services-http", "layers-concurrent-limit", "layers-logging", "layers-throttle", "layers-timeout"] }
+# The HTTP transport opendal uses, built on our own reqwest client.
+opendal-http-transport-reqwest = { version = "0.58.2", default-features = false, features = ["rustls-no-provider"] }
 bytes = { version = "1" }
 futures-io = { version = "0.3" }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+# TLS uses rustls with the ring crypto provider, installed at runtime, rather
+# than reqwest's default aws-lc-rs provider, which needs a C/CMake build.
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 normalize-path = { version = "0.2.1" }
 sha2 = "0.10"
 # NB: the stellar-xdr needs to keep up-to-date with the latest major (protocol)
