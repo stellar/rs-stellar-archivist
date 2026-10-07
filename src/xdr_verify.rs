@@ -15,6 +15,8 @@
 //! - Result set hash matches ledger header's `tx_set_result_hash`
 //! - Intra-checkpoint hash chain: `ledger[N].previous_ledger_hash == hash(ledger[N-1])`
 //! - Cross-checkpoint hash chain: first ledger's `previous_ledger_hash` matches prior checkpoint's last hash
+//! - CAP-0083 empty-tx-set and CAP-0088 millisecond close-time header semantics,
+//!   within and across checkpoints
 
 use crate::history_format::{self, CHECKPOINT_FREQUENCY, GENESIS_CHECKPOINT_LEDGER};
 use crate::storage::{from_opendal_error, Error as StorageError, StagedWriter, StorageRef};
@@ -47,6 +49,12 @@ const ZERO_HASH: Hash = Hash([0; 32]);
 
 /// Protocol version at which CAP-0083 empty-tx-set values become valid.
 const EMPTY_TX_SET_PROTOCOL_VERSION: u32 = 28;
+
+/// Protocol version at which CAP-0088 millisecond close-time values replace
+/// whole-second ones. stellar-core gates the format on the *predecessor*
+/// ledger's protocol: a ledger carries an ms ext arm iff the ledger before it
+/// closed on this protocol or later.
+const MS_CLOSE_TIME_PROTOCOL_VERSION: u32 = 30;
 
 /// SHA-256 of `data` returned as a `stellar_xdr::Hash` (the same newtype
 /// used by ledger headers, tx-set hashes, etc.).
@@ -125,13 +133,19 @@ pub struct LedgerHeaderVerificationData {
     /// `entry.header.ledger_version` — used for the CAP-0083 protocol gate and
     /// the cross-ledger `proposed_prev_ledger_version` check.
     pub ledger_version: u32,
-    /// `Some` iff `scp_value.ext` is `STELLAR_VALUE_EMPTY_TX_SET` (CAP-0083).
+    /// `Some` iff `scp_value.ext` is `STELLAR_VALUE_EMPTY_TX_SET` or
+    /// `STELLAR_VALUE_EMPTY_TX_SET_MS` (CAP-0083).
     pub empty_tx_set: Option<EmptyTxSetInfo>,
+    /// `entry.header.scp_value.close_time` (whole seconds).
+    pub close_time: u64,
+    /// `closeTimeMs` from the ext arm. `Some` iff `scp_value.ext` is
+    /// `STELLAR_VALUE_SIGNED_MS` or `STELLAR_VALUE_EMPTY_TX_SET_MS` (CAP-0088).
+    pub close_time_ms: Option<u64>,
 }
 
-/// `proposedValue` details from a CAP-0083 `STELLAR_VALUE_EMPTY_TX_SET` header
-/// ext arm: the value the network dropped. The dropped set's own hash is not
-/// archived anywhere, so only the previous-ledger fields are verifiable.
+/// `proposedValue` / `proposedMsValue` details from a CAP-0083 empty-tx-set
+/// header ext arm: the value the network dropped. The dropped set's own hash
+/// is not archived anywhere, so only the previous-ledger fields are verifiable.
 #[derive(Debug, Clone)]
 pub struct EmptyTxSetInfo {
     /// `proposedValue.previous_ledger_hash` — must equal the header's own
@@ -162,6 +176,9 @@ struct CheckpointBoundary {
     /// When the checkpoint's first ledger is a CAP-0083 empty-tx-set ledger,
     /// its `proposedValue.previous_ledger_version` (else `None`).
     first_empty_proposed_prev_version: Option<u32>,
+    /// Whether the checkpoint's first ledger carries a CAP-0088 ms close-time
+    /// ext arm, which must agree with the previous checkpoint's last version.
+    first_has_ms_close_time: bool,
 }
 
 /// Kind of verification failure detected. The associated `u32` is the
@@ -317,6 +334,7 @@ impl XdrVerificationManager {
         self.verify_checkpoint_completeness(checkpoint, &header_data);
 
         self.verify_empty_tx_set_internal(&header_data);
+        self.verify_ms_close_time_internal(&header_data);
 
         if let Some(tx_set_hashes) = data.tx_set_hashes {
             self.verify_tx_set_hashes_internal(&header_data, &tx_set_hashes);
@@ -400,7 +418,8 @@ impl XdrVerificationManager {
 
     /// Verify CAP-0083 empty-tx-set header semantics.
     ///
-    /// For each ledger whose `scp_value.ext` is `STELLAR_VALUE_EMPTY_TX_SET`:
+    /// For each ledger whose `scp_value.ext` is `STELLAR_VALUE_EMPTY_TX_SET` or
+    /// `STELLAR_VALUE_EMPTY_TX_SET_MS`:
     /// - `tx_set_hash` must be all-zeros
     /// - `ledger_version` must be >= [`EMPTY_TX_SET_PROTOCOL_VERSION`]
     /// - `proposedValue.previous_ledger_version` must be >=
@@ -490,6 +509,85 @@ impl XdrVerificationManager {
                      (only genesis may have a zero tx set hash)"
                         .to_string(),
                 );
+            }
+            prev = Some((seq, data));
+        }
+        if !errors.is_empty() {
+            self.errors.lock().unwrap().extend(errors);
+        }
+    }
+
+    /// Verify CAP-0088 millisecond close-time header semantics.
+    ///
+    /// For each ledger:
+    /// - an ms ext arm's `closeTimeMs / 1000` must equal `scp_value.close_time`
+    /// - an ms ext arm requires `ledger_version` >= [`MS_CLOSE_TIME_PROTOCOL_VERSION`]
+    /// - an empty-tx-set ledger carries its predecessor's protocol in
+    ///   `previous_ledger_version`, so it must use the ms arm iff that
+    ///   protocol is >= [`MS_CLOSE_TIME_PROTOCOL_VERSION`]
+    /// - for adjacent in-checkpoint pairs, a ledger must use an ms arm iff
+    ///   its predecessor's `ledger_version` is >=
+    ///   [`MS_CLOSE_TIME_PROTOCOL_VERSION`] (the checkpoint-boundary case is
+    ///   checked in [`verify_checkpoint_chain`](Self::verify_checkpoint_chain))
+    fn verify_ms_close_time_internal(
+        &self,
+        header_data: &BTreeMap<u32, LedgerHeaderVerificationData>,
+    ) {
+        let mut errors = Vec::new();
+        let mut prev: Option<(u32, &LedgerHeaderVerificationData)> = None;
+        for (&seq, data) in header_data {
+            let has_ms = data.close_time_ms.is_some();
+            if let Some(close_time_ms) = data.close_time_ms {
+                if close_time_ms / 1000 != data.close_time {
+                    report_ledger_error(
+                        &mut errors,
+                        seq,
+                        format!(
+                            "ms close time {close_time_ms} disagrees with close time {} \
+                             (closeTime must equal closeTimeMs / 1000)",
+                            data.close_time,
+                        ),
+                    );
+                }
+                if data.ledger_version < MS_CLOSE_TIME_PROTOCOL_VERSION {
+                    report_ledger_error(
+                        &mut errors,
+                        seq,
+                        format!(
+                            "ms close-time ext arm on protocol {} (requires protocol >= {})",
+                            data.ledger_version, MS_CLOSE_TIME_PROTOCOL_VERSION,
+                        ),
+                    );
+                }
+            }
+            if let Some(info) = &data.empty_tx_set {
+                let expect_ms = info.proposed_prev_ledger_version >= MS_CLOSE_TIME_PROTOCOL_VERSION;
+                if has_ms != expect_ms {
+                    report_ledger_error(
+                        &mut errors,
+                        seq,
+                        close_time_format_mismatch(
+                            has_ms,
+                            "proposed previous ledger version",
+                            info.proposed_prev_ledger_version,
+                        ),
+                    );
+                }
+            }
+            if let Some((prev_seq, prev_data)) = prev {
+                if prev_seq.saturating_add(1) == seq
+                    && has_ms != (prev_data.ledger_version >= MS_CLOSE_TIME_PROTOCOL_VERSION)
+                {
+                    report_ledger_error(
+                        &mut errors,
+                        seq,
+                        close_time_format_mismatch(
+                            has_ms,
+                            "previous ledger's version",
+                            prev_data.ledger_version,
+                        ),
+                    );
+                }
             }
             prev = Some((seq, data));
         }
@@ -708,6 +806,7 @@ impl XdrVerificationManager {
                     .empty_tx_set
                     .as_ref()
                     .map(|info| info.proposed_prev_ledger_version),
+                first_has_ms_close_time: first_data.close_time_ms.is_some(),
             },
         );
     }
@@ -762,6 +861,26 @@ impl XdrVerificationManager {
                         message: err_msg,
                     });
                 }
+            }
+
+            let prev_version = prev_boundary.last_ledger_version;
+            if curr_boundary.first_has_ms_close_time
+                != (prev_version >= MS_CLOSE_TIME_PROTOCOL_VERSION)
+            {
+                let first_ledger = curr_checkpoint.saturating_sub(63);
+                let err_msg = format!(
+                    "ledger {first_ledger}: {} (checkpoint {prev_checkpoint})",
+                    close_time_format_mismatch(
+                        curr_boundary.first_has_ms_close_time,
+                        "previous ledger's version",
+                        prev_version,
+                    ),
+                );
+                error!("{err_msg}");
+                chain_errors.push(VerificationError {
+                    kind: VerificationErrorType::Boundary(curr_checkpoint),
+                    message: err_msg,
+                });
             }
         }
 
@@ -874,12 +993,23 @@ pub(crate) fn parse_ledger_header_entries_for_checkpoint(
 
         debug!("Verified ledger {} hash: {}", seq, computed_hash.to_hex());
 
-        let empty_tx_set = match &entry.header.scp_value.ext {
-            StellarValueExt::EmptyTxSet(pv) => Some(EmptyTxSetInfo {
-                proposed_prev_ledger_hash: pv.previous_ledger_hash.clone(),
-                proposed_prev_ledger_version: pv.previous_ledger_version,
-            }),
-            StellarValueExt::Basic | StellarValueExt::Signed(_) => None,
+        let (empty_tx_set, close_time_ms) = match &entry.header.scp_value.ext {
+            StellarValueExt::EmptyTxSet(pv) => (
+                Some(EmptyTxSetInfo {
+                    proposed_prev_ledger_hash: pv.previous_ledger_hash.clone(),
+                    proposed_prev_ledger_version: pv.previous_ledger_version,
+                }),
+                None,
+            ),
+            StellarValueExt::EmptyTxSetMs(pv) => (
+                Some(EmptyTxSetInfo {
+                    proposed_prev_ledger_hash: pv.previous_ledger_hash.clone(),
+                    proposed_prev_ledger_version: pv.previous_ledger_version,
+                }),
+                Some(pv.close_time_ms.0),
+            ),
+            StellarValueExt::SignedMs(sv) => (None, Some(sv.close_time_ms.0)),
+            StellarValueExt::Basic | StellarValueExt::Signed(_) => (None, None),
         };
 
         data.insert(
@@ -891,6 +1021,8 @@ pub(crate) fn parse_ledger_header_entries_for_checkpoint(
                 expected_result_hash: entry.header.tx_set_result_hash,
                 ledger_version: entry.header.ledger_version,
                 empty_tx_set,
+                close_time: entry.header.scp_value.close_time.0,
+                close_time_ms,
             },
         );
     }
@@ -949,6 +1081,22 @@ pub(crate) fn compute_empty_v1_parallel_tx_set_hash(previous_ledger_hash: &Hash)
             }),
         ],
     )
+}
+
+/// Describe a CAP-0088 close-time format that disagrees with the predecessor
+/// protocol it was decided by: `has_ms` is whether the ledger carries an ms
+/// ext arm, `source` names where `prev_version` came from.
+fn close_time_format_mismatch(has_ms: bool, source: &str, prev_version: u32) -> String {
+    if has_ms {
+        format!(
+            "ms close-time ext arm but {source} {prev_version} predates protocol {MS_CLOSE_TIME_PROTOCOL_VERSION}"
+        )
+    } else {
+        format!(
+            "whole-second close-time ext arm but {source} {prev_version} requires ms close time \
+             (protocol >= {MS_CLOSE_TIME_PROTOCOL_VERSION})"
+        )
+    }
 }
 
 /// Whether `expected` is one of the recognized "no transactions in this ledger"

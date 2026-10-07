@@ -76,7 +76,10 @@ normalize-path = { version = "0.2.1" }
 sha2 = "0.10"
 # NB: the stellar-xdr needs to keep up-to-date with the latest major (protocol)
 # version or it may fail to parse the latest ledger format.
-stellar-xdr = { version = "28.0.0", default-features = true }
+# Pinned to an unreleased rs-stellar-xdr main commit for the protocol 30 XDR
+# (CAP-0088 millisecond close times); switch back to a crates.io release once
+# one ships, since a git dependency blocks `cargo publish`.
+stellar-xdr = { git = "https://github.com/stellar/rs-stellar-xdr", rev = "28f34cf5a963e3cb13a25456eb9bbda7e0e1ad64", default-features = true }
 async-compression = { version = "0.4", features = ["tokio", "gzip"] }
 flate2 = "1.1.9"
 hex = "0.4"
