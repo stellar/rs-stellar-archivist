@@ -19,12 +19,13 @@ use stellar_xdr::{
     OperationBody, ParallelTxsComponent, Preconditions, PublicKey, ScAddress, ScString, ScSymbol,
     ScVal, ScpHistoryEntry, ScpHistoryEntryV0, SequenceNumber, Signature,
     SorobanAddressCredentials, SorobanAuthorizationEntry, SorobanAuthorizedFunction,
-    SorobanAuthorizedInvocation, SorobanCredentials, StellarValueExt, StellarValueProposedValue,
-    TimePoint, Transaction, TransactionEnvelope, TransactionHistoryEntry,
-    TransactionHistoryEntryExt, TransactionHistoryResultEntry, TransactionHistoryResultEntryExt,
-    TransactionPhase, TransactionResult, TransactionResultExt, TransactionResultPair,
-    TransactionResultResult, TransactionResultSet, TransactionSet, TransactionSetV1, TransactionV0,
-    TransactionV0Envelope, TransactionV0Ext, TransactionV1Envelope, Uint256, VecM, WriteXdr,
+    SorobanAuthorizedInvocation, SorobanCredentials, StellarValueExt, StellarValueProposedMsValue,
+    StellarValueProposedValue, StellarValueSignedMsValue, TimePoint, TimePointMs, Transaction,
+    TransactionEnvelope, TransactionHistoryEntry, TransactionHistoryEntryExt,
+    TransactionHistoryResultEntry, TransactionHistoryResultEntryExt, TransactionPhase,
+    TransactionResult, TransactionResultExt, TransactionResultPair, TransactionResultResult,
+    TransactionResultSet, TransactionSet, TransactionSetV1, TransactionV0, TransactionV0Envelope,
+    TransactionV0Ext, TransactionV1Envelope, Uint256, VecM, WriteXdr,
 };
 
 fn frame_xdr<T: WriteXdr>(entry: &T) -> Vec<u8> {
@@ -257,7 +258,7 @@ fn create_minimal_ledger_header(
         previous_ledger_hash: Hash(prev_hash),
         scp_value: stellar_xdr::StellarValue {
             tx_set_hash: Hash(tx_set_hash),
-            close_time: TimePoint(0),
+            close_time: TimePoint(u64::from(seq)),
             upgrades: VecM::default(),
             ext: stellar_xdr::StellarValueExt::Basic,
         },
@@ -322,6 +323,54 @@ fn create_cap83_ledger_header_entry(
     }
 }
 
+fn lc_value_signature() -> LedgerCloseValueSignature {
+    LedgerCloseValueSignature {
+        node_id: NodeId(PublicKey::PublicKeyTypeEd25519(Uint256([7; 32]))),
+        signature: Signature::default(),
+    }
+}
+
+fn hash_ledger_header(header: LedgerHeader) -> LedgerHeaderHistoryEntry {
+    let header_xdr = header.to_xdr(Limits::none()).unwrap();
+    let computed_hash: [u8; 32] = Sha256::digest(&header_xdr).into();
+    LedgerHeaderHistoryEntry {
+        hash: Hash(computed_hash),
+        header,
+        ext: LedgerHeaderHistoryEntryExt::V0,
+    }
+}
+
+/// A protocol-30 header with a CAP-0088 `STELLAR_VALUE_SIGNED_MS` ext arm.
+fn create_signed_ms_ledger_header_entry(seq: u32, close_time_ms: u64) -> LedgerHeaderHistoryEntry {
+    let mut header = create_minimal_ledger_header(seq, [1; 32], [2; 32], [3; 32]);
+    header.ledger_version = 30;
+    header.scp_value.close_time = TimePoint(close_time_ms / 1000);
+    header.scp_value.ext = StellarValueExt::SignedMs(StellarValueSignedMsValue {
+        close_time_ms: TimePointMs(close_time_ms),
+        lc_value_signature: lc_value_signature(),
+    });
+    hash_ledger_header(header)
+}
+
+/// A protocol-30 header with a CAP-0088 `STELLAR_VALUE_EMPTY_TX_SET_MS` ext arm.
+fn create_empty_tx_set_ms_ledger_header_entry(
+    seq: u32,
+    prev_hash: [u8; 32],
+    close_time_ms: u64,
+) -> LedgerHeaderHistoryEntry {
+    let mut header = create_minimal_ledger_header(seq, prev_hash, [0; 32], EMPTY_XDR_ARRAY_HASH.0);
+    header.ledger_version = 30;
+    header.scp_value.close_time = TimePoint(close_time_ms / 1000);
+    header.scp_value.ext = StellarValueExt::EmptyTxSetMs(StellarValueProposedMsValue {
+        close_time_ms: TimePointMs(close_time_ms),
+        tx_set_hash: Hash(hash_of("dropped-tx-set")),
+        previous_ledger_hash: Hash(prev_hash),
+        previous_ledger_version: 30,
+        lc_value_signature: lc_value_signature(),
+    });
+    hash_ledger_header(header)
+}
+
 fn create_complete_checkpoint_data(
     checkpoint: u32,
     initial_prev_hash: [u8; 32],
@@ -341,6 +390,8 @@ fn create_complete_checkpoint_data(
                 expected_result_hash: Hash([0; 32]),
                 ledger_version: 21,
                 empty_tx_set: None,
+                close_time: u64::from(seq),
+                close_time_ms: None,
             },
         );
         prev_hash = computed_hash;
@@ -374,6 +425,8 @@ fn single_ledger_header_data(
             expected_result_hash: Hash([0; 32]),
             ledger_version: 21,
             empty_tx_set: None,
+            close_time: u64::from(seq),
+            close_time_ms: None,
         },
     )])
 }
@@ -452,6 +505,35 @@ fn test_parse_plain_header_has_no_empty_tx_set_info() {
     let parsed = parse_ledger_header_entries(&frame_xdr(&entry)).unwrap();
     assert_eq!(parsed[&100].ledger_version, 21);
     assert!(parsed[&100].empty_tx_set.is_none());
+    assert!(parsed[&100].close_time_ms.is_none());
+}
+
+#[test]
+fn test_parse_signed_ms_header_extracts_close_time_ms() {
+    let entry = create_signed_ms_ledger_header_entry(100, 1_700_000_000_250);
+    let parsed = parse_ledger_header_entries(&frame_xdr(&entry)).unwrap();
+    let data = &parsed[&100];
+    assert_eq!(data.ledger_version, 30);
+    assert_eq!(data.close_time, 1_700_000_000);
+    assert_eq!(data.close_time_ms, Some(1_700_000_000_250));
+    assert!(data.empty_tx_set.is_none());
+}
+
+#[test]
+fn test_parse_empty_tx_set_ms_header_extracts_empty_tx_set_and_close_time_ms() {
+    let prev = hash_of("prev-ledger");
+    let entry = create_empty_tx_set_ms_ledger_header_entry(100, prev, 1_700_000_000_250);
+    let parsed = parse_ledger_header_entries(&frame_xdr(&entry)).unwrap();
+    let data = &parsed[&100];
+    assert_eq!(data.close_time, 1_700_000_000);
+    assert_eq!(data.close_time_ms, Some(1_700_000_000_250));
+    let info = data
+        .empty_tx_set
+        .as_ref()
+        .expect("EmptyTxSetMs ext must be extracted as an empty-tx-set ledger");
+    assert_eq!(info.proposed_prev_ledger_hash, Hash(prev));
+    assert_eq!(info.proposed_prev_ledger_version, 30);
+    assert_eq!(data.expected_tx_set_hash, Hash([0; 32]));
 }
 
 #[test]
@@ -903,6 +985,8 @@ fn test_ledger_outside_expected_checkpoint_range() {
             expected_result_hash: Hash([0; 32]),
             ledger_version: 21,
             empty_tx_set: None,
+            close_time: 200,
+            close_time_ms: None,
         },
     );
 
@@ -965,6 +1049,8 @@ fn test_consecutive_checkpoints_full(#[case] break_chain: bool) {
                 expected_result_hash: Hash([0; 32]),
                 ledger_version: 21,
                 empty_tx_set: None,
+                close_time: u64::from(seq),
+                close_time_ms: None,
             },
         );
         prev_hash = computed_hash;
@@ -1418,6 +1504,8 @@ fn cap83_header_data(
             proposed_prev_ledger_hash: Hash(prev_hash),
             proposed_prev_ledger_version: ledger_version,
         }),
+        close_time: u64::from(seq),
+        close_time_ms: None,
     }
 }
 
@@ -1705,4 +1793,340 @@ fn test_cap83_boundary_proposed_version_match_ok() {
 
     manager.verify_checkpoint_chain();
     assert_no_errors_matching(&manager, "proposed previous ledger version");
+}
+
+//=============================================================================
+// CAP-0088 millisecond close-time verification
+//=============================================================================
+
+/// Put every ledger on `version`, with close times in the format that a
+/// `version` predecessor implies (ms iff `version >= 30`): a 250 ms offset
+/// for ms ledgers so `closeTimeMs` is not a whole second.
+fn with_close_times(
+    mut data: BTreeMap<u32, LedgerHeaderVerificationData>,
+    version: u32,
+) -> BTreeMap<u32, LedgerHeaderVerificationData> {
+    for (&seq, d) in &mut data {
+        d.ledger_version = version;
+        d.close_time = u64::from(seq);
+        d.close_time_ms = (version >= 30).then(|| u64::from(seq) * 1000 + 250);
+    }
+    data
+}
+
+fn run_checkpoint(
+    checkpoint: u32,
+    data: BTreeMap<u32, LedgerHeaderVerificationData>,
+) -> XdrVerificationManager {
+    let manager = XdrVerificationManager::new();
+    record_checkpoint(&manager, checkpoint, data);
+    manager
+}
+
+fn record_checkpoint(
+    manager: &XdrVerificationManager,
+    checkpoint: u32,
+    data: BTreeMap<u32, LedgerHeaderVerificationData>,
+) {
+    manager.record_header_data(checkpoint, data);
+    manager.record_tx_set_hashes(checkpoint, BTreeMap::new());
+    manager.record_result_hashes(checkpoint, BTreeMap::new());
+    manager.verify_and_release(checkpoint);
+}
+
+/// Checkpoint 127 that upgrades to protocol 30 at ledger 100: ledgers
+/// 64..=99 are on 29, 100..=127 on 30. Ledger 100 itself still closes with a
+/// whole-second value (its predecessor was on 29); 101 onwards are ms.
+fn ms_upgrade_checkpoint() -> BTreeMap<u32, LedgerHeaderVerificationData> {
+    let mut data = with_close_times(
+        with_empty_ledger_hashes(create_complete_checkpoint_data(127, [9; 32])),
+        29,
+    );
+    for seq in 100..=127 {
+        let d = data.get_mut(&seq).unwrap();
+        d.ledger_version = 30;
+        if seq > 100 {
+            d.close_time_ms = Some(u64::from(seq) * 1000 + 250);
+        }
+    }
+    data
+}
+
+#[test]
+fn test_cap88_upgrade_boundary_passes() {
+    let manager = run_checkpoint(127, ms_upgrade_checkpoint());
+    assert!(
+        manager.get_errors().is_empty(),
+        "a valid protocol-30 upgrade checkpoint must verify clean: {:?}",
+        manager.get_errors()
+    );
+}
+
+#[test]
+fn test_cap88_close_time_disagreement_rejected() {
+    let mut data = ms_upgrade_checkpoint();
+    data.get_mut(&110).unwrap().close_time_ms = Some(999_000);
+    let manager = run_checkpoint(127, data);
+    assert_has_error(&manager, "closeTime must equal closeTimeMs / 1000");
+}
+
+#[test]
+fn test_cap88_ms_arm_on_pre_protocol_30_rejected() {
+    let mut data = with_close_times(
+        with_empty_ledger_hashes(create_complete_checkpoint_data(127, [9; 32])),
+        29,
+    );
+    data.get_mut(&100).unwrap().close_time_ms = Some(100_250);
+    let manager = run_checkpoint(127, data);
+    assert_has_error(&manager, "ms close-time ext arm on protocol 29");
+}
+
+#[test]
+fn test_cap88_ms_arm_after_pre_protocol_30_predecessor_rejected() {
+    // Ledger 100 is the upgrade ledger: its predecessor closed on 29, so
+    // stellar-core only accepts a whole-second value for it.
+    let mut data = ms_upgrade_checkpoint();
+    data.get_mut(&100).unwrap().close_time_ms = Some(100_250);
+    let manager = run_checkpoint(127, data);
+    assert_has_error(
+        &manager,
+        "ms close-time ext arm but previous ledger's version 29 predates protocol 30",
+    );
+}
+
+#[test]
+fn test_cap88_whole_second_arm_after_protocol_30_predecessor_rejected() {
+    let mut data = ms_upgrade_checkpoint();
+    data.get_mut(&110).unwrap().close_time_ms = None;
+    let manager = run_checkpoint(127, data);
+    assert_has_error(
+        &manager,
+        "whole-second close-time ext arm but previous ledger's version 30 requires ms close time",
+    );
+}
+
+/// An all-protocol-30 checkpoint 127 whose ledger 100 is an empty-tx-set
+/// ledger; `ms` picks between `EMPTY_TX_SET_MS` and `EMPTY_TX_SET`.
+fn ms_checkpoint_with_empty_tx_set_ledger(ms: bool) -> BTreeMap<u32, LedgerHeaderVerificationData> {
+    let mut data = with_close_times(
+        with_empty_ledger_hashes(create_complete_checkpoint_data(127, [9; 32])),
+        30,
+    );
+    let mut entry = cap83_header_data(100, data[&99].computed_hash.0, 30);
+    entry.close_time = 100;
+    entry.close_time_ms = ms.then_some(100_250);
+    data.insert(100, entry);
+    data
+}
+
+#[test]
+fn test_cap88_empty_tx_set_ms_passes() {
+    let manager = run_checkpoint(127, ms_checkpoint_with_empty_tx_set_ledger(true));
+    assert!(
+        manager.get_errors().is_empty(),
+        "a valid EMPTY_TX_SET_MS ledger must verify clean: {:?}",
+        manager.get_errors()
+    );
+}
+
+#[test]
+fn test_cap88_whole_second_empty_tx_set_on_protocol_30_rejected() {
+    let manager = run_checkpoint(127, ms_checkpoint_with_empty_tx_set_ledger(false));
+    assert_has_error(
+        &manager,
+        "whole-second close-time ext arm but proposed previous ledger version 30",
+    );
+}
+
+#[test]
+fn test_cap88_empty_tx_set_ms_with_pre_protocol_30_proposed_version_rejected() {
+    // Partial-scan shape: the predecessor is outside the scanned range, so
+    // only the version embedded in the ext arm can catch the mismatch.
+    let mut data = ms_checkpoint_with_empty_tx_set_ledger(true);
+    data.retain(|&seq, _| seq >= 100);
+    data.get_mut(&100)
+        .unwrap()
+        .empty_tx_set
+        .as_mut()
+        .unwrap()
+        .proposed_prev_ledger_version = 29;
+    let manager = run_checkpoint(127, data);
+    assert_has_error(
+        &manager,
+        "ms close-time ext arm but proposed previous ledger version 29 predates protocol 30",
+    );
+}
+
+/// Record checkpoint 127 with every ledger on `prev_version`, then checkpoint
+/// 191 with every ledger on 30, whose first ledger (128) carries an ms arm
+/// iff `first_ms`. Runs the cross-checkpoint chain check.
+fn run_cap88_boundary(prev_version: u32, first_ms: bool) -> XdrVerificationManager {
+    let manager = XdrVerificationManager::new();
+    let cp1 = with_close_times(
+        with_empty_ledger_hashes(create_complete_checkpoint_data(127, [9; 32])),
+        prev_version,
+    );
+    let last_hash = cp1[&127].computed_hash.clone();
+    record_checkpoint(&manager, 127, cp1);
+
+    let mut cp2 = with_close_times(
+        with_empty_ledger_hashes(create_complete_checkpoint_data(191, last_hash.0)),
+        30,
+    );
+    cp2.get_mut(&128).unwrap().close_time_ms = first_ms.then_some(128_250);
+    record_checkpoint(&manager, 191, cp2);
+
+    manager.verify_checkpoint_chain();
+    manager
+}
+
+#[rstest]
+#[case::upgrade_in_previous_checkpoint(30, true)]
+#[case::upgrade_at_first_ledger(29, false)]
+fn test_cap88_boundary_format_ok(#[case] prev_version: u32, #[case] first_ms: bool) {
+    let manager = run_cap88_boundary(prev_version, first_ms);
+    assert!(
+        manager.get_errors().is_empty(),
+        "close-time format consistent with the previous checkpoint must verify clean: {:?}",
+        manager.get_errors()
+    );
+}
+
+#[rstest]
+#[case::ms_after_protocol_29(29, true, "ms close-time ext arm but previous ledger's version 29")]
+#[case::whole_second_after_protocol_30(
+    30,
+    false,
+    "whole-second close-time ext arm but previous ledger's version 30"
+)]
+fn test_cap88_boundary_format_mismatch_rejected(
+    #[case] prev_version: u32,
+    #[case] first_ms: bool,
+    #[case] expected: &str,
+) {
+    let manager = run_cap88_boundary(prev_version, first_ms);
+    assert!(
+        manager
+            .get_errors()
+            .iter()
+            .any(|e| e.kind == VerificationErrorType::Boundary(191) && e.message.contains(expected)),
+        "expected a boundary error containing {expected:?}, got: {:?}",
+        manager.get_errors()
+    );
+}
+
+//=============================================================================
+// Strictly-increasing close times (stellar-core catchup check, all protocols)
+//=============================================================================
+
+#[test]
+fn test_consensus_close_time_ms() {
+    let mut data = cap83_header_data(100, [0; 32], 29);
+    data.close_time = 100;
+    assert_eq!(data.consensus_close_time_ms(), 100_000);
+    data.close_time_ms = Some(100_250);
+    assert_eq!(data.consensus_close_time_ms(), 100_250);
+    // Saturates to the largest whole second expressible in ms, like
+    // stellar-core's `ConsensusTime::fromApplyTime`.
+    data.close_time = u64::MAX;
+    data.close_time_ms = None;
+    assert_eq!(data.consensus_close_time_ms(), u64::MAX / 1000 * 1000);
+}
+
+#[rstest]
+#[case::repeated_whole_second(29, 110, 109, None, "non-advancing close time 109.000")]
+#[case::backwards_whole_second(29, 110, 50, None, "non-advancing close time 50.000")]
+#[case::repeated_ms(30, 110, 109, Some(109_250), "non-advancing close time 109.250")]
+#[case::backwards_sub_second(30, 110, 109, Some(109_100), "non-advancing close time 109.100")]
+fn test_non_advancing_close_time_rejected(
+    #[case] version: u32,
+    #[case] seq: u32,
+    #[case] close_time: u64,
+    #[case] close_time_ms: Option<u64>,
+    #[case] expected: &str,
+) {
+    let mut data = with_close_times(
+        with_empty_ledger_hashes(create_complete_checkpoint_data(127, [9; 32])),
+        version,
+    );
+    let d = data.get_mut(&seq).unwrap();
+    d.close_time = close_time;
+    d.close_time_ms = close_time_ms;
+    let manager = run_checkpoint(127, data);
+    assert!(
+        manager
+            .get_errors()
+            .iter()
+            .any(|e| e.kind == VerificationErrorType::Ledger(seq) && e.message.contains(expected)),
+        "expected a ledger {seq} error containing {expected:?}, got: {:?}",
+        manager.get_errors()
+    );
+}
+
+#[test]
+fn test_sub_second_close_time_advance_passes() {
+    // Two ms ledgers inside the same whole second: a seconds-only comparison
+    // would flag ledger 110, but stellar-core compares at ms resolution.
+    let mut data = with_close_times(
+        with_empty_ledger_hashes(create_complete_checkpoint_data(127, [9; 32])),
+        30,
+    );
+    let d = data.get_mut(&110).unwrap();
+    d.close_time = 109;
+    d.close_time_ms = Some(109_900);
+    let manager = run_checkpoint(127, data);
+    assert!(
+        manager.get_errors().is_empty(),
+        "a sub-second close-time advance must verify clean: {:?}",
+        manager.get_errors()
+    );
+}
+
+#[test]
+fn test_upgrade_ledger_ms_close_time_in_same_second_passes() {
+    // Ledger 100 is the protocol-30 upgrade ledger (whole-second, 100.000);
+    // ledger 101 is the first ms ledger and closes later in that same second.
+    let mut data = ms_upgrade_checkpoint();
+    let d = data.get_mut(&101).unwrap();
+    d.close_time = 100;
+    d.close_time_ms = Some(100_500);
+    let manager = run_checkpoint(127, data);
+    assert!(
+        manager.get_errors().is_empty(),
+        "an ms ledger later in its whole-second predecessor's second must verify clean: {:?}",
+        manager.get_errors()
+    );
+}
+
+#[rstest]
+#[case::advancing(129, false)]
+#[case::repeated(127, true)]
+#[case::backwards(100, true)]
+fn test_boundary_close_time_must_advance(#[case] first_close_time: u64, #[case] expect_err: bool) {
+    let manager = XdrVerificationManager::new();
+    let cp1 = with_close_times(
+        with_empty_ledger_hashes(create_complete_checkpoint_data(127, [9; 32])),
+        29,
+    );
+    let last_hash = cp1[&127].computed_hash.clone();
+    record_checkpoint(&manager, 127, cp1);
+
+    let mut cp2 = with_close_times(
+        with_empty_ledger_hashes(create_complete_checkpoint_data(191, last_hash.0)),
+        29,
+    );
+    cp2.get_mut(&128).unwrap().close_time = first_close_time;
+    record_checkpoint(&manager, 191, cp2);
+
+    manager.verify_checkpoint_chain();
+    let boundary_err = manager.get_errors().iter().any(|e| {
+        e.kind == VerificationErrorType::Boundary(191)
+            && e.message.contains("non-advancing close time")
+    });
+    assert_eq!(
+        boundary_err,
+        expect_err,
+        "first ledger closing at {first_close_time} after checkpoint 127 closed at 127: {:?}",
+        manager.get_errors()
+    );
 }

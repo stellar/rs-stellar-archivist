@@ -216,7 +216,12 @@ to `mirror` and `repair`.)
   transactions / results files, and the ledger hash chain is continuous within
   and across checkpoints. This includes CAP-0083 (protocol 28+) empty-tx-set
   ledgers: their header must carry an all-zero `txSetHash`, and the
-  transactions / results files must have no entry for them.
+  transactions / results files must have no entry for them. From protocol 30
+  (CAP-0088), ledgers carry millisecond close times: the archivist checks that
+  `closeTime == closeTimeMs / 1000` and that each ledger uses the millisecond
+  format exactly when its predecessor closed on protocol 30 or later. On every
+  protocol, close times must strictly increase from ledger to ledger, compared
+  at millisecond resolution, as stellar-core requires during catchup.
 
 ### Which mode should I use?
 
